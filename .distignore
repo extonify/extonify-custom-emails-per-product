@@ -1,0 +1,26 @@
+# Excluded from the distributed release archive.
+#
+# Everything listed here is development-only or regenerable. The shipped zip
+# contains the plugin bootstrap, src/, uninstall.php, languages/, readme.txt
+# and the production vendor/ autoloader — nothing else.
+/.git
+/.github
+/docs
+/poc
+/tests
+/node_modules
+/dist
+/bin
+.gitignore
+.distignore
+composer.json
+composer.lock
+phpcs.xml.dist
+phpunit.xml.dist
+package.json
+package-lock.json
+.phpunit.result.cache
+.DS_Store
+# All Markdown is development documentation. readme.txt (not .md) is the
+# WordPress.org-required file and is NOT excluded.
+*.md

@@ -1,0 +1,153 @@
+<?php
+/**
+ * Deterministic delivery-identity hash (ADR-0004, ADR-0009).
+ *
+ * @package Extonify\WCEP
+ */
+
+namespace Extonify\WCEP\Domain;
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Computes the sha256 identity hash that backs the tombstone's UNIQUE key.
+ *
+ * ADR-0004 defines the delivery identity as the tuple
+ * `order_id | rule_id | mode | trigger_identity`. ADR-0009 stores it as a
+ * fixed-length CHAR(64) hash so the UNIQUE index length is safe on every
+ * MySQL/MariaDB configuration.
+ *
+ * HASH ALGORITHM v1 (deterministic across hosts) — per component, in order:
+ *   1. integers are cast and rendered in base 10;
+ *   2. strings are trim()ed and internal whitespace runs collapsed to one
+ *      space (UTF-8 aware, with a plain byte fallback for invalid UTF-8);
+ *   3. ASCII-RANGE case folding ONLY: A-Z to a-z via strtr(). Non-ASCII bytes
+ *      pass through UNCHANGED.
+ * then sha256 over implode('|', components).
+ *
+ * The hash needs STABILITY, not linguistic correctness. strtolower() is
+ * locale-sensitive before PHP 8.2 and mb_strtolower() is unavailable when the
+ * mbstring extension is not installed, so either would make the same input
+ * hash differently across hosts — which would split one delivery identity into
+ * two and re-send an email a customer already received. The sibling Extonify
+ * Address Book plugin shipped exactly that bug; this implementation uses no
+ * locale- or extension-dependent function.
+ */
+final class DeliveryIdentity {
+
+	/**
+	 * Hash algorithm version.
+	 *
+	 * Bump this on ANY change to the rules above, and ship a recompute
+	 * migration alongside — stored hashes are an indexed column, not a
+	 * computed one, so a silent change would split existing identities.
+	 */
+	const HASH_VERSION = 1;
+
+	const ASCII_UPPER = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+	const ASCII_LOWER = 'abcdefghijklmnopqrstuvwxyz';
+
+	/**
+	 * Delivery modes recognised by the identity (ADR-0005).
+	 */
+	const MODES = array( 'insert', 'separate' );
+
+	/**
+	 * Trigger-identity prefixes defined by ADR-0004. The identity is
+	 * `status:{slug}`, `transition:{from}>{to}` or `refund:{id}` — nothing else.
+	 * Keeping this closed is deliberate: an unrecognised prefix means a caller
+	 * invented an identity format, and a tombstone written under an identity no
+	 * later call can reproduce silently defeats duplicate prevention.
+	 */
+	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund' );
+
+	/**
+	 * Storage width of the trigger_identity column (ADR-0009). A longer value
+	 * would be truncated by MySQL, producing a hash that no later call can
+	 * reproduce.
+	 */
+	const MAX_TRIGGER_IDENTITY_LENGTH = 191;
+
+	/**
+	 * Compute the identity hash for a delivery.
+	 *
+	 * @param int    $order_id         WooCommerce order id.
+	 * @param int    $rule_id          Rule id.
+	 * @param string $mode             Delivery mode: 'insert' or 'separate'.
+	 * @param string $trigger_identity Trigger identity, e.g. 'status:completed',
+	 *                                 'transition:pending>processing', 'refund:123'.
+	 * @return string 64-character sha256 hex digest.
+	 */
+	public static function hash( int $order_id, int $rule_id, string $mode, string $trigger_identity ): string {
+		$parts = array(
+			(string) $order_id,
+			(string) $rule_id,
+			self::normalize( $mode ),
+			self::normalize( $trigger_identity ),
+		);
+		return hash( 'sha256', implode( '|', $parts ) );
+	}
+
+	/**
+	 * Normalise a string component: trim, collapse whitespace, ASCII-only
+	 * lowercase. Deliberately free of locale- and mbstring-dependent calls.
+	 *
+	 * @param string $value Raw component.
+	 * @return string
+	 */
+	public static function normalize( string $value ): string {
+		$value = self::collapse_whitespace( trim( $value ) );
+		return strtr( $value, self::ASCII_UPPER, self::ASCII_LOWER );
+	}
+
+	/**
+	 * Collapse whitespace runs to single spaces, deterministically: the UTF-8
+	 * pattern when the input is valid UTF-8, a byte pattern otherwise
+	 * (preg_replace with /u returns null on invalid UTF-8).
+	 *
+	 * @param string $value Trimmed input.
+	 * @return string
+	 */
+	private static function collapse_whitespace( string $value ): string {
+		$collapsed = preg_replace( '/\s+/u', ' ', $value );
+		if ( null === $collapsed ) {
+			$collapsed = preg_replace( '/\s+/', ' ', $value );
+		}
+		return (string) $collapsed;
+	}
+
+	/**
+	 * Whether a delivery mode string is one this plugin recognises.
+	 *
+	 * @param string $mode Candidate mode.
+	 * @return bool
+	 */
+	public static function is_valid_mode( string $mode ): bool {
+		return in_array( self::normalize( $mode ), self::MODES, true );
+	}
+
+	/**
+	 * Whether a trigger identity matches an ADR-0004 form and fits the column.
+	 *
+	 * Accepted, after normalisation:
+	 *   status:{slug}                 e.g. status:completed
+	 *   transition:{from}>{to}        e.g. transition:pending>processing
+	 *   refund:{id}                   e.g. refund:2191
+	 *
+	 * @param string $trigger_identity Candidate identity.
+	 * @return bool
+	 */
+	public static function is_valid_trigger_identity( string $trigger_identity ): bool {
+		$normalized = self::normalize( $trigger_identity );
+
+		if ( '' === $normalized || strlen( $normalized ) > self::MAX_TRIGGER_IDENTITY_LENGTH ) {
+			return false;
+		}
+
+		$prefixes = implode( '|', self::TRIGGER_PREFIXES );
+
+		// Value part: at least one character, drawn from the slug/id/transition
+		// alphabet. '>' separates a transition's two states.
+		return 1 === preg_match( '/^(?:' . $prefixes . '):[a-z0-9][a-z0-9 _.>-]*$/', $normalized );
+	}
+}
