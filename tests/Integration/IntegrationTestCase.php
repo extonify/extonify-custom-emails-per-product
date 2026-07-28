@@ -74,6 +74,16 @@ abstract class IntegrationTestCase extends TestCase {
 	}
 
 	/**
+	 * Attribute any intercepted mail to this test class (gate 5).
+	 *
+	 * @before
+	 * @return void
+	 */
+	protected function attribute_intercepted_mail() {
+		MailGuard::attribute_to( static::class );
+	}
+
+	/**
 	 * Confirm the schema is present before any test runs.
 	 *
 	 * @before

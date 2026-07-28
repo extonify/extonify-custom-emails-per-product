@@ -476,29 +476,22 @@ open.
 The engine ([ADR-0011](adr/ADR-0011.md)) is closed. Everything below is either
 required work for the delivery phase or a finding deliberately left unfixed.
 
-### Required delivery-phase test — `rule_disabled` end to end
+### ~~Required delivery-phase test — `rule_disabled` end to end~~ CLOSED in Prompt 4
 
-**`rule_disabled` is currently unreachable through the immediate path and is not
-proven end to end anywhere.** `find_active_for_trigger()` filters
-`status = 'active'` in SQL, so the immediate path can never produce it, and
-`MatchingEngineTest::test_a_rule_row_marked_inactive_is_reported_as_rule_disabled()`
-proves only that the matcher honours a row it was *handed* already marked
-inactive — it rewrites the fetched array itself. That is the documented contract
-(ADR-0011 §7a), not a defect, but it means the reason code has no end-to-end
-coverage.
+**Delivered.** The deferred job now exists, so the test that could not be written
+before is written:
+`DeferredDeliveryTest::test_a_rule_disabled_during_the_delay_does_not_send()`
+fetches candidates, disables one in the **database** without touching any
+fetched array, runs the **real** deferred job through its registered Action
+Scheduler hook, and asserts the disabled rule neither sends nor claims — while a
+still-enabled rule does send, so the absence is the disabling and not a broken
+path. It then re-enables the rule and shows it can still claim its **preserved**
+identity, proving nothing was silently dropped.
 
-**The delivery phase must add this test:** fetch candidate rules, disable one in
-the **database** without touching the fetched array, run the **real deferred
-execution path**, and assert the disabled rule neither sends nor is silently
-dropped — it must appear in the log as `rule_disabled`. That test belongs with
-the ADR-0007 re-validation it exercises; it cannot be written before the deferred
-job exists.
-
-Do **not** solve this inside the engine. Candidate-id persistence with
-re-fetching at deferred execution would be a second staleness mechanism running
-beside the ADR-0007 snapshot — two sources of truth for one question, the exact
-defect eliminated in [ADR-0002](adr/ADR-0002.md) when per-rule `WC_Email`
-registration was rejected.
+`rule_disabled` itself is exercised by
+`DeferredDeliveryTest::test_a_row_marked_inactive_is_recorded_as_rule_disabled()`,
+which is the reason code's one legitimate caller: a job that re-read a rule,
+found it inactive, and wants the outcome in the log.
 
 ### Findings recorded, deliberately not fixed
 
@@ -566,3 +559,345 @@ re-check on version bumps.
   depends on sanitisation for safety. A future column added to the trigger path
   must be validated the same way and must **not** reach for a sanitiser to make
   bad input acceptable.
+
+## Added in Prompt 4 — the delivery spine
+
+Separate-mode sending is live ([ADR-0012](adr/ADR-0012.md)). Everything below is
+required work for a later prompt or a deliberate scope boundary.
+
+### Contract-consistency gate
+
+**Nothing recorded in this file is a known violation of an ADR by current code.**
+Prompt 3c introduced that gate after Prompt 3b froze the engine with a live
+ADR-0011 §5 violation filed as deferred work; it still holds.
+
+### Required for the prompts that follow
+
+- **Insert mode and the render-context production class (Prompt 5).** Deliberately
+  absent, not stubbed. `DeliveryLogger::MODE` is the single constant a second mode
+  has to change, and `Orchestrator::deliverable_in_this_phase()` is the single
+  place Prompt 5 removes the `insert` exclusion from (ADR-0012 §9). The
+  claim-then-send path insert mode will reuse is already proven here, so Prompt 5
+  can concentrate entirely on render correlation.
+
+  **NOTE (Prompt 4a):** as originally shipped this boundary did not exist —
+  insert rules were matched, claimed under `mode = separate` and **sent as
+  standalone emails**. That was a live ADR-0012 violation and gate 9 was reported
+  clean while it stood, because gate 9 was read against the backlog TEXT rather
+  than against behaviour. Gate 9 now requires direct examination of current
+  behaviour against the ADR.
+- **The preview guard is COARSE and Prompt 5 must replace it.**
+  `Orchestrator::is_rendering_preview()` reads `woocommerce_is_email_preview` and
+  `is_customize_preview()`. That is sufficient for separate mode — which is
+  triggered by an order event and never by a render — but insert mode is
+  triggered BY a render and needs the full ADR-0005 slot machinery, including the
+  verified leak of `woocommerce_is_email_preview` after an interrupted preview.
+- **Placeholders (a later prompt).** Subject, heading and content are sent
+  LITERALLY: `{customer_name}` is delivered as those characters.
+  `Custom_Email::get_subject()` deliberately does not call `format_string()`, and
+  the point at which it starts to must also decide what an empty resolved
+  recipient means — ADR-0005 already names
+  `empty/invalid recipient after placeholder resolution` as a loggable outcome.
+- **`delay_seconds` and ADR-0007 snapshots (Prompt 6).** `delay_seconds` is stored
+  and revision-bearing but nothing reads it yet; every delivery in this prompt is
+  immediate. The `scheduled` final status exists in `FINAL_STATUSES` and is
+  currently unused.
+- **`consolidation` beyond `none`.** One email per rule per trigger. The engine
+  returns both `matched_item_ids` and `matched_product_ids` so a later prompt can
+  choose per-order or per-item without the engine having pre-judged it.
+
+### Findings recorded, deliberately not fixed
+
+- **Two new line-level PHPCS suppressions**, both for WooCommerce-owned hooks this
+  plugin must interoperate with: `woocommerce_email_headers` (applied by every
+  core `WC_Email` subclass; dropping it would break SMTP and deliverability
+  plugins that add headers through it) and `woocommerce_is_email_preview` (read by
+  core in seven places, with no helper function to call instead). Both are
+  `WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound` only,
+  on one line each, with the reason inline.
+- **A `failed` claim with no `delivery_id` logs to WooCommerce rather than the
+  detail store.** There is no parent row to attach a detail row to, and the detail
+  repository rightly refuses an orphan. The failure is therefore visible in the
+  WooCommerce log (source `extonify-wcep`) but not in the delivery-history panel.
+  If the panel needs to show these, it needs a parentless-failure store, which is
+  a schema change and an ADR-0009 amendment.
+- **The halt record rides on the stop rule's detail rows**, so a halt whose stop
+  rule was itself `suppressed` (a repeat of the same identity) writes no new
+  record of the blocked ids. The first firing already recorded them, so nothing is
+  lost — but a support query that only looks at the latest attempt will not see
+  it.
+- ~~**`Orchestrator` reads each sending rule's row with a second query**
+  (`RuleRepository::find()`), cached per request.~~ **RESOLVED in Prompt 4a — do
+  not re-open.** The second read was deleted outright, not optimised:
+  [ADR-0012 §10](adr/ADR-0012.md) makes the rows fetched once, phase-filtered and
+  carried through claiming and sending, because re-reading let an admin save
+  between matching and sending make a rule **match on old targeting and send new
+  content**, with `rule_revision_sent` recording a revision that never produced
+  the match. The batched `find_by_ids()` this entry once proposed would
+  reintroduce exactly that. Measured cost for one delivery on a 10-item order
+  against 20 rules is now **41 queries**, against 200 for a per-rule-per-item
+  implementation.
+- **Deferral is scheduled at `time()`**, so Action Scheduler runs it on the next
+  queue pass. ADR-0008 caps it at one deferral and the claim collapses any race,
+  so an early run is safe — but a store with a stalled Action Scheduler queue will
+  see the deferred delivery sit pending. That is a WooCommerce-wide condition,
+  not something this plugin can fix, and it fails in the safe direction.
+
+## Added in Prompt 4a — delivery spine corrections
+
+### Contract-consistency gate
+
+**Nothing recorded in this file, and nothing in current behaviour, is a known
+violation of an ADR.** Gate 9 is now checked by reading the ADR against the code,
+not only against this file — Prompt 4 reported it clean while insert-mode rules
+were being delivered as standalone emails, which the backlog text did not
+mention because nobody had noticed it.
+
+### Findings recorded, deliberately not fixed
+
+- **`rule_disabled` is unreachable in production, by design** (ADR-0012 §2a). No
+  path hands the matcher a row it has already read and found inactive. The
+  rejected alternative — persisting candidate rule ids and comparing them at
+  execution — is documented in the ADR along with the three reasons it is
+  refused, the decisive one being that the Action Scheduler argument set is the
+  deduplication key and cannot carry a variable-length list.
+
+- **PHPCS suppressions in `src/`: exactly TWO, unchanged since Prompt 4.**
+  Verified against `c851876`: this pass added **zero** suppressions to any
+  pre-existing file, and the two in the new files are the ones already declared.
+  Both are single-line, single-sniff
+  (`PrefixAllGlobals.NonPrefixedHooknameFound`) and reasoned inline:
+  1. `Email\Custom_Email::get_headers()` — `woocommerce_email_headers`, a
+     WooCommerce-owned filter every core `WC_Email` subclass applies; dropping it
+     breaks SMTP and deliverability plugins that add headers through it.
+     **(REMOVED in Prompt 4b: the parent applies that filter now, so this class
+     no longer calls `apply_filters()` at all. The count in `src/` is therefore
+     ONE, not two — see ADR-0012 §5b.)**
+  2. `Delivery\Orchestrator::is_rendering_preview()` —
+     `woocommerce_is_email_preview`, read by core in seven places with no helper
+     function to call instead.
+
+  Everything else matching `phpcs:ignore` in `src/` is a pre-existing
+  `WordPress.DB.*` suppression on a plugin-owned table query.
+
+- **The deferral pre-check still has a race window.** `as_has_scheduled_action()`
+  matches arguments exactly, but a concurrent request can pass it before either
+  writes. Two deferrals for one identity would then be queued, and both would run
+  — at which point the **atomic ADR-0004 claim** collapses them to one send. The
+  cost is one wasted job, not a duplicate email. Closing it at the scheduler is
+  not possible while `$unique` ignores arguments (see the flagged behaviour in
+  ADR-0012).
+
+- **`Orchestrator::deliverable_in_this_phase()` reads two columns that no other
+  code in this phase reads.** When Prompt 5 and Prompt 6 land, each must remove
+  its own condition — and a rule that matches neither phase's conditions would
+  then be silently undeliverable again. The filter should gain an explicit
+  "belongs to no phase" branch at that point rather than an implicit one.
+
+## Added in Prompt 4b — DELIVERY SPINE FROZEN
+
+### Contract-consistency gate
+
+Re-run by direct examination against ADR-0008 and ADR-0012. Three contradictions
+were found and removed; no ADR clause, class docblock or inline comment now
+describes behaviour the code does not have.
+
+1. `DeferredEvaluation` claimed a rule disabled during the delay was reported
+   `rule_disabled`. The job re-fetches, so such a rule is simply **absent** and
+   nothing is manufactured.
+2. `DeferredEvaluation` and ADR-0012 §7 called the Action Scheduler argument set
+   "unique per identity". It is a **best-effort** pre-check; the atomic ADR-0004
+   claim is the guarantee.
+3. ADR-0012's Prompt 4a amendment history said the scheduler is passed
+   `$unique = true`. It never was, deliberately.
+
+One wording is now used everywhere — ADR-0008 §4, ADR-0012 §7a/§7b,
+`DeferredEvaluation`'s class docblock, `is_scheduled()` and `run()`:
+
+```
+Deferred job : re-fetches current active rules. A rule disabled during the delay is
+               absent and sends nothing. No rule_disabled tombstone is manufactured.
+Scheduler    : the per-identity pending check is best-effort; concurrent duplicate jobs
+               remain possible; the atomic claim prevents duplicate delivery.
+```
+
+### Findings recorded, deliberately not fixed
+
+- **The header injector runs at `PHP_INT_MIN`, which is first but not
+  inviolable.** `Custom_Email::inject_copy_headers()` adds this plugin's Cc and
+  Bcc inside `woocommerce_email_headers` so every other callback sees a complete
+  block. A third party registering at the same priority *earlier* would run
+  before it and see the block without them. There is no priority below
+  `PHP_INT_MIN`; the alternative — appending after the filter — is strictly
+  worse, because then *no* callback could see them.
+
+- **The Cc/Bcc feature detection is exercised only against WooCommerce 10.9.4.**
+  `get_cc_recipient()` / `get_bcc_recipient()` arrived in WC 9.8, and the
+  provisional floor is 8.2, so the `method_exists()` fallback branch is reasoned
+  and reviewed but not executed by any test on this runtime. Re-check when the
+  floor is confirmed under ADR-0006 — that is the prompt that has to install an
+  older WooCommerce and actually run it.
+
+- **`recipient_header` is null on every `auto` row, by contract** (ADR-0012 §4a).
+  Literal recipients resolve to bare addresses because `wp_mail()` splits `$to`
+  on commas without honouring RFC quoting, so a display name containing a comma
+  would tear the recipient list apart. The drop is recorded as a resolution note.
+  Preserving display names would need the recipient list handed to `wp_mail()` as
+  an **array** rather than a comma-joined string — worth revisiting, but it is a
+  change to how every delivery is addressed and does not belong in a freeze pass.
+
+- **`DeliveryLogger::record_claim_failure()`'s `delivery_id > 0` branch is still
+  unreachable from `DeliveryRepository::claim()`,** which returns `0` on both of
+  its failure paths. It is kept rather than removed — the method takes a claim
+  array from its caller rather than producing one — and is now held to the same
+  verified-write contract as every other write, so if a future repository does
+  populate it the rows cannot fail silently.
+
+- **`RunOutcome` is produced but not yet consumed.** Every public orchestrator
+  entry point returns one, carrying each rule's action and whether the log
+  actually captured it. Nothing reads the aggregate yet; the delivery-history
+  phase is what it exists for. Until then its value is that the results are no
+  longer discarded.
+
+- **Gate 5 is now a property of the suite, not of a base class.**
+  `Tests\Integration\MailGuard`, installed by the bootstrap, short-circuits
+  `pre_wp_mail` for every test and throws from `phpmailer_init`. The tally is
+  printed per test class at the end of the run. Previously only the classes
+  extending `MatchingTestCase` blocked mail at all.
+
+## Added in Prompt 4c — RE-ENTRANCY FREEZE
+
+### Contract-consistency gate
+
+Re-run by direct examination. Prompt 4b's own gate-10 audit turned out to be one
+of the contradictions: it described `ItemResolver::$products` while the resolver
+also held `$orders`. Everything found is fixed, not deferred:
+
+1. **ADR-0012 §11** claimed a nested send is safe "because `WC_Email::send()`'s
+   arguments are all evaluated before the nested event can fire". False —
+   `is_enabled()` applies a third-party filter first. Struck in place, with the
+   reason recorded, and replaced by §11a.
+2. **ADR-0002** required `reset_runtime_state()` "on entry AND in a `finally`".
+   The exit half is now a restore; amended in place.
+3. **ADR-0012 Consequences** repeated "reset at both ends of `trigger()`".
+4. **`Orchestrator::$matcher`**, **`Events::orchestrator()`** and the §11 audit
+   table all described the resolver's cache as "keyed by product id and therefore
+   correct for every order". That was true of `$products` and false of `$orders`.
+5. **The Prompt 4 backlog entry** proposing a batched `find_by_ids()` for "the
+   orchestrator's second rule query" is marked RESOLVED — Prompt 4a deleted that
+   query for a correctness reason (ADR-0012 §10), and the proposal would have
+   reintroduced it.
+
+### Findings recorded, deliberately not fixed
+
+- **The header injector's per-call closure fixes a latent fragility, not a live
+  defect.** Re-running `NestedDeliveryTest` against the old
+  `array( $this, 'inject_copy_headers' )` registration, the header test **passed**
+  — because the injector runs at `PHP_INT_MIN` and has therefore already
+  contributed its lines before any third-party callback can nest. The closure is
+  still the right shape: the safety currently depends on a priority constant, and
+  a future change that moves the injector off `PHP_INT_MIN` would turn a shared
+  registration into a silently stripped one. Two of the three re-entrancy tests
+  fail against the old code; this one is a guard, and is labelled as such.
+
+- **`ItemResolver::$products` and `$facts` are not invalidated within a request,
+  and that is now a decision** (ADR-0012 §11b). A product edited inside the same
+  request that later evaluates an order containing it would match on its pre-edit
+  facts. No WooCommerce path produces that ordering, whereas order contents
+  changing mid-request is a documented lifecycle — which is exactly why the
+  order-keyed cache had to go and these two do not. `flush()` remains the escape
+  hatch. Re-examine if a bulk product importer ever runs in-process alongside
+  order emails.
+
+- **Removing the order cache cost nothing measurable.** A second resolution of
+  the same 10-item / 10-product order costs **0 queries** (first pass 10), because
+  `WC_Order::get_items()` is memoised on the order object and the item meta is
+  already in WordPress's cache. Asserted, not assumed, by
+  `OrderMutationTest::test_re_resolving_an_order_costs_no_extra_queries`.
+
+- **`Custom_Email::RUNTIME_FIELDS` is now the single source of truth for
+  per-delivery state.** Adding a field anywhere else — a property without an
+  entry here — would be captured by none of capture, apply or restore and would
+  leak between deliveries. There is no automated guard on that; the isolation and
+  re-entrancy tests catch it only for fields they happen to assert on. A
+  reflection-based check that every non-settings public property appears in
+  `RUNTIME_FIELDS` would close it, and belongs with the insert-mode work that
+  adds the next such field.
+
+## Added in Prompt 4d — PARENT STATE FREEZE (final Prompt 4 correction)
+
+**Prompt 4's correction passes end here.** Per this pass's stopping rule, any
+further finding that requires third-party code to re-enter the plugin mid-send is
+recorded below as accepted residual risk and is not fixed. Insert mode (Prompt 5)
+exercises this same code and is a better place to discover anything remaining
+than a fifth speculative audit.
+
+### Contract-consistency gate
+
+1. **ADR-0012 §5** still described `trigger()` as resetting all runtime fields in
+   a `finally`. Superseded by §11a's capture-and-restore since Prompt 4c; the
+   clause is now amended in place with an explicit pointer, so Prompt 5 cannot
+   copy the clearing model.
+2. **`RuleMatcher`** still said both trigger families resolve the order's items
+   once. After the Prompt 4c `$orders` removal, line items are re-read per
+   evaluation and only PRODUCT facts are reused. Corrected on both the class
+   docblock and `evaluate_status_change()`.
+
+### Flagged WooCommerce behaviour — worth an upstream report
+
+- **⚠ `WC_Email::send()` HAS NO `try`/`finally`.** *(Verified in the bundled
+  WC 10.9.4.)* It attaches `wp_mail_from`, `wp_mail_from_name` and
+  `wp_mail_content_type`, then applies `woocommerce_mail_content` and invokes the
+  mail callback, and only then removes them. Anything that throws in between
+  leaves all three attached **for the rest of the request** — and these are
+  `wp_mail`-wide hooks, so every later message, including WordPress password
+  resets, would carry the store's From identity and `text/html` content type.
+  Every `WC_Email` subclass inherits this. **Worth reporting upstream**; a
+  `try`/`finally` around the body would close it for everyone.
+
+  This plugin is unusually exposed because ADR-0012 §3 catches `\Throwable` and
+  lets the request CONTINUE, where a core email would have died with the
+  exception. `Custom_Email::send()` therefore wraps the parent (ADR-0012 §11d)
+  rather than waiting for upstream.
+
+- **`WC_Email::$mime_boundary` and `$mime_boundary_header` are declared and never
+  assigned** anywhere in WC 10.9.4 — vestigial from the multipart implementation
+  that predates `handle_multipart()`. They are excluded from the captured frame
+  on that basis, and `ParentStateTest::test_the_multipart_boundary_properties_stay_untouched()`
+  asserts it behaviourally so a WooCommerce version that starts using them fails
+  the suite rather than leaking.
+
+### Findings recorded, deliberately not fixed
+
+- **`WC_Email::$email_type` can be mutated mid-delivery on the block-editor
+  path** — `get_content()` promotes `plain` → `html` when
+  `get_block_email_html_content()` returns content. Excluded from the frame for
+  three reasons, recorded in ADR-0012 §11c: it is a store setting by ADR-0002 and
+  §5, this plugin registers no block templates, and the promotion is idempotent
+  and one-way so an outer and an inner delivery of the same object promote
+  identically. The residual case — WooCommerce's `block_email_editor` feature on,
+  block content returned for one order and not another, **and** nesting — is
+  accepted under this pass's stopping rule.
+
+- **The multipart consequence cannot be observed end to end in this suite.**
+  Every message is intercepted at `pre_wp_mail`, which short-circuits `wp_mail()`
+  before `phpmailer_init` — the hook WooCommerce calls `handle_multipart()` from.
+  So WooCommerce's real multipart path never runs anywhere in the suite, and a
+  test that merely nested two sends would pass whether or not `sending` is
+  framed. `ParentStateTest::test_the_sending_flag_survives_a_nested_delivery()`
+  therefore invokes `handle_multipart()` — WooCommerce's own unmodified method —
+  at the point `phpmailer_init` would fire. It proves the flag is cleared during
+  the inner delivery and restored for the outer one; it does **not** prove core's
+  `phpmailer_init` wiring fires as expected. Closing that gap needs a harness
+  that intercepts at `phpmailer_init` instead, which would stop `pre_wp_mail`
+  from being the single mail tripwire the suite currently relies on.
+
+- **`RUNTIME_FIELDS` completeness is now guarded, with one known blind spot.**
+  `ParentStateTest::test_every_property_is_either_framed_or_declared_per_request()`
+  fails when any property on the shared object is neither framed nor on the
+  documented per-request allow-list, so a property added by this plugin or by a
+  WooCommerce upgrade forces a human decision. It cannot detect a WooCommerce
+  version that starts *mutating* an already-allow-listed property mid-delivery;
+  the boundary-property assertion above covers the two candidates that exist
+  today, and any newly mutated one would surface as a delivery bug rather than at
+  the guard.

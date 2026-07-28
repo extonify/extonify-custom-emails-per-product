@@ -26,10 +26,37 @@ defined( 'ABSPATH' ) || exit;
  *
  * Each product is loaded ONCE per resolver and its term ids read once, cached
  * for the request; a second line item of the same product costs no further
- * query, and both trigger families of one status change share one resolution
- * pass. The query cost is therefore a function of the number of DISTINCT
+ * query. The query cost is therefore a function of the number of DISTINCT
  * products on the order, and is independent of how many rules are evaluated
  * (ADR-0011 §9).
+ *
+ * WHAT IS CACHED, AND WHAT INVALIDATES IT (ADR-0012 §11b). This object is
+ * SHARED for the whole request — `Events` builds one orchestrator, which holds
+ * one matcher, which holds one resolver — so every cache here is a claim that
+ * some fact cannot change between two evaluations in one request:
+ *
+ * | Cache       | Keyed by                | Holds                     | Invalidation |
+ * |-------------|-------------------------|---------------------------|--------------|
+ * | `$products` | product id              | the `WC_Product`, or false| NONE within a request — accepted, see below |
+ * | `$facts`    | `product_id:variation_id` | type, flags, term ids   | NONE within a request — accepted, same reason |
+ *
+ * THE ORDER'S CONTENTS ARE DELIBERATELY NOT CACHED, and that is a correctness
+ * requirement rather than an oversight. An `$orders` cache existed and was
+ * WRONG: order #100 evaluated with zero items, an importer attached items later
+ * in the same request, and the next status event on #100 read `item_count = 0`
+ * from the cache and deferred again instead of matching — which is precisely
+ * the create-then-attach lifecycle ADR-0008 exists to support. Items replaced
+ * or removed mid-request were equally stale. Re-walking the line items is
+ * cheap: `WC_Order::get_items()` is memoised on the order object, the item meta
+ * is already in WordPress's cache, and the expensive part — product objects,
+ * type slugs, flags, categories and tags — is still cached by product id.
+ *
+ * The two remaining caches are keyed by PRODUCT, and a product edited mid-
+ * request would be evaluated against its pre-edit facts. That is ACCEPTED: an
+ * order's contents change during ordinary order creation, which is a documented
+ * WooCommerce lifecycle, whereas a product being edited inside the same request
+ * that sends an order email is not a lifecycle any WooCommerce path produces.
+ * A caller that needs to force the issue calls `flush()`.
  *
  * IDENTITY COMES FROM THE ITEM, FACTS COME FROM THE PRODUCT. `product_id` and
  * `variation_id` are read from the line item, which stores them, so id-based
@@ -70,14 +97,10 @@ class ItemResolver {
 	private $facts = array();
 
 	/**
-	 * Resolved orders, keyed by order id.
-	 *
-	 * @var array<int,array>
-	 */
-	private $orders = array();
-
-	/**
 	 * Resolve every line item on an order.
+	 *
+	 * READS THE ORDER'S LINE ITEMS EVERY TIME, never a cached resolution — see
+	 * the class docblock and ADR-0012 §11b.
 	 *
 	 * @param \WC_Order $order Order to resolve.
 	 * @return array {
@@ -99,12 +122,6 @@ class ItemResolver {
 	 * }
 	 */
 	public function resolve_order( \WC_Order $order ): array {
-		$order_id = (int) $order->get_id();
-
-		if ( $order_id > 0 && isset( $this->orders[ $order_id ] ) ) {
-			return $this->orders[ $order_id ];
-		}
-
 		$items      = array();
 		$notes      = array();
 		$item_count = 0;
@@ -139,28 +156,25 @@ class ItemResolver {
 			);
 		}
 
-		$resolved = array(
+		return array(
 			'items'      => $items,
 			'notes'      => $notes,
 			'item_count' => $item_count,
 		);
-
-		if ( $order_id > 0 ) {
-			$this->orders[ $order_id ] = $resolved;
-		}
-
-		return $resolved;
 	}
 
 	/**
-	 * Drop every cached product, fact and order.
+	 * Drop every cached product and fact.
+	 *
+	 * The escape hatch for the one case the caches do not cover: a product
+	 * edited within the same request that later evaluates an order containing
+	 * it. See the class docblock's invalidation table.
 	 *
 	 * @return void
 	 */
 	public function flush(): void {
 		$this->products = array();
 		$this->facts    = array();
-		$this->orders   = array();
 	}
 
 	/**

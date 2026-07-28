@@ -39,8 +39,14 @@ class DeliveryRepository {
 	 * An allowlist, not a sanitised free string: `final_status` drives support
 	 * tooling and future reporting, and an arbitrary value would sit in the
 	 * column forever with nothing able to interpret it.
+	 *
+	 * `skipped` was added in Prompt 4 (ADR-0012 §2): a rule that matched the
+	 * include set and was then excluded, whose targeting is invalid, or that was
+	 * disabled, DOES consume its identity and needs a terminal status saying so.
+	 * The column is a `varchar` policed by this list in PHP, and schema v1 is
+	 * unreleased, so this is a constant change and NOT a migration.
 	 */
-	const FINAL_STATUSES = array( 'claimed', 'scheduled', 'sent', 'failed', 'cancelled' );
+	const FINAL_STATUSES = array( 'claimed', 'scheduled', 'sent', 'failed', 'cancelled', 'skipped' );
 
 	/**
 	 * How many ids to bind per statement when deleting in bulk.

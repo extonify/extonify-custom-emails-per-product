@@ -197,6 +197,16 @@ if ( ! empty( $extonify_wcep_blockers ) ) {
  */
 define( 'EXTONIFY_WCEP_DESTRUCTIVE_TESTS_ALLOWED', true );
 
+// ---------------------------------------------------------------------------
+// NO REAL MAIL, SUITE-WIDE.
+//
+// Installed here rather than in a base class so it covers every test, including
+// ones whose author never thought about mail. See `Integration\MailGuard`: the
+// short-circuit tallies, and a `phpmailer_init` tripwire is what actually
+// proves nothing escaped.
+// ---------------------------------------------------------------------------
+\Extonify\WCEP\Tests\Integration\MailGuard::install();
+
 require_once __DIR__ . '/Unit/UnitTestCase.php';
 require_once __DIR__ . '/Integration/IntegrationTestCase.php';
 

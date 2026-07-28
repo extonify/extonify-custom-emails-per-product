@@ -58,8 +58,9 @@ class RuleMatcher {
 	}
 
 	/**
-	 * The resolver holding the request cache, so a caller evaluating several
-	 * triggers on one order resolves its items once.
+	 * The resolver holding the request's PRODUCT cache, so a caller evaluating
+	 * several triggers on one order loads each product once. It caches no order
+	 * contents (ADR-0012 §11b).
 	 *
 	 * @return ItemResolver
 	 */
@@ -76,6 +77,10 @@ class RuleMatcher {
 	 * which is what makes the immediate path current. A DEFERRED caller must
 	 * reload and revalidate rules at execution time per ADR-0007 and pass the
 	 * CURRENT rows — it must not pass a set captured before the delay.
+	 *
+	 * A ZERO-ITEM ORDER DEFERS ONLY WHEN A CANDIDATE RULE EXISTS (ADR-0008,
+	 * ADR-0012 §7). With an empty rule set the answer is already known and final,
+	 * so the result is an ordinary empty one and the caller schedules nothing.
 	 *
 	 * @param \WC_Order    $order Order the trigger fired on.
 	 * @param TriggerEvent $event Trigger event.
@@ -94,16 +99,36 @@ class RuleMatcher {
 
 		$resolved = $this->items->resolve_order( $order );
 
-		// ADR-0008: a targeted event on an order with zero line items is not
-		// evidence that nothing matches, it is evidence that the question
-		// cannot be answered yet. Evaluate nothing, claim nothing, and preserve
-		// the identity so the deferred re-evaluation reuses it.
-		if ( 0 === (int) $resolved['item_count'] ) {
-			return EvaluationResult::for_deferral( $order_id, $event );
-		}
-
+		// THE RULES ARE CONSULTED BEFORE THE DEFERRAL DECISION, NOT AFTER.
+		// Deferring is only meaningful if there is something to defer FOR.
 		if ( null === $rules ) {
 			$rules = $this->rules->find_active_for_trigger( $event->type(), $event->value() );
+		}
+
+		if ( 0 === (int) $resolved['item_count'] ) {
+			/*
+			 * ADR-0008: a targeted event on an order with zero line items is not
+			 * evidence that nothing matches, it is evidence that the question
+			 * cannot be answered yet — SO LONG AS SOMETHING COULD HAVE ANSWERED
+			 * IT. Evaluate nothing, claim nothing, and preserve the identity so
+			 * the deferred re-evaluation reuses it.
+			 */
+			if ( array() !== $rules ) {
+				return EvaluationResult::for_deferral( $order_id, $event );
+			}
+
+			/*
+			 * NO CANDIDATE, SO NOTHING TO ASK AGAIN (ADR-0008, ADR-0012 §7).
+			 * The rule set handed here is already phase-filtered, so "empty"
+			 * covers a store with no active rules, a store whose only rules are
+			 * insert-mode or delayed, and a trigger family nothing targets. The
+			 * deferral used to be decided before the rules were looked at, so
+			 * every one of those cases queued an Action Scheduler job that could
+			 * only ever re-discover the same nothing — and a status change
+			 * evaluates two families, so a bulk import queued two useless
+			 * actions per order and filled the queue.
+			 */
+			return EvaluationResult::create( $order_id, $event, array(), $resolved['notes'] );
 		}
 
 		/*
@@ -132,7 +157,11 @@ class RuleMatcher {
 	 * the other — the halt is scoped to a single trigger identity, or the
 	 * outcome would depend on which family happened to be evaluated first.
 	 *
-	 * Both share one resolver, so the order's items are resolved once.
+	 * Both share one resolver, so each PRODUCT is loaded once. The order's line
+	 * items are re-read per evaluation and deliberately not cached: an order
+	 * routinely gains, loses or replaces items between two events in one request
+	 * (ADR-0012 §11b). Re-reading them costs no query — the product facts are
+	 * what the cache is for.
 	 *
 	 * @param \WC_Order $order Order that changed status.
 	 * @param string    $from  Source status, with or without the `wc-` prefix.

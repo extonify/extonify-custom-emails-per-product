@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Repository;
 
 use Extonify\WCEP\Domain\Json;
+use Extonify\WCEP\Domain\RecipientsDocument;
 use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
 use Extonify\WCEP\Install\Migrator;
@@ -507,18 +508,27 @@ class RuleRepository {
 	/**
 	 * Encode one JSON column, honouring the shape that column's reader expects.
 	 *
-	 * `targeting` is an OBJECT document under ADR-0011 §3 and is read back with
-	 * strict object/array validation, so an empty one must be stored `{}` and
-	 * not `[]`. `recipients` is an ordinary list. Routed through one function so
-	 * `sanitize()` and `content_changed()` cannot encode the same column two
-	 * different ways and bump the revision on a no-op save.
+	 * BOTH JSON columns are OBJECT documents read back with strict object/array
+	 * validation — `targeting` under ADR-0011 §3, `recipients` under ADR-0012 §4
+	 * — so an empty one must be stored `{}` and not the `[]` PHP renders for an
+	 * empty array. Routed through one function so `sanitize()` and
+	 * `content_changed()` cannot encode the same column two different ways and
+	 * bump the revision on a no-op save.
 	 *
 	 * @param string $column Column name.
 	 * @param array  $value  Decoded value.
 	 * @return string JSON text.
 	 */
 	private static function encode_json_column( string $column, array $value ): string {
-		return 'targeting' === $column ? Targeting::encode( $value ) : Json::encode( $value );
+		if ( 'targeting' === $column ) {
+			return Targeting::encode( $value );
+		}
+
+		if ( 'recipients' === $column ) {
+			return RecipientsDocument::encode( $value );
+		}
+
+		return Json::encode( $value );
 	}
 
 	/**

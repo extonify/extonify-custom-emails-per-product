@@ -7,6 +7,7 @@
 
 namespace Extonify\WCEP;
 
+use Extonify\WCEP\Delivery\Events;
 use Extonify\WCEP\Install\Migrator;
 use Extonify\WCEP\Privacy\Eraser;
 use Extonify\WCEP\Privacy\Exporter;
@@ -137,6 +138,12 @@ final class Plugin {
 		// identity can never be re-armed because the order no longer exists.
 		// Fires for both HPOS and legacy post-based storage.
 		add_action( 'woocommerce_delete_order', array( $this, 'on_order_deleted' ) );
+
+		// ADR-0012: the delivery spine. Order events reach the matcher, matched
+		// decisions claim an identity and send, and everything that happened is
+		// written to the delivery log. Registration is hooks only; every handler
+		// re-checks that the schema is operational before it touches anything.
+		Events::register();
 
 		// Admin-only concerns: schema upgrade on plugin update without
 		// reactivation, privacy-policy suggestion, degraded-mode notice.
