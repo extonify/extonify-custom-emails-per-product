@@ -7,6 +7,7 @@
 
 namespace Extonify\WCEP\Delivery;
 
+use Extonify\WCEP\Domain\DeliveryIdentity;
 use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\MatchDecision;
 use Extonify\WCEP\Domain\Text;
@@ -35,10 +36,44 @@ defined( 'ABSPATH' ) || exit;
 class DeliveryLogger {
 
 	/**
-	 * The delivery mode this prompt implements (ADR-0005). Insert mode is
-	 * Prompt 5 and is deliberately absent rather than stubbed.
+	 * Separate mode: this plugin composes and sends its own message (ADR-0012).
 	 */
-	const MODE = 'separate';
+	const MODE_SEPARATE = 'separate';
+
+	/**
+	 * The delivery mode Prompt 5 implements: content injected into WooCommerce's
+	 * own email (ADR-0013).
+	 */
+	const MODE_INSERT = 'insert';
+
+	/**
+	 * Separate mode, under its original name.
+	 *
+	 * Kept as an alias so every separate-mode call site keeps its meaning
+	 * unchanged now that a second mode exists (ADR-0013 §8).
+	 */
+	const MODE = self::MODE_SEPARATE;
+
+	/**
+	 * Insert outcomes (ADR-0013 §1a, §6a).
+	 *
+	 * FOUR, AND NO TWO OF THEM ARE SYNONYMS. `sent` and `failed` are both things
+	 * WooCommerce REPORTED; `unresolved` is the absence of a report about a send
+	 * that DID begin; `abandoned` is a render that never reached a send at all.
+	 * Collapsing any pair asserts something nobody observed — and collapsing
+	 * `abandoned` into `unresolved` is the specific error that reported a
+	 * demonstrably successful delivery as unresolved, because a third party
+	 * rendered the same email again afterwards and threw the render away.
+	 */
+	const OUTCOME_SENT       = 'sent';
+	const OUTCOME_FAILED     = 'failed';
+	const OUTCOME_UNRESOLVED = DeliveryDetailRepository::UNRESOLVED;
+	const OUTCOME_ABANDONED  = DeliveryDetailRepository::ABANDONED;
+
+	/**
+	 * Every outcome an insert record may carry.
+	 */
+	const INSERT_OUTCOMES = array( self::OUTCOME_SENT, self::OUTCOME_FAILED, self::OUTCOME_UNRESOLVED, self::OUTCOME_ABANDONED );
 
 	/**
 	 * Non-matching decisions that DO consume an identity (ADR-0012 §2).
@@ -388,6 +423,194 @@ class DeliveryLogger {
 		// Recorded as fully as it can be: there is no tombstone to write onto,
 		// and the error log entry above IS the record.
 		return self::result( true, 0, 0, true );
+	}
+
+	/**
+	 * Record one rule's content having been inserted into a native email
+	 * (ADR-0013 §1).
+	 *
+	 * THE CLAIM IS INVERTED HERE, AND THAT IS THE WHOLE POINT. Separate mode
+	 * claims BEFORE sending because the claim decides whether to send. Insert
+	 * mode has no such decision — WooCommerce sent its own email, and our content
+	 * was already inside it — so this runs at FINALIZATION and the record is a
+	 * LOG, never a gate.
+	 *
+	 * A `suppressed` claim is therefore NOT a duplicate to be discarded: it is a
+	 * merchant deliberately re-sending a native email, which genuinely does
+	 * re-insert the content (ADR-0004). A second attempt row is written and the
+	 * tombstone's counter has already incremented atomically inside `claim()`.
+	 *
+	 * WHAT `final_status` MEANS ON AN AGGREGATE INSERT TOMBSTONE (ADR-0013 §1a):
+	 * **the LATEST attempt**, never "any success". A merchant looking at an
+	 * identity they have just re-sent is asking *did the message I just sent go
+	 * out*, and "sent" left over from three days ago answers a different
+	 * question. The per-attempt rows keep the whole history, so nothing is lost
+	 * by the aggregate tracking the newest fact — and each attempt row ALWAYS
+	 * records its own true outcome, which is not negotiable either way.
+	 *
+	 * @param int    $order_id        Order id, from the slot recorded at push.
+	 * @param int    $rule_id         Rule id.
+	 * @param string $native_email_id WooCommerce email the content went into —
+	 *                                the ADR-0004 insert identity.
+	 * @param int    $revision        Rule revision, audit only.
+	 * @param string $position        Injection position that emitted it.
+	 * @param string $outcome         One of self::INSERT_OUTCOMES.
+	 * @return array Structured result.
+	 */
+	public function record_insert( int $order_id, int $rule_id, string $native_email_id, int $revision, string $position, string $outcome = self::OUTCOME_SENT ): array {
+		if ( ! in_array( $outcome, self::INSERT_OUTCOMES, true ) ) {
+			// An allowlist, not a default: silently recording an unrecognised
+			// outcome as `sent` is the exact failure this parameter exists to
+			// remove.
+			$this->log_error( 'refused an unrecognised insert outcome "' . $outcome . '" for order #' . $order_id . ' rule #' . $rule_id );
+			return self::result( false, 1, 0, false );
+		}
+
+		$claim = $this->deliveries->claim( $order_id, $rule_id, self::MODE_INSERT, DeliveryIdentity::native( $native_email_id ), $revision );
+
+		if ( DeliveryRepository::FAILED === $claim['result'] ) {
+			return $this->record_claim_failure( $claim, $order_id, $rule_id, self::insert_label( $outcome ) . ' into ' . $native_email_id );
+		}
+
+		$delivery_id = (int) $claim['delivery_id'];
+		$abandoned   = self::OUTCOME_ABANDONED === $outcome;
+
+		/*
+		 * ONE TRANSACTION ALLOCATES THE ATTEMPT, WRITES THE ROW AND RECORDS THE
+		 * STATUS (ADR-0009 amendment). The attempt number used to be read before the
+		 * transaction, from `suppressed_count`, so two concurrent recorders could
+		 * agree on the same one — and the status could be written by whoever finished
+		 * last rather than by whoever allocated the highest attempt.
+		 *
+		 * TWO RULES ARE PUSHED DOWN INTO THAT LOCK, both of them ADR-0013's, and both
+		 * because they depend on the tombstone's attempt history:
+		 *
+		 *   - `$defer_to_genuine_attempt` (§6a) — an ABANDONED render is not a
+		 *     delivery attempt and must not overwrite the status of a send that
+		 *     really happened;
+		 *   - `$type_by_genuine_attempt` (§6b) — ⚠ `auto` versus `resend` is derived
+		 *     from prior GENUINE attempts, never from claim suppression. An abandoned
+		 *     render claims the identity and creates the tombstone, so deriving the
+		 *     type from the claim recorded the merchant's FIRST real delivery as a
+		 *     `resend` of a message that had never gone out. The §6a policy was
+		 *     applied to `final_status` and not to attempt typing; this closes it.
+		 */
+		$recorded = $this->details->record_attempt(
+			$delivery_id,
+			array(
+				// DERIVED INSIDE THE TRANSACTION (§6b) — this value is a placeholder
+				// that `$type_by_genuine_attempt` below replaces. It is still written
+				// as a real member of the allowlist so nothing downstream can see an
+				// unvalidated type.
+				'type'     => 'auto',
+				'state'    => $outcome,
+				'reason'   => Text::log_value( self::insert_reason( $outcome, $native_email_id, $position ) ),
+				// THE PER-ATTEMPT AUDIT (ADR-0013 §1a). The tombstone carries one
+				// `rule_revision_sent` — necessarily the newest — so without this
+				// a send at revision 1 followed by a resend at revision 2 exposed
+				// only one revision for two different bodies. Every attempt now
+				// states the revision, the email, the position and the outcome
+				// that produced IT.
+				//
+				// ⚠ THE ATTEMPT NUMBER IS NOT COPIED IN HERE. It is allocated inside
+				// the transaction below, and the `attempt` COLUMN is its single
+				// source; a JSON copy could only ever disagree with the column it
+				// duplicates. It used to be written here from a number computed
+				// before the transaction — which is exactly the number that could be
+				// wrong.
+				'snapshot' => array(
+					'insert' => array(
+						'rule_revision'   => $revision,
+						'native_email_id' => $native_email_id,
+						'position'        => $position,
+						'outcome'         => $outcome,
+					),
+				),
+			),
+			$outcome,
+			$revision,
+			$abandoned,
+			true
+		);
+
+		$written = $recorded['id'] > 0 ? 1 : 0;
+
+		// A DEFERRED STATUS IS A SUCCESS, NOT A SHORTFALL. The tombstone deliberately
+		// keeps the status of its latest real send attempt (ADR-0013 §6a); reporting
+		// that as "not finalized" would log an error for correct behaviour.
+		$finalized = $recorded['status_written'] || $recorded['status_deferred'];
+
+		return $this->verify( $delivery_id, self::insert_label( $outcome, 'resend' === (string) $recorded['type'] ), 1, $written, $finalized );
+	}
+
+	/**
+	 * The shortfall-log description for one insert outcome.
+	 *
+	 * @param string $outcome Outcome code.
+	 * @param bool   $repeat  Whether this attempt was DERIVED as a resend — i.e.
+	 *                        whether the tombstone already carried a real send
+	 *                        attempt (ADR-0013 §6b). Never the claim result.
+	 * @return string
+	 */
+	private static function insert_label( string $outcome, bool $repeat = false ): string {
+		if ( self::OUTCOME_ABANDONED === $outcome ) {
+			return $repeat ? 'an abandoned re-render' : 'an abandoned render';
+		}
+
+		if ( self::OUTCOME_UNRESOLVED === $outcome ) {
+			return $repeat ? 'an unresolved re-insert' : 'an unresolved insert';
+		}
+
+		if ( self::OUTCOME_FAILED === $outcome ) {
+			return $repeat ? 'a failed re-insert' : 'a failed insert';
+		}
+
+		return $repeat ? 'a re-insert' : 'an insert';
+	}
+
+	/**
+	 * The stored `reason` for one insert outcome.
+	 *
+	 * ⚠ `unresolved` IS NOT `failed`, AND THE WORDING KEEPS THEM APART. Nothing
+	 * is known to have failed: the content went into the message, and
+	 * `woocommerce_email_sent` never fired to say what happened next — because
+	 * the send threw and the throw escaped its caller (ADR-0012 §11e), or the
+	 * render never sent at all. Recording that as `failed` would assert something
+	 * untrue; dropping it would leave the merchant with an email this plugin
+	 * contributed to and no log entry at all.
+	 *
+	 * ⚠ NO LONGER SAYS "re-inserted", AND THAT IS DELIBERATE (ADR-0013 §6b). The
+	 * wording used to be chosen from the CLAIM result, which is the same wrong
+	 * source the attempt `type` was derived from: an abandoned render claims the
+	 * identity, so a merchant's first real delivery was described as a re-insert of
+	 * a message that had never gone out. Whether an attempt is a repeat is now
+	 * recorded in exactly one place — the `type` column, derived from real delivery
+	 * history inside the allocating transaction — and this string no longer offers a
+	 * second, weaker answer to the same question.
+	 *
+	 * @param string $outcome         Outcome code.
+	 * @param string $native_email_id Native email id.
+	 * @param string $position        Injection position.
+	 * @return string
+	 */
+	private static function insert_reason( string $outcome, string $native_email_id, string $position ): string {
+		if ( self::OUTCOME_ABANDONED === $outcome ) {
+			return 'content was rendered into ' . $native_email_id . ' at ' . $position
+				. ' but that render was never sent — no delivery was attempted';
+		}
+
+		if ( self::OUTCOME_UNRESOLVED === $outcome ) {
+			return 'content was rendered into ' . $native_email_id . ' at ' . $position
+				. ' but the send outcome was never reported';
+		}
+
+		$prefix = 'inserted into ' . $native_email_id . ' at ' . $position;
+
+		if ( self::OUTCOME_FAILED === $outcome ) {
+			return $prefix . ' — WooCommerce reported the message as not sent';
+		}
+
+		return $prefix;
 	}
 
 	/**

@@ -606,6 +606,15 @@ ADR-0011 §5 violation filed as deferred work; it still holds.
   returns both `matched_item_ids` and `matched_product_ids` so a later prompt can
   choose per-order or per-item without the engine having pre-judged it.
 
+  **⚠ NOTE (Prompt 5C):** between Prompt 5B and Prompt 5C this was **not** deferred
+  in practice. 5B gave the column validated storage without giving either phase a
+  filter for it, so a stored `daily` rule was **delivered immediately, once per
+  trigger** — `none`'s behaviour under another name — and could halt supported rules
+  through `stop_processing`. Both phases now filter it before evaluation from
+  `Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` (ADR-0013 §8a). **The lesson is
+  general: adding validated storage for a column is what makes its values reachable,
+  so storage and phase filtering must land in the same prompt.**
+
 ### Findings recorded, deliberately not fixed
 
 - **Two new line-level PHPCS suppressions**, both for WooCommerce-owned hooks this
@@ -901,3 +910,289 @@ than a fifth speculative audit.
   the boundary-property assertion above covers the two candidates that exist
   today, and any newly mutated one would surface as a delivery bug rather than at
   the guard.
+
+## Added in Prompt 5 — insert mode and the render context
+
+### Contract-consistency gate
+
+Re-run by direct examination against ADR-0003, ADR-0004, ADR-0005 and the new
+ADR-0013. One clause needed correcting, and it was found by the code rather than
+by reading:
+
+- **ADR-0003's frame does not span all five injection positions.** Verified in
+  the WC 10.9.4 templates: `woocommerce_email_order_meta` and
+  `woocommerce_email_customer_details` fire *after* `woocommerce_email_order_details`
+  returns, so the frame is already popped. ADR-0013 §4a records this, keeps the
+  frame's ADR-0003 lifetime (it is the *item-hook* window, which is what ADR-0003
+  and the POC both call it), and adds a render record for the email-only
+  positions. The storefront guarantee depends on the frame and is unchanged.
+
+Three pre-existing fixtures described rules that ADR-0013 §2 now refuses, and
+were corrected rather than the rule being weakened:
+
+1. `RuleRevisionTest::payload()` was an **insert rule with a one-day delay** —
+   now a separate rule with no delay; the `delivery_mode` provider entry inverts
+   to `insert`.
+2. `RuleRepositoryTest::payload()` was an **insert rule**, so every
+   trigger-normalisation test in that class was asserting against the empty
+   trigger fields ADR-0013 §2 stores — now a separate rule. Insert-mode storage
+   has its own suite in `InsertRuleStorageTest`.
+3. `DeliveryPhaseTest`'s `insert AND delayed` data set describes a rule that can
+   no longer exist. Replaced by
+   `test_an_insert_rule_with_a_delay_cannot_be_stored_at_all()`, which asserts
+   the stronger guarantee: the repository refuses it, so it never reaches the
+   phase filter.
+
+### Findings recorded, deliberately not fixed
+
+- **The whole-render query count carries WooCommerce's own variance.** A native
+  render runs core's templates, options and transients, so its absolute count
+  moves by a few queries between runs for reasons that have nothing to do with
+  this plugin. The gate's two actual claims are asserted exactly instead —
+  evaluation runs ONCE per render whatever the positions, and evaluation cost
+  does not grow with the candidate set — and the whole-render figure is reported
+  as an observation beside them.
+
+- **⚠ `wc_get_template_html()` leaves an output buffer open on an exception.** An
+  interrupted render leaks an `ob_start()` level; the interrupted-preview test
+  unwinds it so the assertion stays about this plugin. This plugin cannot close a
+  buffer it did not open at a call site it does not own. Already recorded under
+  the Prompt 1d flagged behaviour; re-confirmed on WC 10.9.4.
+
+- **`native_email_id` verification is capability-detected, not mandatory**
+  (ADR-0013 §2). When `WC()->mailer()` is unavailable — a CLI importer, a
+  migration, an activation hook — an unrecognised id is accepted and checked
+  again at render time against the email actually rendering. Refusing a valid
+  rule because WooCommerce had not booted would be the worse failure.
+
+- **A render record outlives its frame, and is retired at finalization,
+  reconciliation or shutdown.** A render whose send throws keeps its record until
+  the shutdown sweep.
+
+  **⚠ CORRECTED (Prompt 5B, gate 9).** This entry used to continue: *"a stale
+  record cannot mis-fire: `current_render()` scans newest-first and matches email
+  id, order and audience, so only a later render of the same email for the same
+  order and audience could shadow it — and that render pushes a newer record which
+  wins."* Every clause of that was wrong by the time it was written, and the last
+  one describes the DEFECT rather than the defence — a newer record winning is
+  precisely how an inner render captured an outer render's emission (ADR-0013 §5a).
+  `current_render()` has not scanned newest-first since Prompt 5B: it considers the
+  INNERMOST record only, validates it against the email object, email id, order,
+  audience and enclosing depth, and emits nothing when that fails (0/1/2+, ADR-0013
+  §4a). And the in-frame positions no longer ask it at all — they resolve through
+  the live frame (ADR-0013 §4c), because a leaked inner record could otherwise
+  shadow the render that was actually emitting.
+
+- **The five positions are fixed for now.** `Injector::POSITIONS` is a constant
+  map; the admin UI that lets a merchant choose among them is Prompt 7's, and an
+  unrecognised stored `insert_position` falls back to `after_order_table` rather
+  than emitting nothing. That fallback is now a RECORDED DECISION rather than a
+  survivor: ADR-0009's write-boundary classification names `insert_position` as its
+  one documented repairing column, with the reasoning.
+
+## Prompt 5A — insert finalization and correlation
+
+### Findings recorded, deliberately not fixed
+
+- **A nested send that throws BETWEEN its reservation and its bind leaks one
+  reservation.** The window is `woocommerce_mail_content` → the
+  `woocommerce_mail_callback` filter, inside `WC_Email::send()`. If a third party
+  throws there and another third party catches it, the enclosing send's
+  `woocommerce_mail_callback_params` pops the inner send's leaked reservation
+  instead of its own. `bind()` verifies the reservation against the email object,
+  so a cross-object leak binds nothing and the enclosing render is reported
+  `unresolved` — honest. A SAME-object leak would bind the inner slot. Closing it
+  needs re-entrancy handling around a third-party throw mid-send, which is
+  exactly the class Prompt 4d's stopping rule sends here. Two nested sends of the
+  same email type, one of which throws inside a two-line window and is swallowed.
+
+- **⚠ `woocommerce_mail_content` carries no `$email` argument** (WC 10.9.4,
+  `class-wc-email.php:1233`), so the send scope has to come from
+  `woocommerce_email_headers` / `woocommerce_email_attachments` — see
+  ADR-0013 §5a and §5d. Every native WooCommerce email in 10.9.4 sends through
+  `send_notification()` or `send_if_recipient()`, both of which evaluate those as
+  the last arguments to `send()`. **Re-check on version bumps:** a future
+  subclass calling `send()` with literal headers and attachments would supply no
+  scope. *(Updated Prompt 5B: the consequence is now simply that **no token is
+  taken**, so that send reserves nothing and its render is reported as an
+  abandoned render. The "exactly one eligible slot in the whole ledger" fallback
+  this entry used to name no longer exists — see ADR-0013 §5d.)*
+
+- **⚠ `WC_Email::get_content()` DELETES unrecognised HTML entities from
+  plain-text bodies** (WC 10.9.4, `$plain_search` pattern `/&[^&\s;]+;/i` →
+  `''`). ADR-0013 §4b delivers plain text already decoded, so nothing of ours
+  meets that pattern. Worth watching: the same pattern will eat a literal `&`
+  that happens to be followed by non-space characters and a semicolon.
+
+- **`Injector::normalize_position()` still repairs rather than refuses.** An
+  unrecognised stored `insert_position` falls back to `after_order_table`. That
+  is deliberate for now — a position is a presentation choice with a sane
+  default, not a targeting decision — but it is the last `sanitize_key()`-then-
+  accept in the insert path and belongs to the Prompt 7 rule editor's validation.
+  *(Promoted in Prompt 5B from a backlog note to an explicit clause in ADR-0009's
+  write-boundary classification, so it is a decision a future reader can disagree
+  with rather than the one unexamined survivor of the sweep.)*
+
+## Prompt 5B — render identity, depth safety and the write boundary
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ The exact-token handoff has a one-statement residual window** (ADR-0013
+  §5d). A third party that *completes* a render on the same email object between
+  the enclosing render's completion and that send's header evaluation gets its
+  token taken instead. Both renders are complete, both share the object and the
+  email id, and the only remaining discriminator — the order — comes from
+  `$email->object`, which WooCommerce has already corrupted after a nested render.
+  The window is one PHP statement wide
+  (`send( $to, $subject, $content, $headers, $attachments )`) and the failure is a
+  mis-attribution between two renders of the *same* email, never a lost delivery.
+
+- **⚠ In-flight refused-frame markers still scale with a third party's recursion
+  depth** (ADR-0013 §5c). A marker must be poppable to keep `open_details` and
+  `open_footer` LIFO-aligned, so it cannot be capped without corrupting the
+  removal of a real frame. Each is a six-key array and two strings, against that
+  party's own stack frame, output buffer and `wc_get_order()` object — and the
+  query per level, which is the part that reaches the database, is gone. Capping
+  the markers is not the fix; the recursion is not ours to stop.
+
+- ~~**A render that leaks its record still blocks the two POST-FRAME positions of
+  the render that encloses it.**~~ **CLOSED in Prompt 5C (ADR-0013 §5f).** Deferring
+  it was wrong for a reason that only became visible once §5e moved promotion to a
+  post-frame position: a render that cannot identify itself there can never become a
+  send candidate, so the "safe direction" of losing an insertion was in fact losing
+  the whole correlation. A frame closing at `order_details:15` now retires every
+  record pushed after its own, which is provable rather than heuristic — a nested
+  render's post-frame positions fire immediately after its own `order_details`
+  returns, still inside the enclosing render's window. Measured on a 19-deep storm:
+  15 leaked records before, 0 after.
+
+- **`suppressed_count` and `MAX(attempt)` can legitimately disagree.** Attempt
+  numbers now come from the attempt rows (ADR-0009), and the claim counter counts
+  claims — including claims whose row was never written, and claims made while the
+  kill switch was off. Neither is wrong; they answer different questions. Any
+  future admin UI must not present one as the other.
+
+- **`consolidation` is validated by SHAPE, not by vocabulary** (ADR-0009). The
+  storage contract refuses what `sanitize_key()` would have repaired, without
+  inventing an enumeration for behaviour that does not exist yet. When
+  consolidation lands it must become an enumerated column like `delivery_mode`.
+
+## Prompt 5C — insert correlation and phase isolation
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ The §5d residual survives §5e, in a narrower form.** A third party that
+  completes a render on the same email object between the enclosing render's
+  TERMINAL POSITION and that send's header evaluation still promotes last and is
+  taken. §5e closed every window inside the render (`order_meta`,
+  `customer_details`, the footer, and anything nested from them); what remains is
+  the one-PHP-statement gap between `get_content()` returning and `get_headers()`
+  being evaluated, plus a third party rendering from a lower-priority callback on
+  `woocommerce_email_headers` itself. The order cannot separate the two candidates
+  because `$email->object` is already corrupted by then (ADR-0013 §5, flagged), and
+  the failure is a mis-attribution between two renders of the *same* email — never
+  a lost delivery.
+
+- **A custom template that fires neither `customer_details` nor the footer gets no
+  correlation at all.** Verified: no WC 10.9.4 order-email template does this, so it
+  takes a template override. The render is never promoted, the send identifies
+  nothing, and the slot is swept `unresolved` rather than `abandoned` — honest, but
+  the merchant sees an unknown outcome for a message that probably went out. A
+  future prompt could add a terminal-position backstop at
+  `woocommerce_email_footer`-equivalent depth for plain text; there is no such hook
+  today.
+
+- **`RenderLedger::$candidates` and `RenderContext::$renders` are not capped.**
+  Both are bounded in practice by `MAX_RENDER_DEPTH` for nesting and by the number
+  of sends in a request, and §5f now collects leaked records at every frame close —
+  but neither has an explicit cap of the kind ADR-0013 §5c gives the diagnostic
+  arrays. A third party sending in an unbounded loop grows `$candidates` by one
+  entry per send that never sends.
+
+- **Attempt typing costs one extra indexed read per insert record.**
+  `has_genuine_attempt()` now runs on every `record_attempt()` rather than only when
+  the status is deferred, because `type` needs it too. It is a single
+  `LIMIT 1` on the `delivery_id` index inside a transaction that already holds the
+  parent lock, and it replaced a `find_by_id()` read that used to happen outside it.
+
+## Prompt 5D — SEND SCOPE FREEZE (the last Prompt 5 correction pass)
+
+### Contract-consistency gate
+
+- **Every comment claiming priority 999 "runs after any third party" was wrong and
+  is corrected.** WordPress runs LOWER priority numbers first. The claim appeared in
+  `RenderEvents::register()`, in `RenderEvents::on_emissions_end()`, in
+  `RenderEvents::on_footer()`, twice in `RenderLedger`'s `$candidates` and
+  `promote_render()` docblocks, and in ADR-0013 §5e. Promotion now runs at
+  `PHP_INT_MAX` and the *real* guarantee is stated in ADR-0013 §5e — highest
+  available priority, with a later registration at the same priority still running
+  after ours.
+- **ADR-0013 §5e's template table said the two POS receipt templates "fire no
+  footer at all".** They fire `woocommerce_pos_email_footer`
+  (`customer-pos-completed-order.php:122`, `customer-pos-refunded-order.php:133`).
+  Corrected there and in the flagged-behaviour list.
+
+### ⚠ THE STOP RULE — accepted residual risks, CLOSED to further correction
+
+Prompt 5D is the fifth correction pass on Prompt 5 and the last. The same
+correlation defect appeared at `current_render()`, `bind()`, `reserve()`,
+`take_completed()` and `observe_send()` — one hook further out each round. The
+render lifecycle has finitely many hooks; third-party behaviour does not.
+
+**From here on, any finding that requires a third party to send or render from
+inside another send's argument evaluation is recorded here as accepted residual
+risk and is not fixed.** The list below is that record. None of them loses a
+delivery; each is a mis-attribution between two renders of the *same* email
+object, produced by a third party doing something WooCommerce gives it no reason
+to do.
+
+- **A send that reaches `woocommerce_mail_content` with NO observation frame open
+  consumes the innermost frame that is open** — which may belong to an enclosing
+  send. Produced by calling `WC_Email::send()` directly with a literal headers
+  string, or by an email class that overrides `get_headers()` and
+  `get_attachments()` without applying their filters. No WC 10.9.4 email class does
+  either. `woocommerce_mail_content` carries no `$email` argument (flagged in
+  ADR-0013), so there is nothing at that point to validate against; the pre-5D
+  scalar had the identical exposure.
+- **A send that fires `woocommerce_email_attachments` without ever firing
+  `woocommerce_email_headers`** pairs with the enclosing send's frame instead of
+  opening its own. Same cause, same absence of any WC 10.9.4 instance.
+- **A nested send that opens a frame and then THROWS before reaching
+  `woocommerce_mail_content`, with a third party swallowing the throw**, leaves that
+  frame on top. If it carries the same object and email id as the enclosing send,
+  the enclosing send's attachments observation pairs with it and reserves the
+  nested render's token. The identity check rejects a stale frame of a *different*
+  object or email id; it cannot reject one that is identical, which is this defect
+  class's permanent limit. The stale frame is otherwise dropped and counted at the
+  shutdown sweep, and its slot reported as an abandoned render.
+- **A callback registered LATER at `PHP_INT_MAX` still runs after this plugin's
+  promotion**, because same-priority callbacks run in registration order. A render
+  nested from such a callback promotes after the render enclosing it. This is the
+  floor of what any priority can guarantee.
+- **The §5d/§5e residual, unchanged:** a third party completing a render on the
+  same email object in the one-PHP-statement gap between `get_content()` returning
+  and `get_headers()` being evaluated still promotes last and is taken.
+- **A nested send that throws between `reserve()` and `bind()` leaks one
+  reservation** (recorded in Prompt 5A, still true). The reservation stack stays
+  depth-aligned for every send that completes.
+
+### Findings recorded, deliberately not fixed
+
+- **`RenderLedger::$send_frames` has a clearing path but no numeric cap.** One
+  frame is popped per `reserve()`, and the whole stack is cleared by `take_open()`
+  at shutdown — so it is bounded by live send nesting in every ordinary request.
+  It grows only when a third party evaluates `get_headers()` / `get_attachments()`
+  **without sending**, repeatedly: each such call costs that party a full
+  WordPress filter dispatch and costs this plugin one four-key array. This is the
+  same shape as the uncapped `$candidates` and `$renders` recorded in Prompt 5C,
+  and is left with them rather than given a third bespoke bound.
+- **`rendered_at` / `finalized_at` on the per-attempt snapshot.** ADR-0013 §6c now
+  states that attempt numbers are persistence order, not occurrence order, because
+  abandoned renders are written at the shutdown sweep. Recording the two timestamps
+  would make the true occurrence order recoverable for support tooling and the
+  future admin UI. Not built in a correction pass: it is an addition to the audit
+  payload and belongs with the admin work that would read it.
+- **`RenderContext`'s three diagnostic arrays survive `shutdown()` on purpose.**
+  They are hard-capped at `MAX_DIAGNOSTIC_ENTRIES`, they exist to explain the
+  request after it ends, and `shutdown` is when something reads them. Every
+  collection that carries *state* is cleared there (ADR-0013 §5h).

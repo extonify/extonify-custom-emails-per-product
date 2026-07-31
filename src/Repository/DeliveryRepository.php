@@ -45,8 +45,14 @@ class DeliveryRepository {
 	 * disabled, DOES consume its identity and needs a terminal status saying so.
 	 * The column is a `varchar` policed by this list in PHP, and schema v1 is
 	 * unreleased, so this is a constant change and NOT a migration.
+	 *
+	 * `abandoned` was added in Prompt 5B (ADR-0013 §6a): content was rendered into a
+	 * native email that was never sent. It is written ONLY when the tombstone holds
+	 * no real send attempt — a tombstone whose latest genuine attempt succeeded keeps
+	 * `sent`, because a third party throwing a later render away does not undo a
+	 * delivery that happened.
 	 */
-	const FINAL_STATUSES = array( 'claimed', 'scheduled', 'sent', 'failed', 'cancelled', 'skipped' );
+	const FINAL_STATUSES = array( 'claimed', 'scheduled', 'sent', 'failed', 'cancelled', 'skipped', 'unresolved', DeliveryDetailRepository::ABANDONED );
 
 	/**
 	 * How many ids to bind per statement when deleting in bulk.

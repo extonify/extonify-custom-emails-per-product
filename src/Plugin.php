@@ -8,6 +8,7 @@
 namespace Extonify\WCEP;
 
 use Extonify\WCEP\Delivery\Events;
+use Extonify\WCEP\Render\RenderEvents;
 use Extonify\WCEP\Install\Migrator;
 use Extonify\WCEP\Privacy\Eraser;
 use Extonify\WCEP\Privacy\Exporter;
@@ -144,6 +145,13 @@ final class Plugin {
 		// written to the delivery log. Registration is hooks only; every handler
 		// re-checks that the schema is operational before it touches anything.
 		Events::register();
+
+		// ADR-0013: insert mode. The render context brackets every native email
+		// render, the insert phase evaluates ONCE per render, and the five
+		// injection callbacks read that answer. Registration is hooks only, and
+		// the one SHARED hook is a hard no-op outside an email render — which is
+		// the storefront guarantee, not a runtime check.
+		RenderEvents::register();
 
 		// Admin-only concerns: schema upgrade on plugin update without
 		// reactivation, privacy-policy suggestion, degraded-mode notice.

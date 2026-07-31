@@ -53,13 +53,36 @@ final class DeliveryIdentity {
 	const MODES = array( 'insert', 'separate' );
 
 	/**
-	 * Trigger-identity prefixes defined by ADR-0004. The identity is
-	 * `status:{slug}`, `transition:{from}>{to}` or `refund:{id}` — nothing else.
-	 * Keeping this closed is deliberate: an unrecognised prefix means a caller
-	 * invented an identity format, and a tombstone written under an identity no
-	 * later call can reproduce silently defeats duplicate prevention.
+	 * Identity prefixes defined by ADR-0004. The identity is `status:{slug}`,
+	 * `transition:{from}>{to}`, `refund:{id}` or `native:{native_email_id}` —
+	 * nothing else. Keeping this closed is deliberate: an unrecognised prefix
+	 * means a caller invented an identity format, and a tombstone written under
+	 * an identity no later call can reproduce silently defeats duplicate
+	 * prevention.
+	 *
+	 * `native` IS INSERT MODE'S (ADR-0013 §1). ADR-0004 states the insert
+	 * identity as `order_id | rule_id | native_email_id`; the tuple is unchanged
+	 * and only its third component's ENCODING into this column gains a prefix,
+	 * exactly as a status trigger's slug does. Without one, a bare
+	 * `customer_processing_order` would be indistinguishable from an invented
+	 * format — which is the one thing this list exists to make impossible.
 	 */
-	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund' );
+	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund', self::NATIVE_PREFIX );
+
+	/**
+	 * Prefix marking an insert-mode identity.
+	 */
+	const NATIVE_PREFIX = 'native';
+
+	/**
+	 * Build the insert-mode identity for one native email (ADR-0013 §1).
+	 *
+	 * @param string $native_email_id WooCommerce email id.
+	 * @return string
+	 */
+	public static function native( string $native_email_id ): string {
+		return self::NATIVE_PREFIX . ':' . self::normalize( $native_email_id );
+	}
 
 	/**
 	 * Storage width of the trigger_identity column (ADR-0009). A longer value

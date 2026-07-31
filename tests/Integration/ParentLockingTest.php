@@ -213,6 +213,162 @@ final class ParentLockingTest extends IntegrationTestCase {
 	}
 
 	/**
+	 * 5B-5. ATTEMPT ALLOCATION IS SERIALISED BY THE PARENT LOCK, on two real
+	 * connections (ADR-0009 amendment).
+	 *
+	 * ⚠ THE TWO RACES THIS CLOSES. The attempt number used to be computed OUTSIDE
+	 * the transaction that later locked the parent, and from the tombstone's
+	 * `suppressed_count` rather than from the attempt rows:
+	 *
+	 *   1. two concurrent recorders read the same count and wrote the same attempt
+	 *      number;
+	 *   2. the recorder that FINISHED last wrote `final_status`, even if it had
+	 *      allocated the EARLIER attempt — so a tombstone could report the outcome of
+	 *      attempt 2 while holding attempt 3.
+	 *
+	 * Both are impossible once allocation, insertion and the status write happen
+	 * inside one transaction holding the parent row: whoever allocates the higher
+	 * number is necessarily the one who writes last.
+	 *
+	 * @return void
+	 */
+	public function test_attempt_allocation_and_status_are_serialised_by_the_parent_lock() {
+		$second = $this->second_connection();
+		if ( null === $second ) {
+			$this->markTestSkipped( 'A second database connection could not be opened in this environment.' );
+		}
+
+		global $wpdb;
+
+		$primary = $wpdb;
+		$details = new QuietDetailRepository();
+
+		$order_id = $this->fake_order_id();
+		$claim    = $this->deliveries->claim( $order_id, 224, 'insert', 'native:customer_processing_order' );
+		$this->track_delivery( $claim['delivery_id'] );
+
+		$delivery_id = (int) $claim['delivery_id'];
+
+		// --- Attempt 1, on connection A. --------------------------------------
+		$first = $details->record_attempt( $delivery_id, array( 'state' => 'sent' ), 'sent', 7 );
+		$this->track_detail( (int) $first['id'] );
+
+		$this->assertSame( 1, $first['attempt'] );
+		$this->assertTrue( $first['status_written'] );
+
+		/*
+		 * --- WHILE A HOLDS THE PARENT, B CANNOT ALLOCATE OR WRITE STATUS. -----
+		 *
+		 * This is the state connection A is in for the whole of its own
+		 * `record_attempt()`: transaction open, parent row held. The old code did its
+		 * allocation OUTSIDE this window, which is exactly why two recorders could
+		 * agree on a number.
+		 */
+		$table = Migrator::table( 'deliveries' );
+
+		$primary->query( 'START TRANSACTION' );
+		$primary->get_var( $primary->prepare( "SELECT id FROM {$table} WHERE id = %d FOR UPDATE", $delivery_id ) );
+
+		$second->query( 'SET SESSION innodb_lock_wait_timeout = 2' );
+
+		$GLOBALS['wpdb'] = $second;
+
+		$start   = microtime( true );
+		$blocked = $details->record_attempt( $delivery_id, array( 'state' => 'failed' ), 'failed', 9 );
+		$elapsed = microtime( true ) - $start;
+
+		$GLOBALS['wpdb'] = $primary;
+
+		$this->assertSame( 0, $blocked['id'], 'The second connection wrote an attempt row while the parent was held.' );
+		$this->assertSame( 0, $blocked['attempt'], 'The second connection allocated an attempt number under the lock.' );
+		$this->assertFalse( $blocked['status_written'], 'The second connection wrote final_status under the lock.' );
+		$this->assertGreaterThan( 1.0, $elapsed, 'The second connection did not actually wait for the lock.' );
+
+		$primary->query( 'COMMIT' );
+
+		$held = $this->deliveries->find_by_id( $delivery_id );
+		$this->assertSame( 'sent', $held['final_status'], 'A blocked recorder changed the tombstone anyway.' );
+		$this->assertSame( 7, (int) $held['rule_revision_sent'] );
+
+		/*
+		 * --- AND THE NUMBER COMES FROM THE ATTEMPT ROWS, NOT `suppressed_count`. -
+		 *
+		 * Three more claims of the same identity push `suppressed_count` to 3 without
+		 * writing any attempt row. The old allocator would call the next attempt 4.
+		 */
+		for ( $i = 0; $i < 3; $i++ ) {
+			// THE SAME IDENTITY, so each claim is suppressed and increments the
+			// counter without writing anything.
+			$this->deliveries->claim( $order_id, 224, 'insert', 'native:customer_processing_order' );
+		}
+
+		$bumped = $this->deliveries->find_by_id( $delivery_id );
+		$this->assertGreaterThan( 0, (int) $bumped['suppressed_count'], 'The claim counter did not move, so the probe proves nothing.' );
+
+		// --- Attempt 2, now on connection B, which sees A's committed row. -----
+		$second->query( 'SET SESSION innodb_lock_wait_timeout = DEFAULT' );
+		$GLOBALS['wpdb'] = $second;
+
+		$on_b = $details->record_attempt( $delivery_id, array( 'state' => 'failed' ), 'failed', 9 );
+
+		$GLOBALS['wpdb'] = $primary;
+		$this->track_detail( (int) $on_b['id'] );
+
+		$this->assertSame(
+			2,
+			$on_b['attempt'],
+			'The attempt number came from suppressed_count instead of MAX(attempt).'
+		);
+
+		// --- Attempt 3, back on connection A. ---------------------------------
+		$on_a = $details->record_attempt( $delivery_id, array( 'state' => 'sent' ), 'sent', 11 );
+		$this->track_detail( (int) $on_a['id'] );
+
+		$this->assertSame( 3, $on_a['attempt'] );
+
+		// --- Consecutive, unique, and the status belongs to the HIGHEST. -------
+		$rows     = $details->find_for_delivery( $delivery_id );
+		$attempts = array_map( 'intval', wp_list_pluck( $rows, 'attempt' ) );
+
+		$this->assertSame( array( 1, 2, 3 ), $attempts, 'Attempt numbers are not consecutive and unique.' );
+		$this->assertSame( count( $attempts ), count( array_unique( $attempts ) ) );
+
+		$highest   = $rows[ count( $rows ) - 1 ];
+		$tombstone = $this->deliveries->find_by_id( $delivery_id );
+
+		$this->assertSame( 3, (int) $highest['attempt'] );
+		$this->assertSame(
+			(string) $highest['state'],
+			(string) $tombstone['final_status'],
+			'The tombstone contradicts its own highest attempt.'
+		);
+		$this->assertSame(
+			11,
+			(int) $tombstone['rule_revision_sent'],
+			'The revision belongs to an earlier attempt than the status does.'
+		);
+
+		$second->close();
+
+		fwrite(
+			STDERR,
+			sprintf(
+				"\n[5B item 5] two real connections, one tombstone:\n"
+				. "  A attempt 1 (sent, rev 7); B blocked %.1fs under A's parent lock and wrote NOTHING\n"
+				. "  suppressed_count pushed to %d, next allocation still %d — MAX(attempt)+1, not the claim counter\n"
+				. "  B attempt 2 (failed, rev 9); A attempt 3 (sent, rev 11)\n"
+				. "  attempts %s; tombstone final_status=%s rev=%d = the HIGHEST attempt's own outcome\n",
+				$elapsed,
+				(int) $bumped['suppressed_count'],
+				$on_b['attempt'],
+				implode( ',', $attempts ),
+				$tombstone['final_status'],
+				(int) $tombstone['rule_revision_sent']
+			)
+		);
+	}
+
+	/**
 	 * A rejected insert leaves no open transaction behind, so the next
 	 * statement on this connection is not silently swept into one.
 	 *

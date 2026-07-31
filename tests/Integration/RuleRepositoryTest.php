@@ -45,7 +45,18 @@ final class RuleRepositoryTest extends IntegrationTestCase {
 			'priority'        => 5,
 			'trigger_type'    => 'status',
 			'trigger_value'   => 'completed',
-			'delivery_mode'   => 'insert',
+			/*
+			 * SEPARATE SINCE PROMPT 5.
+			 *
+			 * Most of this class is about TRIGGER normalisation, and ADR-0013 §2
+			 * stores empty trigger fields for an insert rule — so an insert-mode
+			 * payload would make every one of those tests assert the absence of
+			 * the thing it exists to check. `native_email_id` and
+			 * `insert_position` stay populated so the column coverage is
+			 * unchanged; insert-mode storage has its own suite in
+			 * `InsertRuleStorageTest`.
+			 */
+			'delivery_mode'   => 'separate',
 			'native_email_id' => 'customer_completed_order',
 			'insert_position' => 'after_order_table',
 			'targeting'       => array( 'products' => array( 12, 34 ) ),
@@ -53,6 +64,8 @@ final class RuleRepositoryTest extends IntegrationTestCase {
 			'subject'         => 'How to care for your mug',
 			'heading'         => 'Mug care',
 			'content'         => '<p>Hand wash only.</p>',
+			// Legal on a SEPARATE rule, which is what this payload now is —
+			// ADR-0013 §2 only refuses a delay on an INSERT rule.
 			'delay_seconds'   => 3600,
 			'consolidation'   => 'none',
 			'stop_processing' => 1,
@@ -83,26 +96,175 @@ final class RuleRepositoryTest extends IntegrationTestCase {
 	}
 
 	/**
-	 * Unknown enum values fall back to the safe default rather than being
-	 * written through.
+	 * 5B-4 / gate 13. EVERY ENUMERATED AND IDENTIFIER COLUMN IS VALIDATED ON ITS RAW
+	 * VALUE, and a refused write writes NOTHING.
 	 *
-	 * `trigger_type` is DELIBERATELY NOT in this list — falling back is safe for
-	 * `status` and `delivery_mode`, whose defaults make a rule do LESS, but a
-	 * trigger fallback makes a rule do something DIFFERENT. See
-	 * test_an_unknown_trigger_type_is_refused_not_coerced().
+	 * ⚠ REPLACES `test_unknown_enum_values_fall_back_safely()`, WHOSE CONTRACT WAS
+	 * THE DEFECT. Falling back was justified on the grounds that the defaults make a
+	 * rule do LESS — and for `status` that is nearly true, but for `delivery_mode` it
+	 * is the opposite: `unknown` fell back to `separate`, so an importer that meant
+	 * to insert a block of content into WooCommerce's own email instead created a
+	 * rule that SENDS ITS OWN EMAIL TO THE CUSTOMER. Doing more than was asked, from
+	 * a value nobody recognised.
+	 *
+	 * Each case below is a value `sanitize_key()` would have REPAIRED into something
+	 * valid, which is the whole failure shape: junk input becoming a different valid
+	 * setting rather than a rejected write.
 	 *
 	 * @return void
 	 */
-	public function test_unknown_enum_values_fall_back_safely() {
-		$data                  = $this->payload();
-		$data['status']        = 'wide-open';
-		$data['delivery_mode'] = 'broadcast';
+	public function test_enumerated_and_identifier_columns_refuse_raw_input_they_would_have_repaired() {
+		$cases = array(
+			'status'          => array( 'wide-open', 'ACTIVE', ' active ', 'active!', 'act<b>ive</b>', '', 'activé' ),
+			'delivery_mode'   => array( 'broadcast', 'unknown', 'INSERT', 'insert!', ' insert ', '', 'sep arate' ),
+			'native_email_id' => array( 'Customer_Completed_Order', ' customer_completed_order ', 'customer_completed_order!', str_repeat( 'a', 101 ) ),
+			'consolidation'   => array( 'NONE', ' none ', 'none!', '<b>none</b>', '', str_repeat( 'n', 21 ) ),
+			'trigger_type'    => array( 'statuz', 'STATUS', 'status!', ' status ', '' ),
+			'trigger_value'   => array( '<b>completed</b>', 'completed%20', '', '   ', 'com pleted' ),
+		);
 
-		$id   = $this->track_rule( $this->repo->insert( $data ) );
-		$rule = $this->repo->find( $id );
+		$reported = array();
 
-		$this->assertSame( 'inactive', $rule['status'], 'An unknown status must fail CLOSED.' );
+		foreach ( $cases as $column => $values ) {
+			// A GOOD ROW FIRST, so every refusal below is measured against a rule that
+			// exists and must come out unchanged.
+			$baseline_id = $this->track_rule( $this->repo->insert( $this->payload() ) );
+			$this->assertGreaterThan( 0, $baseline_id );
+
+			$before = $this->repo->find( $baseline_id );
+			$count  = $this->rule_count();
+
+			foreach ( $values as $value ) {
+				$data            = $this->payload();
+				$data[ $column ] = $value;
+
+				$label = '' === trim( (string) $value ) ? '(blank)' : $value;
+
+				// --- INSERT: no row is written at all. -------------------------
+				$this->assertSame(
+					0,
+					$this->repo->insert( $data ),
+					sprintf( 'insert() accepted %s = "%s".', $column, $label )
+				);
+				$this->assertSame(
+					$count,
+					$this->rule_count(),
+					sprintf( 'A refused insert of %s = "%s" wrote a row.', $column, $label )
+				);
+
+				// --- UPDATE: the existing row is left exactly as it was. -------
+				$this->assertFalse(
+					$this->repo->update( $baseline_id, array( $column => $value ) ),
+					sprintf( 'update() accepted %s = "%s".', $column, $label )
+				);
+				$this->assertSame(
+					$before,
+					$this->repo->find( $baseline_id ),
+					sprintf( 'A refused update of %s = "%s" modified the stored row.', $column, $label )
+				);
+
+				$reported[ $column ][] = $label;
+			}
+		}
+
+		// And the legitimate values still write, or this test proves only that
+		// everything is refused.
+		$accepted = $this->track_rule( $this->repo->insert( $this->payload() ) );
+		$rule     = $this->repo->find( $accepted );
+
+		$this->assertSame( 'active', $rule['status'] );
 		$this->assertSame( 'separate', $rule['delivery_mode'] );
+		$this->assertSame( 'customer_completed_order', $rule['native_email_id'] );
+		$this->assertSame( 'none', $rule['consolidation'] );
+
+		$lines = '';
+		foreach ( $reported as $column => $values ) {
+			$lines .= sprintf( "  %-16s refused: %s\n", $column, implode( ', ', $values ) );
+		}
+
+		fwrite( STDERR, "\n[5B item 4 / gate 13] validated columns, raw values refused with NO write:\n" . $lines );
+	}
+
+	/**
+	 * 5B-4 / gate 13. THE LENGTH BOUND IS THE COLUMN'S OWN WIDTH.
+	 *
+	 * A well-formed but over-long id used to pass validation and be TRUNCATED by
+	 * MySQL into a different, unmatchable target. The constant and the schema must
+	 * therefore agree, and this reads the width out of `information_schema` rather
+	 * than trusting either one.
+	 *
+	 * @return void
+	 */
+	public function test_the_identifier_length_bounds_match_the_columns_they_protect() {
+		global $wpdb;
+
+		$table = Migrator::table( 'rules' );
+
+		$widths = array();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection in a test.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+				WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME IN ( %s, %s )',
+				$table,
+				'native_email_id',
+				'consolidation'
+			),
+			ARRAY_A
+		);
+
+		foreach ( (array) $rows as $row ) {
+			$widths[ (string) $row['COLUMN_NAME'] ] = (int) $row['CHARACTER_MAXIMUM_LENGTH'];
+		}
+
+		$this->assertSame(
+			$widths['native_email_id'],
+			RuleRepository::MAX_NATIVE_EMAIL_ID_LENGTH,
+			'MAX_NATIVE_EMAIL_ID_LENGTH has drifted from the column it protects.'
+		);
+		$this->assertSame(
+			$widths['consolidation'],
+			RuleRepository::MAX_CONSOLIDATION_LENGTH,
+			'MAX_CONSOLIDATION_LENGTH has drifted from the column it protects.'
+		);
+
+		// The boundary itself: exactly at the width is stored, one over is refused.
+		$exact          = str_repeat( 'a', RuleRepository::MAX_NATIVE_EMAIL_ID_LENGTH );
+		$data           = $this->payload();
+		$data['native_email_id'] = $exact;
+
+		$id = $this->track_rule( $this->repo->insert( $data ) );
+		$this->assertGreaterThan( 0, $id );
+		$this->assertSame(
+			$exact,
+			$this->repo->find( $id )['native_email_id'],
+			'A value exactly the column width was altered on the way in.'
+		);
+
+		fwrite(
+			STDERR,
+			sprintf(
+				"\n[5B item 4 / gate 13] length bounds match the schema: native_email_id varchar(%d), consolidation varchar(%d)\n",
+				$widths['native_email_id'],
+				$widths['consolidation']
+			)
+		);
+	}
+
+	/**
+	 * Total rule count, for proving that a refused write wrote nothing.
+	 *
+	 * @return int
+	 */
+	private function rule_count(): int {
+		global $wpdb;
+
+		$table = Migrator::table( 'rules' );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned table in a test.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- plugin-derived identifier.
+		return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
 	}
 
 	/**

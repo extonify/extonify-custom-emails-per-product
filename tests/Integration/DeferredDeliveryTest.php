@@ -237,7 +237,16 @@ final class DeferredDeliveryTest extends DeliveryTestCase {
 		 */
 		$cases = array(
 			'no active rules'                => array( 'to' => 'processing', 'rule' => null, 'actions' => 0 ),
-			'only an insert rule'            => array( 'to' => 'on-hold', 'rule' => array( 'delivery_mode' => 'insert' ), 'actions' => 0 ),
+			// An insert rule needs a target email to be storable at all since
+			// Prompt 5 (ADR-0013 §2); it is still out of this phase.
+			'only an insert rule'            => array(
+				'to'      => 'on-hold',
+				'rule'    => array(
+					'delivery_mode'   => 'insert',
+					'native_email_id' => 'customer_on_hold_order',
+				),
+				'actions' => 0,
+			),
 			'only a delayed rule'            => array( 'to' => 'cancelled', 'rule' => array( 'delay_seconds' => 604800 ), 'actions' => 0 ),
 			'a rule on another trigger only' => array( 'to' => 'refunded', 'rule' => array( 'trigger_value' => 'completed' ), 'actions' => 0 ),
 			// One, not two: the rule targets `status:{to}`, so the

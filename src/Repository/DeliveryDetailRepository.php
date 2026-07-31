@@ -37,7 +37,54 @@ class DeliveryDetailRepository {
 	/**
 	 * Attempt states (ADR-0005).
 	 */
-	const STATES = array( 'scheduled', 'sent', 'failed', 'cancelled', 'skipped', 'suppressed' );
+	const STATES = array( 'scheduled', 'sent', 'failed', 'cancelled', 'skipped', 'suppressed', self::UNRESOLVED, self::ABANDONED );
+
+	/**
+	 * Content was rendered into a native email whose send outcome was never
+	 * reported (ADR-0013 §6).
+	 *
+	 * DISTINCT FROM `failed` ON PURPOSE. Nothing is known to have failed: the
+	 * content went into the message, and `woocommerce_email_sent` never fired to
+	 * say what happened next — because the send threw (ADR-0012 §11e), or the
+	 * render never sent at all. Recording it as `failed` would assert something
+	 * untrue; dropping it would leave a silent gap.
+	 *
+	 * Schema v1 is unreleased and `state` is a PHP-enforced varchar allowlist, so
+	 * this is a constant change and NOT a migration — the same reasoning
+	 * ADR-0012 §2 used when adding `skipped`.
+	 */
+	const UNRESOLVED = 'unresolved';
+
+	/**
+	 * Content was rendered into a native email that WAS NEVER SENT (ADR-0013 §6a).
+	 *
+	 * DISTINCT FROM `unresolved`, WHICH IS ITSELF DISTINCT FROM `failed`. Three
+	 * different facts, and collapsing any pair of them states something untrue:
+	 *
+	 *   - `failed`     — a send happened and WooCommerce reported it did not work;
+	 *   - `unresolved` — a send happened and NOTHING was reported back;
+	 *   - `abandoned`  — no send happened at all. A render was produced and thrown
+	 *     away, which is what a third party calling `get_content()` for its own
+	 *     purposes does.
+	 *
+	 * An abandoned render is NOT a delivery attempt, so it never becomes the
+	 * tombstone's `final_status` while a genuine attempt exists — see
+	 * self::record_attempt()'s `$defer_to_genuine_attempt`.
+	 *
+	 * Schema v1 is unreleased and `state` is a PHP-enforced varchar allowlist, so
+	 * this is a constant change and NOT a migration — the same reasoning ADR-0012 §2
+	 * used for `skipped` and ADR-0013 §6 for `unresolved`.
+	 */
+	const ABANDONED = 'abandoned';
+
+	/**
+	 * States that record a REAL send attempt and its outcome (ADR-0013 §6a).
+	 *
+	 * The tombstone's `final_status` belongs to the latest of these. Anything else —
+	 * `abandoned` above all — describes something that happened around a delivery
+	 * rather than a delivery.
+	 */
+	const GENUINE_ATTEMPT_STATES = array( 'sent', 'failed', self::UNRESOLVED );
 
 	/**
 	 * Fields that can hold personal data and must therefore be surfaced by the
@@ -88,9 +135,6 @@ class DeliveryDetailRepository {
 	public function insert( int $delivery_id, array $data ): int {
 		global $wpdb;
 
-		$type  = isset( $data['type'] ) ? sanitize_key( (string) $data['type'] ) : 'auto';
-		$state = isset( $data['state'] ) ? sanitize_key( (string) $data['state'] ) : 'scheduled';
-
 		// LOCK THE PARENT FOR THE DURATION (Prompt 2c Item 4).
 		//
 		// Order cleanup resolves tombstone ids, deletes the details, then
@@ -101,16 +145,241 @@ class DeliveryDetailRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
 		$wpdb->query( 'START TRANSACTION' );
 
+		$prepared = $this->prepare_row( $delivery_id, $data );
+
+		if ( null === $prepared['row'] ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+			$wpdb->query( 'ROLLBACK' );
+			$this->log_error( 'refused to write a delivery-detail row: ' . (string) $prepared['error'] );
+			return 0;
+		}
+
+		$insert_id = $this->write_row( $prepared['row'] );
+
+		if ( $insert_id <= 0 ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+			$wpdb->query( 'ROLLBACK' );
+			return 0;
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+		$wpdb->query( 'COMMIT' );
+
+		return $insert_id;
+	}
+
+	/**
+	 * Allocate an attempt number, write the attempt row, and record the tombstone's
+	 * resulting status — ALL IN ONE TRANSACTION, holding the parent row lock
+	 * (ADR-0009 amendment, Prompt 5B Item E).
+	 *
+	 * ⚠ WHY THIS EXISTS, AND BOTH DEFECTS ARE RACES THAT CORRUPT THE AUDIT.
+	 *
+	 * 1. **Two recorders could allocate the same attempt number.** The attempt
+	 *    number used to be computed OUTSIDE this transaction, from the tombstone's
+	 *    `suppressed_count`, and only then was the row inserted under the parent
+	 *    lock. Two concurrent recorders — a merchant resending while a webhook fires
+	 *    the same email — both read the same count and both wrote attempt 2. The
+	 *    count is also the wrong source: it counts CLAIMS, not attempt rows, so a
+	 *    claim that failed to write its row left the numbering permanently offset.
+	 *    The number now comes from `MAX(attempt) + 1` over the attempt rows
+	 *    themselves, computed after the `FOR UPDATE` lock is held, so a second
+	 *    recorder blocks until the first has committed its row and then sees it.
+	 *
+	 * 2. **The tombstone could contradict its own highest attempt.** Request A
+	 *    inserted attempt 2, request B inserted attempt 3 and wrote
+	 *    `final_status = sent`, then A finished and wrote `final_status = failed` —
+	 *    a tombstone reporting the outcome of an EARLIER attempt than the one it
+	 *    holds. Allocating and writing the status inside the same lock makes that
+	 *    ordering impossible: whoever allocates the higher attempt is, necessarily,
+	 *    the one who writes last.
+	 *
+	 * A FAILED STATUS WRITE DOES NOT ROLL BACK THE ATTEMPT ROW. The row records
+	 * something that really happened, and discarding it would lose the only evidence
+	 * of a real send; the shortfall is REPORTED to the caller instead (ADR-0012 §3).
+	 *
+	 * @param int         $delivery_id              Owning tombstone id.
+	 * @param array       $data                     Attempt fields; `attempt` is
+	 *                                              ignored — it is allocated here.
+	 * @param string|null $final_status             Status to record on the
+	 *                                              tombstone, or null to leave it.
+	 * @param int         $rule_revision_sent       Revision to record with it.
+	 * @param bool        $defer_to_genuine_attempt When true the status is written
+	 *                                              ONLY if no earlier attempt on
+	 *                                              this tombstone recorded a real
+	 *                                              send outcome — the ADR-0013 §6a
+	 *                                              abandoned-render rule. Checked
+	 *                                              inside the lock, or it would be a
+	 *                                              third race.
+	 * @param bool        $type_by_genuine_attempt  When true `type` is DERIVED here:
+	 *                                              `resend` if this tombstone already
+	 *                                              carries a real send attempt,
+	 *                                              `auto` otherwise (ADR-0013 §6b).
+	 *                                              The caller's `type` is ignored.
+	 * @return array{id:int,attempt:int,type:string,status_written:bool,status_deferred:bool}
+	 */
+	public function record_attempt( int $delivery_id, array $data, ?string $final_status = null, int $rule_revision_sent = 0, bool $defer_to_genuine_attempt = false, bool $type_by_genuine_attempt = false ): array {
+		global $wpdb;
+
+		$result = array(
+			'id'              => 0,
+			'attempt'         => 0,
+			'type'            => '',
+			'status_written'  => false,
+			'status_deferred' => false,
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+		$wpdb->query( 'START TRANSACTION' );
+
+		// Takes the parent row FOR UPDATE. Everything below happens under that lock.
+		$prepared = $this->prepare_row( $delivery_id, $data );
+
+		if ( null === $prepared['row'] ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+			$wpdb->query( 'ROLLBACK' );
+			$this->log_error( 'refused to write a delivery-detail row: ' . (string) $prepared['error'] );
+			return $result;
+		}
+
+		$row            = $prepared['row'];
+		$attempt        = $this->next_attempt_locked( $delivery_id );
+		$row['attempt'] = $attempt;
+
+		// READ BEFORE WRITING: this row must not count itself as an earlier attempt.
+		$has_genuine = $this->has_genuine_attempt( $delivery_id );
+
+		if ( $type_by_genuine_attempt ) {
+			/*
+			 * THE TYPE COMES FROM DELIVERY HISTORY, NOT FROM CLAIM SUPPRESSION
+			 * (ADR-0013 §6b). A first genuine send whose identity was already claimed
+			 * by an ABANDONED render was being written `resend` — recording a
+			 * merchant's FIRST delivery as a repeat of something that never went out.
+			 * Both values are members of self::TYPES, so validation is not bypassed.
+			 */
+			$row['type'] = $has_genuine ? 'resend' : 'auto';
+		}
+
+		$result['type'] = (string) $row['type'];
+
+		$insert_id = $this->write_row( $row );
+
+		if ( $insert_id <= 0 ) {
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+			$wpdb->query( 'ROLLBACK' );
+			return $result;
+		}
+
+		$result['id']      = $insert_id;
+		$result['attempt'] = $attempt;
+
+		if ( null !== $final_status ) {
+			if ( $defer_to_genuine_attempt && $has_genuine ) {
+				$result['status_deferred'] = true;
+			} else {
+				$result['status_written'] = $this->deliveries()->set_final_status( $delivery_id, $final_status, $rule_revision_sent );
+			}
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
+		$wpdb->query( 'COMMIT' );
+
+		return $result;
+	}
+
+	/**
+	 * The next attempt number for a tombstone, read under the parent lock.
+	 *
+	 * MUST BE CALLED INSIDE THE TRANSACTION THAT HOLDS THE PARENT `FOR UPDATE`
+	 * LOCK. Called anywhere else it is a plain read and two callers can agree on the
+	 * same number.
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return int
+	 */
+	private function next_attempt_locked( int $delivery_id ): int {
+		global $wpdb;
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned detail table inside the allocating transaction; a cached read would defeat the allocation.
+		$max = $wpdb->get_var(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+			$wpdb->prepare( "SELECT MAX(attempt) FROM {$table} WHERE delivery_id = %d", $delivery_id )
+		);
+
+		return max( 1, (int) $max + 1 );
+	}
+
+	/**
+	 * Whether a tombstone already carries a REAL send attempt (ADR-0013 §6a).
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return bool
+	 */
+	private function has_genuine_attempt( int $delivery_id ): bool {
+		global $wpdb;
+		$table = $this->table();
+
+		// Placeholders are generated from the COUNT of a class constant, and every
+		// member of it is a hardcoded literal.
+		$placeholders = implode( ', ', array_fill( 0, count( self::GENUINE_ATTEMPT_STATES ), '%s' ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- probe of the plugin-owned detail table inside the allocating transaction; the answer decides a status write and must be live.
+		$found = $wpdb->get_var(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %s tokens counted from the GENUINE_ATTEMPT_STATES constant, whose members are hardcoded literals.
+				"SELECT id FROM {$table} WHERE delivery_id = %d AND state IN ( {$placeholders} ) LIMIT 1",
+				array_merge( array( $delivery_id ), self::GENUINE_ATTEMPT_STATES )
+			)
+		);
+
+		return null !== $found;
+	}
+
+	/**
+	 * Write one prepared row. NO transaction control of its own — the caller owns
+	 * it, because ⚠ MySQL treats a nested `START TRANSACTION` as an implicit COMMIT
+	 * of the outer one, which would release the parent lock mid-operation.
+	 *
+	 * @param array $row Prepared row from self::prepare_row().
+	 * @return int Inserted row id, or 0 on failure.
+	 */
+	private function write_row( array $row ): int {
+		global $wpdb;
+
+		// Positional, matching the FIXED key order self::prepare_row() builds.
+		$formats = array( '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s' );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- insert into the plugin-owned detail table; $wpdb->insert() prepares every value.
+		$ok = $wpdb->insert( $this->table(), $row, $formats );
+
+		return $ok ? (int) $wpdb->insert_id : 0;
+	}
+
+	/**
+	 * Validate one attempt row and build it, or explain why it cannot be written.
+	 *
+	 * TAKES THE PARENT ROW `FOR UPDATE` as part of the integrity probe, so every
+	 * caller must already be inside a transaction.
+	 *
+	 * @param int   $delivery_id Owning tombstone id.
+	 * @param array $data        Raw input.
+	 * @return array{row:?array,error:?string}
+	 */
+	private function prepare_row( int $delivery_id, array $data ): array {
+		$type  = isset( $data['type'] ) ? sanitize_key( (string) $data['type'] ) : 'auto';
+		$state = isset( $data['state'] ) ? sanitize_key( (string) $data['state'] ) : 'scheduled';
+
 		// INTEGRITY GATE (Prompt 2b Item 4). There is no database foreign key —
 		// ADR-0009 makes referential integrity repository discipline — so this
 		// is the only thing standing between a typo and an orphan row that no
 		// cleanup path and no privacy path can ever reach.
 		$invalid = $this->validate_row( $delivery_id, $data, $type, $state );
 		if ( null !== $invalid ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
-			$wpdb->query( 'ROLLBACK' );
-			$this->log_error( 'refused to write a delivery-detail row: ' . $invalid );
-			return 0;
+			return array(
+				'row'   => null,
+				'error' => $invalid,
+			);
 		}
 
 		// Strict, like `type` and `state`: silently relabelling a BCC as a
@@ -118,10 +387,10 @@ class DeliveryDetailRepository {
 		// recipient type in a privacy export.
 		$recipient_type = Recipient::normalize_type( (string) ( $data['recipient_type'] ?? 'to' ) );
 		if ( null === $recipient_type ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
-			$wpdb->query( 'ROLLBACK' );
-			$this->log_error( 'refused an unrecognised recipient_type for delivery #' . $delivery_id );
-			return 0;
+			return array(
+				'row'   => null,
+				'error' => 'unrecognised recipient_type for delivery #' . $delivery_id,
+			);
 		}
 
 		$recipient        = null;
@@ -130,13 +399,11 @@ class DeliveryDetailRepository {
 			$raw       = (string) $data['recipient'];
 			$recipient = Recipient::normalize( $raw );
 			if ( null === $recipient ) {
-				// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
-				$wpdb->query( 'ROLLBACK' );
-				$this->log_error(
-					'refused to store an unresolvable recipient for delivery #' . $delivery_id
-					. ' — the delivery engine must resolve one row per recipient'
+				return array(
+					'row'   => null,
+					'error' => 'unresolvable recipient for delivery #' . $delivery_id
+						. ' — the delivery engine must resolve one row per recipient',
 				);
-				return 0;
 			}
 			$display_name = Recipient::display_name( $raw );
 			if ( null !== $display_name ) {
@@ -148,55 +415,53 @@ class DeliveryDetailRepository {
 			}
 		}
 
-		$row = array(
-			'delivery_id'       => $delivery_id,
-			// A non-positive parent id is NOT a parent. Storing the raw cast
-			// would write 0 — a fake parent that validation never inspects,
-			// because it only checks values greater than zero.
-			'parent_attempt_id' => ( isset( $data['parent_attempt_id'] ) && (int) $data['parent_attempt_id'] > 0 )
-				? (int) $data['parent_attempt_id']
-				: null,
-			'attempt'           => isset( $data['attempt'] ) ? max( 1, (int) $data['attempt'] ) : 1,
-			// Validated above, not defaulted: an unrecognised state would be
-			// silently rewritten to 'scheduled', and since the retention purge
-			// branches on state = 'failed', a typo like 'faild' would quietly
-			// give a failed delivery the 90-day window instead of 180.
-			'type'              => $type,
-			'state'             => $state,
-			// Shape-only sanitisation: see Text::log_value(). A tag-stripping
-			// sanitiser would delete `<alice@example.test>` from a diagnostic.
-			'reason'            => isset( $data['reason'] ) ? Text::log_value( (string) $data['reason'] ) : '',
-			'recipient'         => $recipient,
-			'recipient_type'    => $recipient_type,
-			'recipient_header'  => $recipient_header,
-			'subject'           => isset( $data['subject'] ) ? sanitize_text_field( (string) $data['subject'] ) : null,
-			'snapshot'          => isset( $data['snapshot'] ) ? Json::encode( (array) $data['snapshot'] ) : null,
-			'failure_message'   => isset( $data['failure_message'] ) ? Text::log_value( (string) $data['failure_message'] ) : null,
-			'is_debug'          => ! empty( $data['is_debug'] ) ? 1 : 0,
-			// UTC, matching the tombstone and the gmdate() comparison in
-			// purge_older_than(). Never a MySQL CURRENT_TIMESTAMP default: the
-			// database server's system timezone is not necessarily UTC, and a
-			// local-time default would mis-fire retention by that offset.
-			'created_at'        => current_time( 'mysql', true ),
+		return array(
+			'row'   => array(
+				'delivery_id'       => $delivery_id,
+				// A non-positive parent id is NOT a parent. Storing the raw cast
+				// would write 0 — a fake parent that validation never inspects,
+				// because it only checks values greater than zero.
+				'parent_attempt_id' => ( isset( $data['parent_attempt_id'] ) && (int) $data['parent_attempt_id'] > 0 )
+					? (int) $data['parent_attempt_id']
+					: null,
+				'attempt'           => isset( $data['attempt'] ) ? max( 1, (int) $data['attempt'] ) : 1,
+				// Validated above, not defaulted: an unrecognised state would be
+				// silently rewritten to 'scheduled', and since the retention purge
+				// branches on state = 'failed', a typo like 'faild' would quietly
+				// give a failed delivery the 90-day window instead of 180.
+				'type'              => $type,
+				'state'             => $state,
+				// Shape-only sanitisation: see Text::log_value(). A tag-stripping
+				// sanitiser would delete `<alice@example.test>` from a diagnostic.
+				'reason'            => isset( $data['reason'] ) ? Text::log_value( (string) $data['reason'] ) : '',
+				'recipient'         => $recipient,
+				'recipient_type'    => $recipient_type,
+				'recipient_header'  => $recipient_header,
+				'subject'           => isset( $data['subject'] ) ? sanitize_text_field( (string) $data['subject'] ) : null,
+				'snapshot'          => isset( $data['snapshot'] ) ? Json::encode( (array) $data['snapshot'] ) : null,
+				'failure_message'   => isset( $data['failure_message'] ) ? Text::log_value( (string) $data['failure_message'] ) : null,
+				'is_debug'          => ! empty( $data['is_debug'] ) ? 1 : 0,
+				// UTC, matching the tombstone and the gmdate() comparison in
+				// purge_older_than(). Never a MySQL CURRENT_TIMESTAMP default: the
+				// database server's system timezone is not necessarily UTC, and a
+				// local-time default would mis-fire retention by that offset.
+				'created_at'        => current_time( 'mysql', true ),
+			),
+			'error' => null,
 		);
+	}
 
-		$formats = array( '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s' );
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- insert into the plugin-owned detail table; $wpdb->insert() prepares every value.
-		$ok = $wpdb->insert( $this->table(), $row, $formats );
-
-		if ( ! $ok ) {
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
-			$wpdb->query( 'ROLLBACK' );
-			return 0;
-		}
-
-		$insert_id = (int) $wpdb->insert_id;
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- transaction control around plugin-owned tables.
-		$wpdb->query( 'COMMIT' );
-
-		return $insert_id;
+	/**
+	 * The parent tombstone repository.
+	 *
+	 * A seam for the same reason `DeliveryRepository::details()` is one, and the
+	 * status write it provides deliberately issues no transaction control of its
+	 * own, so it participates in self::record_attempt()'s transaction.
+	 *
+	 * @return DeliveryRepository
+	 */
+	protected function deliveries(): DeliveryRepository {
+		return new DeliveryRepository();
 	}
 
 	/**

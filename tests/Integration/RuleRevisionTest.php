@@ -50,7 +50,18 @@ final class RuleRevisionTest extends IntegrationTestCase {
 			'priority'        => 10,
 			'trigger_type'    => 'status',
 			'trigger_value'   => 'completed',
-			'delivery_mode'   => 'insert',
+			/*
+			 * A SEPARATE BASELINE WITH NO DELAY, since Prompt 5.
+			 *
+			 * This payload exists to cover every COLUMN, and it used to be an
+			 * insert rule carrying `delay_seconds => 86400`. ADR-0013 §2 now
+			 * refuses that combination outright — there is no way to insert
+			 * content into an email that is already sending, a day from now — so
+			 * the baseline moved to the mode where a delay is meaningful.
+			 * `native_email_id` and `insert_position` stay populated, so the
+			 * column coverage this test guards is unchanged.
+			 */
+			'delivery_mode'   => 'separate',
 			'native_email_id' => 'customer_completed_order',
 			'insert_position' => 'after_order_table',
 			'targeting'       => array( 'products' => array( 1 ) ),
@@ -58,7 +69,7 @@ final class RuleRevisionTest extends IntegrationTestCase {
 			'subject'         => 'Baseline subject',
 			'heading'         => 'Baseline heading',
 			'content'         => '<p>Baseline content.</p>',
-			'delay_seconds'   => 86400,
+			'delay_seconds'   => 0,
 			'consolidation'   => 'none',
 			'stop_processing' => 0,
 		);
@@ -100,7 +111,10 @@ final class RuleRevisionTest extends IntegrationTestCase {
 			'content'               => array( 'content', '<p>Different content.</p>' ),
 			'recipients'            => array( 'recipients', array( 'customer', 'admin' ) ),
 			'targeting'             => array( 'targeting', array( 'products' => array( 2, 3 ) ) ),
-			'delivery_mode'         => array( 'delivery_mode', 'separate' ),
+			// The baseline is `separate` since Prompt 5, so the meaningful change
+			// is the other way. `native_email_id` is already populated and the
+			// baseline delay is 0, so this is a legal insert rule (ADR-0013 §2).
+			'delivery_mode'         => array( 'delivery_mode', 'insert' ),
 			'insert_position'       => array( 'insert_position', 'before_order_table' ),
 			'native_email_id'       => array( 'native_email_id', 'customer_processing_order' ),
 			// NEW in Prompt 2a — silently exempt before.

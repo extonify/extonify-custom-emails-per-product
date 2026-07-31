@@ -96,6 +96,13 @@ class Migrator {
 					'columns' => array( 'trigger_type', 'trigger_value' ),
 					'unique'  => false,
 				),
+				// ADR-0013 §2: insert rules are found by the WooCommerce email
+				// they target, never by a trigger. Schema v1 is unreleased, so
+				// this is an in-place amendment of v1 and NOT migration 2.
+				'insert_lookup'   => array(
+					'columns' => array( 'delivery_mode', 'native_email_id', 'status' ),
+					'unique'  => false,
+				),
 			),
 			'types'   => array(),
 		),
@@ -538,7 +545,8 @@ class Migrator {
 	updated_at datetime NOT NULL default '0000-00-00 00:00:00',
 	PRIMARY KEY  (id),
 	KEY status_priority (status, priority),
-	KEY trigger_lookup (trigger_type, trigger_value)
+	KEY trigger_lookup (trigger_type, trigger_value),
+	KEY insert_lookup (delivery_mode, native_email_id, status)
 ) {$charset_collate};";
 
 		// ADR-0004 tombstone. Holds no direct contact or message-content fields

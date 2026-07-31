@@ -639,6 +639,15 @@ class Orchestrator {
 	 *
 	 * An unfiltered rule is therefore a DEFECT, never a default.
 	 *
+	 * THE FILTER COVERS EVERY COLUMN WHOSE BEHAVIOUR IS UNIMPLEMENTED, and the list
+	 * is maintained as such rather than grown one incident at a time
+	 * (self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS). ⚠ `consolidation` was missing until
+	 * Prompt 5C: Prompt 5B gave it validated storage, so a merchant could store
+	 * `daily` and have the rule delivered **immediately, once per trigger**, which is
+	 * the behaviour of `none` under another name. Out of scope silently meant
+	 * "handled by whatever path exists" — the same defect as insert rules being sent
+	 * separately, arriving through DATA rather than through code.
+	 *
 	 * @param array[] $rules Candidate rule rows.
 	 * @return array[] Rows this phase may deliver.
 	 */
@@ -650,10 +659,7 @@ class Orchestrator {
 				continue;
 			}
 
-			// ADR-0007 scheduling is Prompt 6. Sending a seven-day delay
-			// immediately is the same class of error as sending an insert rule
-			// separately.
-			if ( (int) ( $rule['delay_seconds'] ?? 0 ) > 0 ) {
+			if ( ! self::behaviour_is_implemented( $rule ) ) {
 				continue;
 			}
 
@@ -661,6 +667,43 @@ class Orchestrator {
 		}
 
 		return $deliverable;
+	}
+
+	/**
+	 * Columns carrying behaviour no phase implements yet, with the ONLY value each
+	 * may hold to be deliverable (ADR-0012 §9, ADR-0013 §8a).
+	 *
+	 * | Column | Deliverable value | Owner |
+	 * |---|---|---|
+	 * | `delay_seconds` | `0` | Prompt 6 — ADR-0007 scheduling |
+	 * | `consolidation` | `none` | a later prompt — ADR-0005 consolidation |
+	 *
+	 * A rule holding anything else is left ENTIRELY untouched by both phases: no
+	 * claim, no send, no record, and — because the filter runs BEFORE evaluation —
+	 * no halt of a supported rule through its `stop_processing` flag.
+	 */
+	const UNIMPLEMENTED_BEHAVIOUR_DEFAULTS = array(
+		'delay_seconds' => '0',
+		'consolidation' => 'none',
+	);
+
+	/**
+	 * Whether every unimplemented-behaviour column on a rule holds its default.
+	 *
+	 * SHARED BY BOTH PHASES so they cannot drift: insert mode applies the same list
+	 * in its indexed fetch, and this is the assertion that the two agree.
+	 *
+	 * @param array $rule Rule row.
+	 * @return bool
+	 */
+	public static function behaviour_is_implemented( array $rule ): bool {
+		foreach ( self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS as $column => $default ) {
+			if ( (string) ( $rule[ $column ] ?? $default ) !== (string) $default ) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	/**

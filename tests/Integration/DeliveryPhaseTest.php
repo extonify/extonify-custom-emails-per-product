@@ -81,14 +81,45 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 			),
 			'delayed one day'     => array( array( 'delay_seconds' => 86400 ), 'a rule delayed by one day' ),
 			'delayed one second'  => array( array( 'delay_seconds' => 1 ), 'a rule delayed by one second' ),
-			'insert AND delayed'  => array(
-				array(
-					'delivery_mode' => 'insert',
-					'delay_seconds' => 604800,
-				),
-				'an insert rule delayed by a week',
-			),
+			/*
+			 * ⚠ ADDED PROMPT 5C, AND IT WAS A LIVE DEFECT RATHER THAN A GAP.
+			 * Prompt 5B gave `consolidation` validated storage, so `daily` became
+			 * storable — and nothing filtered it, so the rule was delivered with
+			 * ordinary IMMEDIATE, once-per-trigger behaviour. That is `none`'s
+			 * behaviour under another name: the merchant asked for a daily digest and
+			 * got an email per order. The Prompt 4 shape exactly — out-of-scope
+			 * behaviour reachable through DATA rather than through code.
+			 */
+			'consolidation daily' => array( array( 'consolidation' => 'daily' ), 'a rule consolidated daily' ),
+			'consolidation weekly' => array( array( 'consolidation' => 'weekly' ), 'a rule consolidated weekly' ),
+			'consolidation per_order' => array( array( 'consolidation' => 'per_order' ), 'a rule consolidated per order' ),
 		);
+	}
+
+	/**
+	 * 1a. A rule belonging to BOTH other phases — insert AND delayed — cannot be
+	 *     stored at all since Prompt 5.
+	 *
+	 * This data set used to live in the provider above, where it asserted that
+	 * the phase filter left such a rule untouched. ADR-0013 §2 now refuses the
+	 * combination at the REPOSITORY, which is strictly stronger: the rule never
+	 * reaches the filter because it never reaches the database. Asserted here so
+	 * the case is still covered and the reason it moved is on the record.
+	 *
+	 * @return void
+	 */
+	public function test_an_insert_rule_with_a_delay_cannot_be_stored_at_all() {
+		$refused = $this->rules->insert(
+			array(
+				'name'            => 'insert and delayed',
+				'status'          => 'active',
+				'delivery_mode'   => 'insert',
+				'native_email_id' => 'customer_completed_order',
+				'delay_seconds'   => 604800,
+			)
+		);
+
+		$this->assertSame( 0, $refused, 'A rule belonging to two other phases was stored.' );
 	}
 
 	/**
@@ -112,6 +143,9 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 				'name'            => 'insert rule that halts',
 				'priority'        => 1,
 				'delivery_mode'   => 'insert',
+				// Required since Prompt 5 for the rule to be storable at all
+				// (ADR-0013 §2); irrelevant to what this test asserts.
+				'native_email_id' => 'customer_completed_order',
 				'stop_processing' => 1,
 			)
 		);
@@ -170,18 +204,85 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 	 */
 	public function test_the_phase_filter_boundary() {
 		$rules = array(
-			array( 'id' => 1, 'delivery_mode' => 'separate', 'delay_seconds' => 0 ),
-			array( 'id' => 2, 'delivery_mode' => 'insert', 'delay_seconds' => 0 ),
-			array( 'id' => 3, 'delivery_mode' => 'separate', 'delay_seconds' => 1 ),
-			array( 'id' => 4, 'delivery_mode' => 'insert', 'delay_seconds' => 86400 ),
-			array( 'id' => 5, 'delivery_mode' => '', 'delay_seconds' => 0 ),
+			array( 'id' => 1, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'none' ),
+			array( 'id' => 2, 'delivery_mode' => 'insert', 'delay_seconds' => 0, 'consolidation' => 'none' ),
+			array( 'id' => 3, 'delivery_mode' => 'separate', 'delay_seconds' => 1, 'consolidation' => 'none' ),
+			array( 'id' => 4, 'delivery_mode' => 'insert', 'delay_seconds' => 86400, 'consolidation' => 'none' ),
+			array( 'id' => 5, 'delivery_mode' => '', 'delay_seconds' => 0, 'consolidation' => 'none' ),
 			array( 'id' => 6 ),
+			array( 'id' => 7, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'daily' ),
+			array( 'id' => 8, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'weekly' ),
+			array( 'id' => 9, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => '' ),
+			// A row with the column absent keeps the default, so it is deliverable —
+			// the filter must not reject a rule for a column it never carried.
+			array( 'id' => 10, 'delivery_mode' => 'separate', 'delay_seconds' => 0 ),
 		);
 
 		$this->assertSame(
-			array( 1 ),
+			array( 1, 10 ),
 			array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' ),
-			'Only separate + delay_seconds = 0 belongs to this phase.'
+			'Only separate + delay_seconds = 0 + consolidation = none belongs to this phase.'
+		);
+	}
+
+	/**
+	 * 1e / gate 15. EVERY UNIMPLEMENTED-BEHAVIOUR COLUMN IS ENUMERATED, and each
+	 *               one's non-default value is filtered out.
+	 *
+	 * The enumeration is the contract: a future column carrying behaviour nobody
+	 * has built yet is added HERE, and both phases inherit the filtering. Growing
+	 * the list one incident at a time is what let `consolidation` ship deliverable.
+	 *
+	 * @return void
+	 */
+	public function test_every_unimplemented_behaviour_column_is_filtered() {
+		$columns = Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS;
+
+		$this->assertSame(
+			array( 'delay_seconds', 'consolidation' ),
+			array_keys( $columns ),
+			'The unimplemented-behaviour enumeration changed; both phases and gate 15 depend on it.'
+		);
+
+		foreach ( $columns as $column => $default ) {
+			$base = array(
+				'id'            => 1,
+				'delivery_mode' => 'separate',
+				'delay_seconds' => 0,
+				'consolidation' => 'none',
+			);
+
+			$this->assertTrue(
+				Orchestrator::behaviour_is_implemented( $base ),
+				'The all-defaults rule is not deliverable.'
+			);
+
+			foreach ( array( 'daily', '1', '86400', 'per_order', 'anything' ) as $value ) {
+				if ( (string) $value === (string) $default ) {
+					continue;
+				}
+
+				$candidate            = $base;
+				$candidate[ $column ] = $value;
+
+				$this->assertFalse(
+					Orchestrator::behaviour_is_implemented( $candidate ),
+					sprintf( '%s = "%s" was treated as implemented behaviour.', $column, $value )
+				);
+				$this->assertSame(
+					array(),
+					Orchestrator::deliverable_in_this_phase( array( $candidate ) ),
+					sprintf( '%s = "%s" reached the separate phase.', $column, $value )
+				);
+			}
+		}
+
+		fwrite(
+			STDERR,
+			"\n[5C item 2 / gate 15] unimplemented-behaviour columns filtered by BOTH phases: "
+			. implode( ', ', array_map( static function ( $c, $d ) {
+				return $c . ' (only "' . $d . '")';
+			}, array_keys( $columns ), $columns ) ) . "\n"
 		);
 	}
 

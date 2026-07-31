@@ -7,6 +7,7 @@
 
 namespace Extonify\WCEP\Repository;
 
+use Extonify\WCEP\Delivery\Orchestrator;
 use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\RecipientsDocument;
 use Extonify\WCEP\Domain\Targeting;
@@ -53,6 +54,24 @@ class RuleRepository {
 	 * Columns holding JSON documents.
 	 */
 	const JSON_COLUMNS = array( 'targeting', 'recipients' );
+
+	/**
+	 * Longest storable `native_email_id` — the `varchar(100)` column's own width.
+	 *
+	 * ⚠ MUST MATCH `Migrator`'s SCHEMA, AND A TEST ASSERTS THAT IT DOES against
+	 * `information_schema`. A 300-character well-formed id used to pass validation
+	 * and be TRUNCATED by MySQL into a different, shorter string — which is the same
+	 * silent-coercion failure as a repaired id, arriving from the database instead
+	 * of from `sanitize_key()`: the rule then targets an email nobody named, and
+	 * `find_active_for_native_email()` can never match it because the read is
+	 * refused before it queries.
+	 */
+	const MAX_NATIVE_EMAIL_ID_LENGTH = 100;
+
+	/**
+	 * Longest storable `consolidation` — the `varchar(20)` column's own width.
+	 */
+	const MAX_CONSOLIDATION_LENGTH = 20;
 
 	/**
 	 * Suffix under which a hydrated row keeps each JSON column's RAW string.
@@ -140,13 +159,18 @@ class RuleRepository {
 	public function insert( array $data ): int {
 		global $wpdb;
 
-		$trigger = $this->resolve_trigger( $data, 'status', '' );
+		if ( ! self::write_is_valid( $data, array() ) ) {
+			return 0;
+		}
+
+		$mode    = self::effective_mode( $data, array() );
+		$trigger = $this->resolve_trigger_for_mode( $data, array(), 'status', '' );
 		if ( null === $trigger ) {
 			return 0;
 		}
 
 		$now = current_time( 'mysql', true );
-		$row = $this->sanitize( $data, null, $trigger );
+		$row = $this->sanitize( $data, null, $trigger, $mode );
 
 		$row['revision']   = 1;
 		$row['created_at'] = $now;
@@ -181,12 +205,17 @@ class RuleRepository {
 		 * is malformed for a transition one — so the stored row is what supplies
 		 * whichever half the caller left out.
 		 */
-		$trigger = $this->resolve_trigger( $data, (string) $existing['trigger_type'], (string) $existing['trigger_value'] );
+		if ( ! self::write_is_valid( $data, $existing ) ) {
+			return false;
+		}
+
+		$mode    = self::effective_mode( $data, $existing );
+		$trigger = $this->resolve_trigger_for_mode( $data, $existing, (string) $existing['trigger_type'], (string) $existing['trigger_value'] );
 		if ( null === $trigger ) {
 			return false;
 		}
 
-		$row               = $this->sanitize( $data, array_keys( $data ), $trigger );
+		$row               = $this->sanitize( $data, array_keys( $data ), $trigger, $mode );
 		$row['updated_at'] = current_time( 'mysql', true );
 
 		if ( $this->content_changed( $existing, $row ) ) {
@@ -266,6 +295,279 @@ class RuleRepository {
 	}
 
 	/**
+	 * Active INSERT rules targeting one WooCommerce email (ADR-0013 §2).
+	 *
+	 * `native_email_id` IS THE SINGLE SOURCE OF TRUTH for which email an insert
+	 * rule belongs to. `trigger_type` and `trigger_value` are not consulted —
+	 * they are stored EMPTY for insert rules precisely so there is no second
+	 * place for this question to be answered differently.
+	 *
+	 * `delay_seconds = 0` AND `consolidation = 'none'` are part of the WHERE clause
+	 * rather than a later filter, for the same reason ADR-0012 §9 filters before
+	 * evaluation: a rule whose behaviour no phase implements must be left entirely
+	 * untouched, not fetched and then discarded somewhere a future edit could
+	 * forget. Filtering in the fetch also means such a rule can never HALT a
+	 * supported one through `stop_processing`, because it never enters the ordered
+	 * evaluation at all.
+	 *
+	 * ⚠ `consolidation` was missing until Prompt 5C. Prompt 5B gave the column
+	 * validated storage, so `daily` became storable — and a `daily` rule was then
+	 * inserted into every matching email immediately, which is `none`'s behaviour
+	 * under another name (ADR-0013 §8a).
+	 *
+	 * @param string $native_email_id WooCommerce email id currently rendering.
+	 * @return array[] Rows in ADR-0011 fetch order.
+	 */
+	public function find_active_for_native_email( string $native_email_id ): array {
+		global $wpdb;
+		$table = $this->table();
+
+		/*
+		 * THE READ REFUSES EXACTLY WHAT THE WRITE REFUSES, and neither side
+		 * sanitises first — the same contract `normalize_trigger()` shares between
+		 * the two trigger paths, for the same reason. Repairing here would let
+		 * `Customer Processing Order` match rows stored as
+		 * `customer_processing_order`, which no rule author asked for. An id the
+		 * write path cannot store can match nothing, so asking the database would
+		 * be a query spent proving that.
+		 */
+		if ( ! self::is_well_formed_native_email_id( $native_email_id ) ) {
+			return array();
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned rules table.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; an identifier cannot be bound by prepare().
+				"SELECT * FROM {$table}
+				WHERE status = %s AND delivery_mode = %s AND native_email_id = %s
+					AND delay_seconds = %d AND consolidation = %s
+				ORDER BY priority ASC, id ASC",
+				'active',
+				'insert',
+				$native_email_id,
+				(int) Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS['delay_seconds'],
+				Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS['consolidation']
+			),
+			ARRAY_A
+		);
+
+		return array_map( array( $this, 'hydrate' ), (array) $rows );
+	}
+
+	/**
+	 * Whether a write may be stored at all (ADR-0009 write boundary, ADR-0013 §2).
+	 *
+	 * THE VALIDATED HALF OF THE BOUNDARY, AND IT REFUSES RATHER THAN REPAIRS. Every
+	 * column checked here is either an ENUMERATION or an IDENTIFIER, and for those
+	 * two kinds repair is not a kindness — it silently produces a DIFFERENT VALID
+	 * VALUE, which is worse than an inert rule because the rule then behaves in a
+	 * way nobody chose and nothing explains. `delivery_mode = 'unknown'` became a
+	 * `separate` rule that emailed customers directly when the author meant to
+	 * insert; `status = 'wide-open'` became `inactive`; `trigger_type = 'statuz'`
+	 * became a working status trigger. Same shape, five columns, one rule.
+	 *
+	 * A refused write writes NOTHING and leaves any existing row exactly as it was.
+	 *
+	 * | Column | Refused unless |
+	 * |---|---|
+	 * | `status` | exactly `active` or `inactive` |
+	 * | `delivery_mode` | exactly `insert` or `separate` |
+	 * | `native_email_id` | `[a-z0-9_-]+`, at most MAX_NATIVE_EMAIL_ID_LENGTH (empty allowed on a non-insert rule) |
+	 * | `consolidation` | `[a-z0-9_-]+`, at most MAX_CONSOLIDATION_LENGTH |
+	 * | `trigger_type` / `trigger_value` | see self::normalize_trigger() |
+	 *
+	 * The remaining insert-mode rules are ADR-0013 §2's:
+	 *
+	 *   - an insert rule with an EMPTY `native_email_id` targets no email, can
+	 *     never fire, and can never say why;
+	 *   - an insert rule with a NON-ZERO `delay_seconds` is incoherent: there is
+	 *     no way to insert content into an email that is already sending, seven
+	 *     days from now. Coercing it to zero would leave the merchant with a rule
+	 *     whose editor says seven days and whose behaviour says none.
+	 *
+	 * The mode itself is read from the write when supplied and from the stored
+	 * row otherwise, so a partial update that only changes `delay_seconds` is
+	 * still judged against the rule's real mode.
+	 *
+	 * @param array $data     Raw input; its KEYS are the presence check.
+	 * @param array $existing Stored row, or empty for an insert.
+	 * @return bool
+	 */
+	private static function write_is_valid( array $data, array $existing ): bool {
+		/*
+		 * THE ENUMERATIONS FIRST, ON THEIR RAW VALUES, AND BEFORE ANYTHING READS
+		 * THEM. `delivery_mode` in particular decides which of the branches below
+		 * applies, so validating it later would mean judging an insert-mode write by
+		 * a mode that had already been coerced.
+		 */
+		if ( array_key_exists( 'status', $data ) && ! in_array( self::raw_value( $data, 'status' ), self::STATUSES, true ) ) {
+			return false;
+		}
+
+		if ( array_key_exists( 'delivery_mode', $data ) && ! in_array( self::raw_value( $data, 'delivery_mode' ), self::DELIVERY_MODES, true ) ) {
+			return false;
+		}
+
+		/*
+		 * `consolidation` IS VALIDATED BY SHAPE, NOT BY VOCABULARY, AND THAT IS
+		 * DELIBERATE. Consolidation BEHAVIOUR is out of scope — only `none` does
+		 * anything today — so enumerating the values here would be designing that
+		 * behaviour in the storage layer. What the storage contract can say now is
+		 * that it does not REPAIR: `NONE`, `" none "`, `none!` and a 30-character
+		 * value are all refused rather than quietly rewritten or truncated by MySQL.
+		 * When consolidation lands, this becomes an enumeration like the two above.
+		 */
+		if ( array_key_exists( 'consolidation', $data ) && ! self::is_well_formed_key( self::raw_value( $data, 'consolidation' ), self::MAX_CONSOLIDATION_LENGTH ) ) {
+			return false;
+		}
+
+		/*
+		 * SHAPE IS CHECKED ON EVERY WRITE THAT SUPPLIES THE COLUMN, NOT ONLY ON
+		 * INSERT-MODE ONES. Otherwise a malformed id could be stored, silently
+		 * repaired, on a `separate` rule and then become an INSERT rule's target
+		 * in one later `update( $id, [ 'delivery_mode' => 'insert' ] )` — the same
+		 * coercion arriving by a second route.
+		 */
+		if ( array_key_exists( 'native_email_id', $data ) ) {
+			$raw = self::raw_value( $data, 'native_email_id' );
+
+			if ( '' !== $raw && ! self::is_well_formed_native_email_id( $raw ) ) {
+				return false;
+			}
+		}
+
+		$mode = self::effective_mode( $data, $existing );
+
+		if ( 'insert' !== $mode ) {
+			return true;
+		}
+
+		/*
+		 * THE ORIGINAL VALUE, NOT A SANITISED ONE. `sanitize_key()` ran first
+		 * here, so `customer_processing_order!` was REPAIRED into a valid,
+		 * registered id and stored — the rule then targeted an email nobody
+		 * chose, which is worse than an inert rule for exactly the reason
+		 * ADR-0011 §2 gives for trigger values: junk input became a DIFFERENT
+		 * VALID TARGET. Same coercion, new column; refused, not repaired.
+		 */
+		$native = array_key_exists( 'native_email_id', $data )
+			? self::raw_value( $data, 'native_email_id' )
+			: (string) ( $existing['native_email_id'] ?? '' );
+
+		if ( ! self::is_well_formed_native_email_id( $native ) ) {
+			return false;
+		}
+
+		$delay = array_key_exists( 'delay_seconds', $data )
+			? (int) $data['delay_seconds']
+			: (int) ( $existing['delay_seconds'] ?? 0 );
+
+		if ( 0 !== $delay ) {
+			return false;
+		}
+
+		return self::native_email_is_registered( $native );
+	}
+
+	/**
+	 * Whether a value is EXACTLY a well-formed WooCommerce email id.
+	 *
+	 * The accepted alphabet is `sanitize_key()`'s own — lowercase ASCII letters,
+	 * digits, underscore and hyphen — but it is APPLIED AS A TEST rather than as
+	 * a transformation. That is the whole difference between this and what it
+	 * replaced: `CUSTOMER_PROCESSING_ORDER`, `" customer_processing_order "`,
+	 * `customer_processing_order!` and `<b>customer_processing_order</b>` are all
+	 * REFUSED here and were all silently repaired into a working target before.
+	 *
+	 * THE LENGTH IS PART OF WELL-FORMEDNESS, and it is checked HERE so the write and
+	 * the read share one answer — `find_active_for_native_email()` calls this too, so
+	 * an id the write refuses is an id the read refuses to look for.
+	 *
+	 * Nothing downstream relies on this for safety — `$wpdb` prepares every value
+	 * and the id is compared again at render time (ADR-0013 §4). It exists so a
+	 * rule always targets the email its author actually named.
+	 *
+	 * @param string $value Raw value, exactly as supplied.
+	 * @return bool
+	 */
+	private static function is_well_formed_native_email_id( string $value ): bool {
+		return self::is_well_formed_key( $value, self::MAX_NATIVE_EMAIL_ID_LENGTH );
+	}
+
+	/**
+	 * Whether a raw value is already a well-formed key of at most `$max` bytes.
+	 *
+	 * THE `sanitize_key()` ALPHABET, APPLIED AS A TEST. A value that would survive
+	 * `sanitize_key()` unchanged passes; anything that sanitisation would have had to
+	 * REPAIR is refused. The length is measured in BYTES with `strlen()`, because
+	 * that is what a MySQL `varchar` column counts when it decides whether to
+	 * truncate.
+	 *
+	 * @param string $value Raw value, exactly as supplied.
+	 * @param int    $max   Column width in bytes.
+	 * @return bool
+	 */
+	private static function is_well_formed_key( string $value, int $max ): bool {
+		if ( '' === $value || strlen( $value ) > $max ) {
+			return false;
+		}
+
+		return 1 === preg_match( '/^[a-z0-9_\-]+$/', $value );
+	}
+
+	/**
+	 * One raw field, as a string, without ever throwing.
+	 *
+	 * NON-SCALAR INPUT BECOMES THE EMPTY STRING, which every validated column then
+	 * refuses. Casting an array to string would raise a notice and — with the test
+	 * suite converting notices to exceptions — turn a rejected write into a fatal
+	 * one; and `(string) $object` would call `__toString()` on caller-supplied code.
+	 *
+	 * @param array  $data Raw input.
+	 * @param string $key  Column name.
+	 * @return string
+	 */
+	private static function raw_value( array $data, string $key ): string {
+		$value = $data[ $key ] ?? '';
+
+		return is_scalar( $value ) ? (string) $value : '';
+	}
+
+	/**
+	 * Whether a native email id matches one WooCommerce actually has.
+	 *
+	 * CAPABILITY-DETECTED, AND ITS ABSENCE IS NOT A REJECTION. The mailer is
+	 * frequently unavailable when rules are written — a CLI importer, a
+	 * migration, an activation hook all run long before `WC()->mailer()` — and
+	 * refusing a valid rule because WooCommerce had not booted yet would be a
+	 * worse failure than accepting an id that is checked again at render time,
+	 * where it is compared against the email actually rendering (ADR-0013 §4).
+	 *
+	 * @param string $native_email_id Well-formed email id.
+	 * @return bool
+	 */
+	private static function native_email_is_registered( string $native_email_id ): bool {
+		if ( ! function_exists( 'WC' ) || ! is_object( WC()->mailer() ) ) {
+			return true;
+		}
+
+		$emails = WC()->mailer()->get_emails();
+
+		if ( ! is_array( $emails ) || array() === $emails ) {
+			return true;
+		}
+
+		foreach ( $emails as $email ) {
+			if ( is_object( $email ) && isset( $email->id ) && (string) $email->id === $native_email_id ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
 	 * All rules, newest first. Used by tests and the future admin list table.
 	 *
 	 * @param int $limit  Page size.
@@ -315,9 +617,11 @@ class RuleRepository {
 	 * @param array         $data    Raw input.
 	 * @param string[]|null $only    Restrict to these keys (partial update).
 	 * @param array         $trigger Normalised trigger from self::resolve_trigger().
+	 * @param string        $mode    The delivery mode the write RESULTS IN, from
+	 *                               self::effective_mode().
 	 * @return array Column => value, ready for $wpdb.
 	 */
-	private function sanitize( array $data, ?array $only, array $trigger ): array {
+	private function sanitize( array $data, ?array $only, array $trigger, string $mode ): array {
 		$out = array();
 
 		/*
@@ -335,16 +639,31 @@ class RuleRepository {
 			}
 		};
 
-		$status = isset( $data['status'] ) ? sanitize_key( (string) $data['status'] ) : 'inactive';
-		$mode   = isset( $data['delivery_mode'] ) ? sanitize_key( (string) $data['delivery_mode'] ) : 'separate';
-
+		/*
+		 * THE VALIDATED COLUMNS ARE WRITTEN VERBATIM, AND THAT IS THE POINT (ADR-0009
+		 * write boundary). `status`, `delivery_mode`, `native_email_id`,
+		 * `consolidation` and both trigger halves reached here only by passing
+		 * self::write_is_valid() / self::normalize_trigger() on their RAW values, so
+		 * there is nothing left to coerce. A second, weaker coercion here is exactly
+		 * how the boundary drifted before: this line used to read
+		 * `in_array( $status, STATUSES ) ? $status : 'inactive'`, which turned every
+		 * unrecognised status into a silently deactivated rule.
+		 *
+		 * An ABSENT column still gets its documented default — that is a default, not
+		 * a repair.
+		 */
 		$put( 'name', sanitize_text_field( (string) ( $data['name'] ?? '' ) ) );
-		$put( 'status', in_array( $status, self::STATUSES, true ) ? $status : 'inactive' );
+		$put( 'status', array_key_exists( 'status', $data ) ? self::raw_value( $data, 'status' ) : 'inactive' );
 		$put( 'priority', (int) ( $data['priority'] ?? 10 ) );
 		$put( 'trigger_type', $trigger['type'] );
 		$put( 'trigger_value', $trigger['value'] );
-		$put( 'delivery_mode', in_array( $mode, self::DELIVERY_MODES, true ) ? $mode : 'separate' );
-		$put( 'native_email_id', sanitize_key( (string) ( $data['native_email_id'] ?? '' ) ) );
+		$put( 'delivery_mode', $mode );
+		$put( 'native_email_id', self::raw_value( $data, 'native_email_id' ) );
+		// ⚠ THE ONE DOCUMENTED EXCEPTION: `insert_position` REPAIRS (ADR-0009). A
+		// position is presentation with a sane default — an unrecognised one falls
+		// back to `after_order_table` in `Injector::normalize_position()` rather than
+		// refusing the rule or emitting nothing. Recorded as a decision, not left as
+		// the sweep's unexamined survivor.
 		$put( 'insert_position', sanitize_key( (string) ( $data['insert_position'] ?? '' ) ) );
 		$put( 'targeting', self::encode_json_column( 'targeting', (array) ( $data['targeting'] ?? array() ) ) );
 		$put( 'recipients', self::encode_json_column( 'recipients', (array) ( $data['recipients'] ?? array() ) ) );
@@ -354,10 +673,64 @@ class RuleRepository {
 		// safe markup and strips scripts. Escaped again on output by the caller.
 		$put( 'content', wp_kses_post( (string) ( $data['content'] ?? '' ) ) );
 		$put( 'delay_seconds', max( 0, (int) ( $data['delay_seconds'] ?? 0 ) ) );
-		$put( 'consolidation', sanitize_key( (string) ( $data['consolidation'] ?? 'none' ) ) );
+		$put( 'consolidation', array_key_exists( 'consolidation', $data ) ? self::raw_value( $data, 'consolidation' ) : 'none' );
 		$put( 'stop_processing', ! empty( $data['stop_processing'] ) ? 1 : 0 );
 
+		/*
+		 * INSERT MODE FORCES ITS OWN COLUMNS, WHATEVER THE CALLER SUPPLIED, AND
+		 * THIS BYPASSES `$only` DELIBERATELY (ADR-0013 §2).
+		 *
+		 * A partial update writes only the keys the caller named, so converting a
+		 * stored `status`/`completed` rule with
+		 * `update( $id, [ 'delivery_mode' => 'insert', 'native_email_id' => ... ] )`
+		 * left BOTH trigger columns behind. The row then claimed a trigger the
+		 * engine does not consult and the rule read as a promise nothing keeps —
+		 * the exact single-source violation ADR-0013 §2 exists to rule out. The
+		 * mode being written is the RESULTING mode, so a partial update that only
+		 * changes `delay_seconds` is still judged against the rule's real mode.
+		 *
+		 * `delay_seconds` is here for completeness rather than repair: a non-zero
+		 * delay on an insert rule is REFUSED upstream by
+		 * self::write_is_valid(), so this only ever writes the zero that was
+		 * already true.
+		 */
+		if ( 'insert' === $mode ) {
+			$out['trigger_type']  = $trigger['type'];
+			$out['trigger_value'] = $trigger['value'];
+			$out['delay_seconds'] = 0;
+		}
+
 		return $out;
+	}
+
+	/**
+	 * The delivery mode a write RESULTS IN, from the input when it says and from
+	 * the stored row otherwise.
+	 *
+	 * ONE ANSWER, USED EVERYWHERE. Validation, trigger resolution and
+	 * sanitisation each used to work this out for themselves, and `sanitize()`
+	 * got it wrong for partial updates — it defaulted to `separate` whenever the
+	 * caller had not mentioned the mode, so a stored insert rule being edited was
+	 * sanitised as a separate one.
+	 *
+	 * @param array $data     Raw input.
+	 * @param array $existing Stored row, or empty for a fresh insert.
+	 * @return string
+	 */
+	private static function effective_mode( array $data, array $existing ): string {
+		if ( array_key_exists( 'delivery_mode', $data ) ) {
+			/*
+			 * THE RAW VALUE, NOT A SANITISED ONE. `sanitize_key()` used to run here,
+			 * which meant `INSERT` and `" insert "` both became `insert` — the caller's
+			 * intent guessed rather than honoured. self::write_is_valid() checks this
+			 * column against the allowlist EXACTLY and refuses anything else before
+			 * this is ever reached, so by here the value is already one of two
+			 * literals. Sanitising it again could only re-open the coercion.
+			 */
+			return self::raw_value( $data, 'delivery_mode' );
+		}
+
+		return (string) ( $existing['delivery_mode'] ?? 'separate' );
 	}
 
 	/**
@@ -366,11 +739,47 @@ class RuleRepository {
 	 * it (ADR-0011 §2).
 	 *
 	 * @param array  $data           Raw input.
+	 * @param array  $existing       Stored row, or empty for a fresh insert.
 	 * @param string $existing_type  Trigger type already stored ('status' for a
 	 *                               fresh insert).
 	 * @param string $existing_value Trigger value already stored.
 	 * @return array|null `{type, value}`, or null when the trigger is malformed
 	 *                    and must not be stored.
+	 */
+	private function resolve_trigger_for_mode( array $data, array $existing, string $existing_type, string $existing_value ): ?array {
+		if ( 'insert' === self::effective_mode( $data, $existing ) ) {
+			/*
+			 * AN INSERT RULE STORES EMPTY TRIGGER FIELDS AND SKIPS TRIGGER
+			 * VALIDATION ENTIRELY (ADR-0013 §2).
+			 *
+			 * This follows the refund precedent one step further: ADR-0011 §2
+			 * already forces `trigger_value` empty for refund rules because the
+			 * value is meaningless there. For an insert rule BOTH halves are
+			 * meaningless — `native_email_id` decides which email it belongs to —
+			 * so storing a plausible-looking `status:completed` would read as a
+			 * promise the engine does not keep.
+			 *
+			 * Emptiness is also what makes phase isolation structural rather
+			 * than conventional: `find_active_for_trigger()` refuses an empty
+			 * type before it queries, so no insert rule can ever be returned to
+			 * the separate path, whatever that path later does with its results.
+			 */
+			return array(
+				'type'  => '',
+				'value' => '',
+			);
+		}
+
+		return $this->resolve_trigger( $data, $existing_type, $existing_value );
+	}
+
+	/**
+	 * Work out the trigger a NON-insert write should store.
+	 *
+	 * @param array  $data           Raw input.
+	 * @param string $existing_type  Trigger type already stored.
+	 * @param string $existing_value Trigger value already stored.
+	 * @return array|null `{type, value}`, or null when malformed.
 	 */
 	private function resolve_trigger( array $data, string $existing_type, string $existing_value ): ?array {
 		/*
