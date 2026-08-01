@@ -592,12 +592,16 @@ ADR-0011 §5 violation filed as deferred work; it still holds.
   triggered by an order event and never by a render — but insert mode is
   triggered BY a render and needs the full ADR-0005 slot machinery, including the
   verified leak of `woocommerce_is_email_preview` after an interrupted preview.
-- **Placeholders (a later prompt).** Subject, heading and content are sent
-  LITERALLY: `{customer_name}` is delivered as those characters.
-  `Custom_Email::get_subject()` deliberately does not call `format_string()`, and
-  the point at which it starts to must also decide what an empty resolved
-  recipient means — ADR-0005 already names
-  `empty/invalid recipient after placeholder resolution` as a loggable outcome.
+- ~~**Placeholders (a later prompt).** Subject, heading and content are sent
+  LITERALLY: `{customer_name}` is delivered as those characters.~~
+  **⚠ SUPERSEDED 2026-08-01 (Prompt 6A) — DONE in Prompt 6, see
+  [ADR-0014](adr/ADR-0014.md).** Subject, heading and content are resolved at send
+  time against the live order, single-pass, escaped per destination. An empty
+  resolved recipient is decided: the entry is dropped with a note and, if that
+  leaves no `to`, the delivery is `skipped` with the reason recorded (ADR-0014 §7).
+  `Custom_Email::get_subject()` still deliberately does not call
+  `format_string()` — that is WooCommerce's own, differently-spelled substitution
+  pass, whose values this plugin does not control.
 - **`delay_seconds` and ADR-0007 snapshots (Prompt 6).** `delay_seconds` is stored
   and revision-bearing but nothing reads it yet; every delivery in this prompt is
   immediate. The `scheduled` final status exists in `FINAL_STATUSES` and is
@@ -1196,3 +1200,120 @@ to do.
   They are hard-capped at `MAX_DIAGNOSTIC_ENTRIES`, they exist to explain the
   request after it ends, and `shutdown` is when something reads them. Every
   collection that carries *state* is cleared there (ADR-0013 §5h).
+
+## Prompt 6 — placeholders
+
+### Contract-consistency gate
+
+- **`Custom_Email::get_subject()` said "placeholder substitution does not exist
+  yet"** and `$delivery_content` said only that it was kses-filtered. Both now
+  state what ADR-0014 §9 actually does, including the deliberate continued absence
+  of `WC_Email::format_string()` — WooCommerce's own, differently-spelled
+  substitution pass, whose values this plugin does not control.
+- **`Render\Injector::to_plain_text()`** now delegates to
+  `Domain\Text::to_plain_text()`. The flattening rule — and the ⚠ WooCommerce
+  behaviour it exists for — had to be shared with separate mode, and two copies of
+  a rule about what WooCommerce deletes is one copy too many.
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ `{shipping_method}` costs two queries per delivery, once, whatever the
+  placeholder count.** `WC_Order::get_shipping_method()` loads the order's
+  **shipping** line items — a line-item type nothing else in the delivery path
+  reads. It is memoised per delivery, so occurrences are free; only bodies that
+  ask for it pay. Recorded rather than removed: the alternative is reaching around
+  WooCommerce's own accessor into the item table, which would break the moment
+  shipping storage changes.
+- **A placeholder whose underlying field is EMPTY is not recorded.** An order with
+  no phone number is not an authoring error, and recording it would bury the real
+  §1a signal — an unknown token or a refused key — in noise. The consequence is
+  that "blank because empty" and "blank because the field does not exist on this
+  order" look the same to a merchant; the rule editor (Prompt 9) is where that
+  distinction can be shown before the email is sent.
+- **`{product_name}` on a multi-match rule is an authoring choice** (ADR-0014 §5).
+  The rule editor should surface `{product_names}` and `{matched_product_list}`
+  beside the singular forms and say which is which — **a Prompt 9 note**, recorded
+  here because the editor is the only place the distinction can be made visible.
+- **The meta allow-filter is per key, in code, with no UI.** Deliberate: a setting
+  a merchant can flip without understanding it is how `_stripe_source_id` ends up
+  in a customer's inbox. If a UI is ever added it must name the key, show its
+  current value, and warn — not offer a blanket "allow private fields" switch.
+- **`{store_email}` reads the `woocommerce_email_from_address` setting**, falling
+  back to `admin_email`. If a store later gains a per-email from-address, this
+  placeholder will keep answering with the global one until it is taught
+  otherwise.
+- **The plain-text destination cannot carry angle brackets at all** — WooCommerce
+  strips every tag from the whole plain body (ADR-0014's flagged list). A merchant
+  writing `a < b` sees it in HTML and not in the plain alternative. Not fixable
+  from this side without escaping a body that must not be escaped.
+
+## Prompt 6A — the placeholder failure boundary and contract freeze
+
+### Contract-consistency gate (direct examination, gate 9)
+
+- **ADR-0012 §6's first paragraph said content is "sent literally; no placeholder
+  substitution exists yet".** False since Prompt 6. Struck through and marked
+  **superseded**, pointing at ADR-0014; the rest of §6 (kses at storage,
+  WooCommerce's wrapper, plain-text output) is unchanged and still binding.
+- **This backlog's own "Placeholders (a later prompt)" entry said the same
+  thing.** Struck through and marked superseded, with the question it left open —
+  what an empty resolved recipient means — answered against ADR-0014 §7.
+- **"Costs no queries" appeared in five places** — `PlaceholderResolver` (twice),
+  `PlaceholderValues`, `Orchestrator`, `Injector` and `RenderEvents` — and
+  contradicted the ADR-0014 §8 measurement in the same repository. Every one now
+  states the measured contract instead: **no per-placeholder and no per-occurrence
+  query growth; one bounded, named cost per distinct data class a body reads.**
+- **ADR-0014 §6.3 said "scalars only" while the code refused booleans.** PHP counts
+  `bool` as a scalar, so the ADR described the code incorrectly. The contract is now
+  **string, integer or float**, with the boolean decision stated: `(string) true` is
+  `"1"` and `(string) false` is `""`, two spellings one of which is
+  indistinguishable from "nothing was stored", so the plugin declines to guess and
+  **records the refusal as a boolean** rather than as a non-printable value.
+- **The public-key veto diagnostic was false.** A site filter refusing a *public*
+  key was logged `refused a protected meta key`, sending a merchant looking for an
+  underscore that was not there. Two reasons now: default-deny on a `_`-prefixed
+  key, versus `a site filter (extonify_wcep_meta_placeholder_allowed) refused the
+  public meta key`.
+- **The Prompt 6 "hostile value appears safely in both formats" requirement is
+  superseded**, in ADR-0014 §3 rather than left standing beside the honest report
+  of it: in plain text WooCommerce **deletes** `<script>alert(1)</script>` outright
+  via `wp_strip_all_tags()`. The amended requirement is *neutralised* in both
+  formats — escaped and visible in HTML, removed by WooCommerce in plain text.
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ The delivery kill switch does not silence INSERT mode, and that is currently
+  correct but is a product question.** `Custom_Email::is_globally_enabled()` reads
+  the saved `enabled` setting of *this plugin's own* `WC_Email` — the email insert
+  mode never sends. A merchant unticking it therefore stops separate-mode
+  deliveries and leaves inserted blocks in native emails. Defensible (the box is
+  labelled for one email) and surprising (the box is the only switch there is).
+  **Not a mode twin**, so ADR-0014 §11 records it as out of the audit's scope; the
+  settings UI prompt should either relabel the box or add a second switch.
+- **⚠ Separate mode does not derive attempt `type` from delivery history**
+  (ADR-0013 §6b) and does not allocate attempt numbers under the parent lock
+  (§6c). Live-correct: ADR-0004 gives separate mode at most one attempt set per
+  identity, so `auto` is always right and there is no numbering to race. **A manual
+  resend feature must give separate mode the same history-derived typing**, or a
+  merchant's first delivery will be recorded as a resend for exactly the reason
+  §6b describes.
+- **⚠ A meta value that is a boolean, and a meta value that is missing, both render
+  blank.** The boolean is recorded and the missing key is not (ADR-0014 §4), which
+  is the right split for the log but still leaves two blanks in the email. The rule
+  editor is where the difference can be shown before sending.
+- **⚠ The per-item binding covers item-scoped placeholders only.** `{order_*}`,
+  `{customer_*}` and the plural product forms are order-scoped and identical in
+  every block by definition — that is what makes them the plural forms — but a
+  merchant reading two blocks that differ in some placeholders and not others has
+  to know which is which. A Prompt 9 editor note.
+- **⚠ An overlength meta key resolves empty and is recorded with the FULL key in
+  the note.** A template carrying twenty distinct multi-kilobyte keys would produce
+  a long `reason`; it is bounded by `MAX_NOTES` (20) and by
+  `Domain\Text::log_value()` (2000 characters), so the column cannot be overrun —
+  but the note is then truncated mid-key. Acceptable: the merchant's fix is visible
+  from the first characters.
+- **⚠ A `Throwable` from a third party is caught, recorded and swallowed — it is
+  never re-thrown.** That is the whole point in a `woocommerce_order_status_changed`
+  handler and inside a rendering hook, but it means a genuinely broken site can
+  fail every delivery quietly except for the `wc_get_logger()` error and the
+  `failed` tombstones. A future admin surface should count them.

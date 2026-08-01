@@ -61,6 +61,18 @@ if ( ! defined( 'WP_USE_THEMES' ) ) {
 	define( 'WP_USE_THEMES', false );
 }
 
+/*
+ * QUERY-COST DIAGNOSIS SEAM. Several gates report query counts, and when a count
+ * moves the useful question is WHICH query appeared — which needs `SAVEQUERIES`,
+ * and `SAVEQUERIES` has to be defined before WordPress loads. Off by default,
+ * because recording every query costs memory and a backtrace per query.
+ *
+ *     EXTONIFY_WCEP_SAVE_QUERIES=1 composer test:integration
+ */
+if ( getenv( 'EXTONIFY_WCEP_SAVE_QUERIES' ) && ! defined( 'SAVEQUERIES' ) ) {
+	define( 'SAVEQUERIES', true );
+}
+
 require dirname( __DIR__, 4 ) . '/wp-load.php';
 
 if ( ! class_exists( 'WooCommerce' ) ) {

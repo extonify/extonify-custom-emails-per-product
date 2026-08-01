@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Delivery;
 
 use Extonify\WCEP\Domain\DeliveryIdentity;
+use Extonify\WCEP\Domain\PlaceholderSyntax;
 use Extonify\WCEP\Domain\Recipient;
 use Extonify\WCEP\Domain\RecipientsDocument;
 
@@ -69,6 +70,36 @@ final class RecipientResolver {
 	 * The store's admin address.
 	 */
 	const TOKEN_ADMIN = 'admin';
+
+	/**
+	 * The store's email identity, for `{store_email}`.
+	 */
+	const TOKEN_STORE = 'store';
+
+	/**
+	 * THE ONLY PLACEHOLDERS A RECIPIENT FIELD MAY CONTAIN (ADR-0014 §7), mapped
+	 * to the context key each resolves from.
+	 *
+	 * ⚠ DELIBERATELY NARROWER THAN THE BODY. A recipient field becomes part of a
+	 * mail header, and a free-text value in one is a header-injection vector even
+	 * after CR/LF stripping — stripping is defence in depth, not a licence to put
+	 * arbitrary customer input there. And there is no legitimate use: a merchant
+	 * who wants to mail the customer writes `{customer_email}`, and nobody wants
+	 * to mail an address assembled out of a billing first name.
+	 *
+	 * Everything these resolve to still passes `HeaderGuard::strip()`,
+	 * `Recipient::normalize()`'s `is_email()` validation and de-duplication. A
+	 * placeholder is a SOURCE of an address here, never a bypass around the
+	 * checks an address faces.
+	 *
+	 * ⚠ AND ANY PLACEHOLDER OUTSIDE THIS SET REFUSES THE ENTIRE ENTRY (§7a) —
+	 * see self::substitute(). "Resolve it to empty and validate what is left"
+	 * delivered `{customer_first_name}alice@example.test` to `alice@example.test`.
+	 */
+	const SAFE_PLACEHOLDERS = array(
+		'customer_email' => self::TOKEN_CUSTOMER,
+		'store_email'    => self::TOKEN_STORE,
+	);
 
 	/**
 	 * Resolve a stored recipients value.
@@ -146,6 +177,20 @@ final class RecipientResolver {
 			}
 		}
 
+		// THE RESTRICTED PLACEHOLDER PASS (ADR-0014 §7), before the token pass
+		// and before validation — so whatever a placeholder produces still faces
+		// every check a literal address faces.
+		$source = self::substitute( $source, $channel, $context, $notes );
+
+		if ( null === $source || '' === $source ) {
+			// `null` — the entry contained a disallowed placeholder and is refused
+			// AS A WHOLE (ADR-0014 §7a). `''` — every placeholder in it resolved to
+			// nothing. Both are recorded by self::substitute(); dropping either
+			// silently would leave the merchant with a recipient that vanished for
+			// no stated reason.
+			return;
+		}
+
 		$resolved = self::resolve_token( $source, $context );
 
 		if ( null === $resolved ) {
@@ -184,6 +229,70 @@ final class RecipientResolver {
 			'type'    => $channel,
 			'source'  => $source,
 		);
+	}
+
+	/**
+	 * Resolve the SAFE placeholders in one recipient entry (ADR-0014 §7, §7a).
+	 *
+	 * SINGLE-PASS, through the same engine the body uses, so a resolved address
+	 * is never re-scanned — a customer whose billing email somehow contained
+	 * `{store_email}` cannot reach the store's address through it.
+	 *
+	 * ⚠ A DISALLOWED PLACEHOLDER REFUSES THE **WHOLE ENTRY**, NOT JUST ITSELF
+	 * (ADR-0014 §7a). Resolving it to empty and validating the REMAINDER was a hole:
+	 *
+	 *     {customer_first_name}alice@example.test  ->  alice@example.test  ->  SENT
+	 *
+	 * The refused placeholder disappeared and what was left happened to be a valid
+	 * address, so the entry delivered — to an address §7 never authorised, assembled
+	 * out of a field §7 exists to keep out of headers. §7 says a recipient field
+	 * takes two placeholders and nothing else; the only way to mean that is to
+	 * discard the entry the moment a third one appears, whatever survives it.
+	 *
+	 * Not left literal either: a literal `{customer_first_name}` would fail
+	 * `is_email()` and be dropped as "an invalid address", which is true but
+	 * useless — the merchant needs to know the plugin refused a placeholder, not
+	 * that "Alice" is not an email address.
+	 *
+	 * @param string   $source  Entry, already line-break stripped.
+	 * @param string   $channel Channel name, for the note.
+	 * @param array    $context Token context.
+	 * @param string[] $notes   Accumulated notes, by reference.
+	 * @return string|null Substituted entry, or NULL when the entry is refused
+	 *                     whole.
+	 */
+	private static function substitute( string $source, string $channel, array $context, array &$notes ): ?string {
+		if ( false === strpos( $source, '{' ) ) {
+			return $source;
+		}
+
+		$refused = false;
+
+		$resolved = PlaceholderSyntax::render(
+			$source,
+			static function ( string $name, ?string $param ) use ( $channel, $context, &$notes, &$refused ): string {
+				$label = PlaceholderSyntax::label( $name, $param );
+
+				if ( null !== $param || ! isset( self::SAFE_PLACEHOLDERS[ $name ] ) ) {
+					$refused = true;
+					$notes[] = 'refused a disallowed placeholder in a ' . $channel . ' entry: ' . $label
+						. '; the whole entry was dropped';
+					return '';
+				}
+
+				$address = trim( (string) ( $context[ self::SAFE_PLACEHOLDERS[ $name ] ] ?? '' ) );
+
+				if ( '' === $address ) {
+					$notes[] = 'resolved ' . $label . ' in a ' . $channel . ' entry to nothing';
+				}
+
+				// Header-context escaping, exactly as a subject gets: a value
+				// reaching header composition is stripped whatever route it took.
+				return PlaceholderSyntax::escape( $address, PlaceholderSyntax::CONTEXT_HEADER );
+			}
+		);
+
+		return $refused ? null : $resolved;
 	}
 
 	/**

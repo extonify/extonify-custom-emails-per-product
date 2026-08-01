@@ -55,7 +55,7 @@ class DeliveryLogger {
 	const MODE = self::MODE_SEPARATE;
 
 	/**
-	 * Insert outcomes (ADR-0013 §1a, §6a).
+	 * MESSAGE outcomes (ADR-0013 §1a, §6a, ADR-0014 §10c).
 	 *
 	 * FOUR, AND NO TWO OF THEM ARE SYNONYMS. `sent` and `failed` are both things
 	 * WooCommerce REPORTED; `unresolved` is the absence of a report about a send
@@ -64,6 +64,9 @@ class DeliveryLogger {
 	 * `abandoned` into `unresolved` is the specific error that reported a
 	 * demonstrably successful delivery as unresolved, because a third party
 	 * rendered the same email again afterwards and threw the render away.
+	 *
+	 * ⚠ THESE DESCRIBE THE MESSAGE. WHETHER ONE RULE'S CONTENT GOT INTO IT IS A
+	 * SECOND, INDEPENDENT FACT — see self::RENDER_OUTCOMES.
 	 */
 	const OUTCOME_SENT       = 'sent';
 	const OUTCOME_FAILED     = 'failed';
@@ -71,9 +74,44 @@ class DeliveryLogger {
 	const OUTCOME_ABANDONED  = DeliveryDetailRepository::ABANDONED;
 
 	/**
-	 * Every outcome an insert record may carry.
+	 * Every outcome an insert record may carry FOR THE MESSAGE.
+	 *
+	 * ⚠ `not_rendered` IS DELIBERATELY NOT A MEMBER, AND REMOVING IT IS THE PROMPT 6B
+	 * CORRECTION. It used to be the fifth member and it OVERWROTE the message
+	 * outcome, so a rule whose resolution threw during an ABANDONED render was
+	 * recorded as `not_rendered` — stored `failed`, which
+	 * `DeliveryDetailRepository::GENUINE_ATTEMPT_STATES` counts as a real send
+	 * attempt. The merchant's next, FIRST, genuine delivery was then typed `resend`:
+	 * exactly the ADR-0013 §6b defect Prompt 5C fixed, reintroduced through a
+	 * different column. The reason text was untrue as well, always ending "and the
+	 * native email was sent without it" for messages that were never sent.
 	 */
-	const INSERT_OUTCOMES = array( self::OUTCOME_SENT, self::OUTCOME_FAILED, self::OUTCOME_UNRESOLVED, self::OUTCOME_ABANDONED );
+	const INSERT_OUTCOMES = array(
+		self::OUTCOME_SENT,
+		self::OUTCOME_FAILED,
+		self::OUTCOME_UNRESOLVED,
+		self::OUTCOME_ABANDONED,
+	);
+
+	/**
+	 * RULE RENDER outcomes (ADR-0014 §10c).
+	 *
+	 * PER RULE, NOT PER MESSAGE, AND ORTHOGONAL TO self::INSERT_OUTCOMES. This says
+	 * whether ONE rule's content reached the message the other axis describes; the
+	 * two are recorded side by side and neither is ever derived from the other.
+	 * `not_rendered` means resolving that rule threw and the injector emitted
+	 * nothing — whatever then became of the message it would have gone into.
+	 */
+	const RENDER_RENDERED     = 'rendered';
+	const RENDER_NOT_RENDERED = 'not_rendered';
+
+	/**
+	 * Both render outcomes.
+	 */
+	const RENDER_OUTCOMES = array(
+		self::RENDER_RENDERED,
+		self::RENDER_NOT_RENDERED,
+	);
 
 	/**
 	 * Non-matching decisions that DO consume an identity (ADR-0012 §2).
@@ -272,7 +310,8 @@ class DeliveryLogger {
 	}
 
 	/**
-	 * Record a send that THREW.
+	 * Record a delivery that THREW — during recipient resolution, during
+	 * placeholder resolution, during content assembly, or during the send itself.
 	 *
 	 * The exception is caught by the orchestrator so it cannot escape into the
 	 * WooCommerce order event; this is where it becomes visible instead. The
@@ -280,15 +319,25 @@ class DeliveryLogger {
 	 * response routinely carries the address in angle brackets and
 	 * `sanitize_text_field()` would delete the most useful part of it.
 	 *
-	 * @param int                $delivery_id Tombstone id.
-	 * @param ResolvedRecipients $recipients  Resolved recipients.
-	 * @param string             $subject     Subject as attempted.
-	 * @param \Throwable         $error       What was thrown.
-	 * @param string             $reason      Notes recorded during resolution.
-	 * @param array              $snapshot    Structured diagnostic payload.
+	 * ⚠ THE RECIPIENTS MAY NOT EXIST YET, AND THAT IS THE ADR-0014 §10 CASE.
+	 * Prompt 6 introduced a third-party filter INSIDE resolution, so the throw can
+	 * now happen before there is any address to write a row against — and
+	 * `write_attempt_rows()` writes one row per recipient, which for an empty set
+	 * is NO ROW AT ALL. That is precisely the claimed-tombstone-with-no-evidence
+	 * state ADR-0012 §3 exists to prevent, so a recipient-less failure row is
+	 * written instead. `null` is accepted rather than an empty object because the
+	 * caller genuinely has nothing: the resolver never returned.
+	 *
+	 * @param int                     $delivery_id Tombstone id.
+	 * @param ResolvedRecipients|null $recipients  Resolved recipients, or null when
+	 *                                             resolution itself threw.
+	 * @param string                  $subject     Subject as attempted.
+	 * @param \Throwable              $error       What was thrown.
+	 * @param string                  $reason      Notes recorded during resolution.
+	 * @param array                   $snapshot    Structured diagnostic payload.
 	 * @return array Structured result.
 	 */
-	public function record_send_failure( int $delivery_id, ResolvedRecipients $recipients, string $subject, \Throwable $error, string $reason = '', array $snapshot = array() ): array {
+	public function record_send_failure( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, \Throwable $error, string $reason = '', array $snapshot = array() ): array {
 		$message = get_class( $error ) . ': ' . $error->getMessage();
 
 		$this->log_error( 'delivery #' . $delivery_id . ' threw during send — ' . $message );
@@ -308,39 +357,55 @@ class DeliveryLogger {
 	/**
 	 * Write one attempt row per resolved recipient, then finalise.
 	 *
-	 * @param int                $delivery_id Tombstone id.
-	 * @param ResolvedRecipients $recipients  Resolved recipients.
-	 * @param string             $subject     Subject as sent.
-	 * @param string             $state       Attempt state.
-	 * @param string             $reason      Resolution notes.
-	 * @param string|null        $failure     Failure message, or null.
-	 * @param array              $snapshot    Structured diagnostic payload.
-	 * @param string             $what        Description for the shortfall log.
+	 * @param int                     $delivery_id Tombstone id.
+	 * @param ResolvedRecipients|null $recipients  Resolved recipients, or null.
+	 * @param string                  $subject     Subject as sent.
+	 * @param string                  $state       Attempt state.
+	 * @param string                  $reason      Resolution notes.
+	 * @param string|null             $failure     Failure message, or null.
+	 * @param array                   $snapshot    Structured diagnostic payload.
+	 * @param string                  $what        Description for the shortfall log.
 	 * @return array Structured result.
 	 */
-	private function write_attempt_rows( int $delivery_id, ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what ): array {
-		$entries  = $recipients->entries();
+	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what ): array {
+		$entries = null === $recipients ? array() : $recipients->entries();
+		$written = 0;
+
+		$row = array(
+			'type'            => 'auto',
+			'state'           => $state,
+			'subject'         => $subject,
+			'reason'          => Text::log_value( $reason ),
+			'failure_message' => null === $failure ? null : Text::log_value( $failure ),
+		);
+
+		if ( array() !== $snapshot ) {
+			$row['snapshot'] = $snapshot;
+		}
+
+		if ( array() === $entries ) {
+			/*
+			 * ⚠ ONE RECIPIENT-LESS ROW RATHER THAN NONE (ADR-0014 §10). Reachable
+			 * only on a failure path — a send is refused above unless there is a
+			 * deliverable recipient — and it is the path where a third party threw
+			 * before resolution produced an address. Writing nothing here would
+			 * finalise the tombstone with no detail row: an identity consumed, a
+			 * merchant told nothing, and the exception recorded nowhere.
+			 */
+			$written = $this->details->insert( $delivery_id, $row ) > 0 ? 1 : 0;
+
+			return $this->verify( $delivery_id, $what, 1, $written, $this->deliveries->set_final_status( $delivery_id, 'sent' === $state ? 'sent' : 'failed' ) );
+		}
+
 		$expected = count( $entries );
-		$written  = 0;
 
 		// ONE ROW PER RESOLVED RECIPIENT (ADR-0009, ADR-0012 §4). Never a
 		// comma-joined list: the privacy eraser finds rows with
 		// `WHERE recipient = %s`, so a joined list would be invisible to a
 		// legally-required erasure request.
 		foreach ( $entries as $entry ) {
-			$row = array(
-				'type'            => 'auto',
-				'state'           => $state,
-				'recipient'       => $entry['address'],
-				'recipient_type'  => $entry['type'],
-				'subject'         => $subject,
-				'reason'          => Text::log_value( $reason ),
-				'failure_message' => null === $failure ? null : Text::log_value( $failure ),
-			);
-
-			if ( array() !== $snapshot ) {
-				$row['snapshot'] = $snapshot;
-			}
+			$row['recipient']      = $entry['address'];
+			$row['recipient_type'] = $entry['type'];
 
 			if ( $this->details->insert( $delivery_id, $row ) > 0 ) {
 				++$written;
@@ -448,20 +513,33 @@ class DeliveryLogger {
 	 * by the aggregate tracking the newest fact — and each attempt row ALWAYS
 	 * records its own true outcome, which is not negotiable either way.
 	 *
+	 * ⚠ TWO OUTCOMES ARE RECORDED, NOT ONE, AND NEITHER MAY REPLACE THE OTHER
+	 * (ADR-0014 §10c). `$outcome` is what happened to the MESSAGE; `$rendered` is
+	 * whether THIS RULE'S content got into it. They were collapsed until Prompt 6B —
+	 * `not_rendered` was written INSTEAD of the message outcome — which made an
+	 * abandoned render indistinguishable from a failed delivery in the `state`
+	 * column, and so made a merchant's first real send report as a `resend`.
+	 *
 	 * @param int    $order_id        Order id, from the slot recorded at push.
 	 * @param int    $rule_id         Rule id.
 	 * @param string $native_email_id WooCommerce email the content went into —
 	 *                                the ADR-0004 insert identity.
 	 * @param int    $revision        Rule revision, audit only.
 	 * @param string $position        Injection position that emitted it.
-	 * @param string $outcome         One of self::INSERT_OUTCOMES.
+	 * @param string $outcome         The MESSAGE outcome; one of
+	 *                                self::INSERT_OUTCOMES.
+	 * @param string $notes           Placeholder-resolution notes from the render
+	 *                                that produced this content (ADR-0014 §1a).
+	 * @param bool   $rendered        Whether this RULE'S content reached the
+	 *                                message (ADR-0014 §10c).
 	 * @return array Structured result.
 	 */
-	public function record_insert( int $order_id, int $rule_id, string $native_email_id, int $revision, string $position, string $outcome = self::OUTCOME_SENT ): array {
+	public function record_insert( int $order_id, int $rule_id, string $native_email_id, int $revision, string $position, string $outcome = self::OUTCOME_SENT, string $notes = '', bool $rendered = true ): array {
 		if ( ! in_array( $outcome, self::INSERT_OUTCOMES, true ) ) {
 			// An allowlist, not a default: silently recording an unrecognised
 			// outcome as `sent` is the exact failure this parameter exists to
-			// remove.
+			// remove. `not_rendered` is refused here too, and deliberately — it is
+			// a RENDER outcome and arrives as `$rendered`, never as a message one.
 			$this->log_error( 'refused an unrecognised insert outcome "' . $outcome . '" for order #' . $order_id . ' rule #' . $rule_id );
 			return self::result( false, 1, 0, false );
 		}
@@ -469,11 +547,21 @@ class DeliveryLogger {
 		$claim = $this->deliveries->claim( $order_id, $rule_id, self::MODE_INSERT, DeliveryIdentity::native( $native_email_id ), $revision );
 
 		if ( DeliveryRepository::FAILED === $claim['result'] ) {
-			return $this->record_claim_failure( $claim, $order_id, $rule_id, self::insert_label( $outcome ) . ' into ' . $native_email_id );
+			return $this->record_claim_failure( $claim, $order_id, $rule_id, self::insert_label( $outcome, $rendered ) . ' into ' . $native_email_id );
 		}
 
 		$delivery_id = (int) $claim['delivery_id'];
 		$abandoned   = self::OUTCOME_ABANDONED === $outcome;
+
+		/*
+		 * THE STORED `state` IS THE TWO OUTCOMES MAPPED ONTO THE ATTEMPT-STATE
+		 * ALLOWLIST — see self::insert_state() for the full matrix and for why an
+		 * ABANDONED message keeps its own state whatever became of this rule's
+		 * content. Nothing is lost by the mapping: `snapshot.insert.outcome` and
+		 * `snapshot.insert.render` keep BOTH facts exactly, and the `reason` sentence
+		 * spells them out.
+		 */
+		$state = self::insert_state( $outcome, $rendered );
 
 		/*
 		 * ONE TRANSACTION ALLOCATES THE ATTEMPT, WRITES THE ROW AND RECORDS THE
@@ -503,8 +591,11 @@ class DeliveryLogger {
 				// as a real member of the allowlist so nothing downstream can see an
 				// unvalidated type.
 				'type'     => 'auto',
-				'state'    => $outcome,
-				'reason'   => Text::log_value( self::insert_reason( $outcome, $native_email_id, $position ) ),
+				'state'    => $state,
+				'reason'   => Text::log_value(
+					self::insert_reason( $outcome, $rendered, $native_email_id, $position )
+					. ( '' !== $notes ? '; ' . $notes : '' )
+				),
 				// THE PER-ATTEMPT AUDIT (ADR-0013 §1a). The tombstone carries one
 				// `rule_revision_sent` — necessarily the newest — so without this
 				// a send at revision 1 followed by a resend at revision 2 exposed
@@ -519,15 +610,21 @@ class DeliveryLogger {
 				// before the transaction — which is exactly the number that could be
 				// wrong.
 				'snapshot' => array(
+					// ⚠ BOTH AXES, SIDE BY SIDE (ADR-0014 §10c). `outcome` is the
+					// MESSAGE'S and `render` is THIS RULE'S; `not_rendered` used to be
+					// written into `outcome`, which destroyed the message fact
+					// entirely. Storing both is what lets the stored `state` be a
+					// lossy allowlist without anything having to be inferred back.
 					'insert' => array(
 						'rule_revision'   => $revision,
 						'native_email_id' => $native_email_id,
 						'position'        => $position,
 						'outcome'         => $outcome,
+						'render'          => $rendered ? self::RENDER_RENDERED : self::RENDER_NOT_RENDERED,
 					),
 				),
 			),
-			$outcome,
+			$state,
 			$revision,
 			$abandoned,
 			true
@@ -540,19 +637,70 @@ class DeliveryLogger {
 		// that as "not finalized" would log an error for correct behaviour.
 		$finalized = $recorded['status_written'] || $recorded['status_deferred'];
 
-		return $this->verify( $delivery_id, self::insert_label( $outcome, 'resend' === (string) $recorded['type'] ), 1, $written, $finalized );
+		return $this->verify( $delivery_id, self::insert_label( $outcome, $rendered, 'resend' === (string) $recorded['type'] ), 1, $written, $finalized );
 	}
 
 	/**
-	 * The shortfall-log description for one insert outcome.
+	 * The stored attempt `state` for one MESSAGE outcome and one RENDER outcome
+	 * (ADR-0014 §10c).
 	 *
-	 * @param string $outcome Outcome code.
-	 * @param bool   $repeat  Whether this attempt was DERIVED as a resend — i.e.
-	 *                        whether the tombstone already carried a real send
-	 *                        attempt (ADR-0013 §6b). Never the claim result.
+	 * `state` is a storage allowlist that retention tiering, the privacy exporter,
+	 * `GENUINE_ATTEMPT_STATES` and every support query read, so it holds four
+	 * values and the two axes have to project onto them. The projection is stated
+	 * as a table rather than derived, because the previous one-line version was
+	 * where the defect lived:
+	 *
+	 *   | message      | rendered | state        |
+	 *   |--------------|----------|--------------|
+	 *   | `sent`       | yes      | `sent`       |
+	 *   | `sent`       | **no**   | **`failed`** |
+	 *   | `failed`     | either   | `failed`     |
+	 *   | `unresolved` | either   | `unresolved` |
+	 *   | `abandoned`  | either   | `abandoned`  |
+	 *
+	 * ⚠ ONLY THE `sent` ROW IS AFFECTED BY THE RENDER OUTCOME, and that is the
+	 * correction. A message that WENT OUT without this rule's content is a failed
+	 * delivery OF THIS RULE and must be found by `state = 'failed'`. A message that
+	 * was ABANDONED was no delivery at all, so it keeps `abandoned` whether or not
+	 * this rule rendered — the previous code overwrote it with `failed`,
+	 * `GENUINE_ATTEMPT_STATES` counted that as a real send attempt, and the
+	 * merchant's next and FIRST genuine delivery was typed `resend` (ADR-0013 §6b).
+	 * `unresolved` keeps its own state for the same reason, one step weaker: a send
+	 * that began and never reported is not a send that failed.
+	 *
+	 * Nothing is inferred back out of the shared state: `snapshot.insert.outcome`
+	 * and `snapshot.insert.render` keep both codes exactly.
+	 *
+	 * @param string $outcome  One of self::INSERT_OUTCOMES — the MESSAGE outcome.
+	 * @param bool   $rendered Whether this rule's content reached the message.
+	 * @return string A member of `DeliveryDetailRepository::STATES`.
+	 */
+	private static function insert_state( string $outcome, bool $rendered ): string {
+		if ( ! $rendered && self::OUTCOME_SENT === $outcome ) {
+			return self::OUTCOME_FAILED;
+		}
+
+		return $outcome;
+	}
+
+	/**
+	 * The shortfall-log description for one insert record.
+	 *
+	 * @param string $outcome  MESSAGE outcome code.
+	 * @param bool   $rendered Whether this rule's content reached the message.
+	 * @param bool   $repeat   Whether this attempt was DERIVED as a resend — i.e.
+	 *                         whether the tombstone already carried a real send
+	 *                         attempt (ADR-0013 §6b). Never the claim result.
 	 * @return string
 	 */
-	private static function insert_label( string $outcome, bool $repeat = false ): string {
+	private static function insert_label( string $outcome, bool $rendered = true, bool $repeat = false ): string {
+		if ( ! $rendered ) {
+			// THE RULE'S OWN FAILURE IS WHAT A SHORTFALL AGAINST THIS ROW IS ABOUT,
+			// and this wording is true under every message outcome — which the
+			// outcome-derived labels below are not.
+			return $repeat ? 'a rule that failed to re-render' : 'a rule that failed to render';
+		}
+
 		if ( self::OUTCOME_ABANDONED === $outcome ) {
 			return $repeat ? 'an abandoned re-render' : 'an abandoned render';
 		}
@@ -588,12 +736,38 @@ class DeliveryLogger {
 	 * history inside the allocating transaction — and this string no longer offers a
 	 * second, weaker answer to the same question.
 	 *
-	 * @param string $outcome         Outcome code.
+	 * ⚠ AND IT NO LONGER CLAIMS THE NATIVE EMAIL WAS SENT WHEN IT WAS NOT
+	 * (ADR-0014 §10c). The `not_rendered` sentence used to end "…and the native
+	 * email was sent without it" unconditionally, because `not_rendered` had
+	 * REPLACED the message outcome and there was nothing left to consult. It was
+	 * therefore false for every abandoned, unresolved and failed message — a
+	 * merchant reading the log was told a customer had received an email nobody
+	 * ever sent. The two facts are now separate parameters and the sentence is
+	 * assembled from both.
+	 *
+	 * @param string $outcome         MESSAGE outcome code.
+	 * @param bool   $rendered        Whether this rule's content reached the
+	 *                                message.
 	 * @param string $native_email_id Native email id.
 	 * @param string $position        Injection position.
 	 * @return string
 	 */
-	private static function insert_reason( string $outcome, string $native_email_id, string $position ): string {
+	private static function insert_reason( string $outcome, bool $rendered, string $native_email_id, string $position ): string {
+		if ( ! $rendered ) {
+			/*
+			 * ⚠ THE ONE OPENING THAT SAYS NOTHING WAS INSERTED (ADR-0014 §10c). Every
+			 * other branch opens with "inserted into" or "content was rendered into",
+			 * because in those cases the content really did reach the message. Here it
+			 * did not: resolving this rule threw and the injector emitted nothing. What
+			 * then became of the MESSAGE is a second fact and is stated as one. The
+			 * exception's class and message arrive as `$notes` and are appended by the
+			 * caller.
+			 */
+			return 'NOTHING was inserted into ' . $native_email_id . ' at ' . $position
+				. ' — resolving this rule threw, so its content was withheld and '
+				. self::message_clause( $outcome );
+		}
+
 		if ( self::OUTCOME_ABANDONED === $outcome ) {
 			return 'content was rendered into ' . $native_email_id . ' at ' . $position
 				. ' but that render was never sent — no delivery was attempted';
@@ -611,6 +785,33 @@ class DeliveryLogger {
 		}
 
 		return $prefix;
+	}
+
+	/**
+	 * What became of the MESSAGE this rule failed to render into (ADR-0014 §10c).
+	 *
+	 * FOUR SENTENCES, ONE PER MESSAGE OUTCOME, and exactly one of them says the
+	 * email was sent. That is the whole point: the sentence a merchant reads has to
+	 * match what actually happened to the message, and until Prompt 6B every one of
+	 * these cases produced the `sent` wording.
+	 *
+	 * @param string $outcome MESSAGE outcome code.
+	 * @return string
+	 */
+	private static function message_clause( string $outcome ): string {
+		if ( self::OUTCOME_ABANDONED === $outcome ) {
+			return 'that render never reached a send at all — no delivery was attempted';
+		}
+
+		if ( self::OUTCOME_UNRESOLVED === $outcome ) {
+			return "the native email's send outcome was never reported";
+		}
+
+		if ( self::OUTCOME_FAILED === $outcome ) {
+			return 'WooCommerce reported the native email itself as not sent';
+		}
+
+		return 'the native email was sent without it';
 	}
 
 	/**

@@ -105,6 +105,21 @@ class RenderLedger {
 	const MAX_DIAGNOSTIC_ENTRIES = 100;
 
 	/**
+	 * How many DISTINCT notes one rule will carry out of one render
+	 * (ADR-0014 §1d).
+	 *
+	 * ⚠ THE CAP `PlaceholderValues::MAX_NOTES` DOES NOT ALREADY PROVIDE. That one
+	 * bounds a single value set, and at the per-item position a rule gets a FRESH
+	 * value set per line item — so an order with fifty failing items could
+	 * contribute fifty times the per-set limit to one rule-level string that had no
+	 * limit of its own. Deliberately the same number, because it bounds the same
+	 * `reason` column at the other end: 20 notes plus the outcome sentence stay
+	 * inside `Domain\Text::MAX_LOG_LENGTH`, so the cap here and the truncation at
+	 * storage agree rather than the second one quietly doing the first one's job.
+	 */
+	const MAX_RULE_NOTES = 20;
+
+	/**
 	 * The two observation stages of one `WC_Email::send()`, in the order
 	 * `WC_Email` evaluates them as arguments to that call.
 	 */
@@ -312,13 +327,27 @@ class RenderLedger {
 	 * two line items still counts once, so a non-per-item position cannot
 	 * double-record.
 	 *
+	 * ⚠ `$emitted` IS NOT A SECOND SPELLING OF "REGISTERED" (ADR-0014 §10b). A rule
+	 * whose resolution THREW is registered too — the merchant is entitled to know
+	 * its content was withheld from an email that went out — but nothing of it
+	 * reached the message, so it must not be recorded as inserted. It is the RULE'S
+	 * render outcome and is recorded ALONGSIDE the message's, never instead of it
+	 * (ADR-0014 §10c).
+	 *
 	 * @param string $token    Render token.
 	 * @param int    $rule_id  Rule id.
 	 * @param int    $revision Rule revision, for the audit.
 	 * @param string $position Injection position that emitted it.
+	 * @param string $notes    Anything placeholder resolution had to say about
+	 *                         this rule's content (ADR-0014 §1a) — carried to the
+	 *                         attempt row's `reason` at finalization, because the
+	 *                         render is where it is known and the record is
+	 *                         written a whole send later. Stored in a keyed,
+	 *                         capped SET; flatten it with self::notes_line().
+	 * @param bool   $emitted  Whether content actually reached the message.
 	 * @return bool True when the rule was recorded against a slot.
 	 */
-	public function register( string $token, int $rule_id, int $revision, string $position ): bool {
+	public function register( string $token, int $rule_id, int $revision, string $position, string $notes = '', bool $emitted = true ): bool {
 		$index = $this->index_of( $token );
 
 		if ( $index < 0 ) {
@@ -328,13 +357,123 @@ class RenderLedger {
 
 		if ( ! isset( $this->slots[ $index ]['rules'][ $rule_id ] ) ) {
 			$this->slots[ $index ]['rules'][ $rule_id ] = array(
-				'rule_id'  => $rule_id,
-				'revision' => $revision,
-				'position' => $position,
+				'rule_id'       => $rule_id,
+				'revision'      => $revision,
+				'position'      => $position,
+				// A SET KEYED BY THE NOTE, NOT A STRING — see self::add_note().
+				'notes'         => array(),
+				'dropped_notes' => 0,
+				'emitted'       => $emitted,
 			);
+
+			$this->add_note( $index, $rule_id, $notes );
+
+			return true;
 		}
 
+		$existing = $this->slots[ $index ]['rules'][ $rule_id ];
+
+		/*
+		 * ACCUMULATED WITH OR, ACROSS EMISSIONS (ADR-0014 §10b). A rule emitting
+		 * beside two line items and throwing on only one of them DID reach the
+		 * customer, so a later `false` must not erase an earlier genuine `true`.
+		 *
+		 * ⚠ THIS IS ONLY SOUND BECAUSE `Injector` NO LONGER REGISTERS BEFORE THE
+		 * OUTPUT IS WRITTEN. It used to register `true`, then run `wp_kses_post()`,
+		 * which can throw — and the catch's `false` was then OR'd back into a `true`
+		 * nothing had earned, so the ledger claimed content that was never printed.
+		 * OR is the right rule ACROSS emissions and was the wrong rule WITHIN one;
+		 * the ordering fix is what makes that distinction hold.
+		 */
+		$this->slots[ $index ]['rules'][ $rule_id ]['emitted'] = (bool) ( $existing['emitted'] ?? true ) || $emitted;
+
+		$this->add_note( $index, $rule_id, $notes );
+
 		return true;
+	}
+
+	/**
+	 * Add one note to a rule's set, EXACTLY KEYED AND CAPPED (ADR-0014 §1d).
+	 *
+	 * A DISTINCT LATER NOTE IS KEPT, NOT DROPPED. The first registration wins on
+	 * revision and position — one rule, one row — but "the second line item threw"
+	 * is a different fact from "the first one resolved cleanly", and only one of the
+	 * two would otherwise survive.
+	 *
+	 * ⚠ TWO THINGS WERE WRONG WITH THE CONCATENATED STRING THIS REPLACES, AND BOTH
+	 * ARE CLASSES OF DEFECT ALREADY FIXED ELSEWHERE IN THIS PLUGIN:
+	 *
+	 *   1. **UNBOUNDED.** `PlaceholderValues` caps its own notes at 20 PER ITEM, and
+	 *      this concatenated the per-item strings into one rule-level string with no
+	 *      cap at all — so a fifty-line order with a per-item failure on each grew it
+	 *      linearly. That is the memory-leak-wearing-a-useful-name shape Prompt 5B
+	 *      capped in `RenderContext` and in this class's own diagnostics; it was
+	 *      missed here only because the collection was new.
+	 *   2. **INEXACT DE-DUPLICATION.** The test was `false === strpos( $existing,
+	 *      $note )`, so a DISTINCT note that happened to be a SUBSTRING of one already
+	 *      stored was silently discarded — `unknown placeholder {a}` swallowed by
+	 *      `unknown placeholder {ab}`. A set keyed by the exact note answers the
+	 *      question actually being asked.
+	 *
+	 * The set is flattened only at storage, by self::notes_line().
+	 *
+	 * @param int    $index   Slot index.
+	 * @param int    $rule_id Rule id.
+	 * @param string $notes   Note text; may itself be a `; `-joined run from one
+	 *                        value set, which is SPLIT so each part is keyed and
+	 *                        capped on its own rather than as one long line.
+	 * @return void
+	 */
+	private function add_note( int $index, int $rule_id, string $notes ): void {
+		if ( '' === trim( $notes ) ) {
+			return;
+		}
+
+		foreach ( explode( '; ', $notes ) as $note ) {
+			$note = trim( $note );
+
+			if ( '' === $note || isset( $this->slots[ $index ]['rules'][ $rule_id ]['notes'][ $note ] ) ) {
+				continue;
+			}
+
+			if ( count( $this->slots[ $index ]['rules'][ $rule_id ]['notes'] ) >= self::MAX_RULE_NOTES ) {
+				++$this->slots[ $index ]['rules'][ $rule_id ]['dropped_notes'];
+				continue;
+			}
+
+			$this->slots[ $index ]['rules'][ $rule_id ]['notes'][ $note ] = true;
+		}
+	}
+
+	/**
+	 * One rule entry's notes, flattened for storage (ADR-0014 §1d).
+	 *
+	 * THE ONLY PLACE THE SET BECOMES A STRING. Everything upstream keeps it keyed,
+	 * so de-duplication stays exact and the cap stays enforceable — the same
+	 * discipline `PlaceholderValues::notes_line()` follows one layer down, including
+	 * saying out loud how many were dropped rather than silently truncating.
+	 *
+	 * A plain string is accepted and returned unchanged, so a hand-built slot in a
+	 * test or a fixture flattens rather than fatalling.
+	 *
+	 * @param array $entry Rule entry from a slot's `rules` set.
+	 * @return string
+	 */
+	public static function notes_line( array $entry ): string {
+		$notes = $entry['notes'] ?? array();
+
+		if ( is_string( $notes ) ) {
+			return $notes;
+		}
+
+		$lines   = array_keys( (array) $notes );
+		$dropped = (int) ( $entry['dropped_notes'] ?? 0 );
+
+		if ( $dropped > 0 ) {
+			$lines[] = 'and ' . $dropped . ' further render notes not recorded';
+		}
+
+		return implode( '; ', $lines );
 	}
 
 	/**

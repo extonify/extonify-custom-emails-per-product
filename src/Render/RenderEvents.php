@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Render;
 
 use Extonify\WCEP\Delivery\InsertPhase;
+use Extonify\WCEP\Delivery\PlaceholderResolver;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -540,7 +541,18 @@ class RenderEvents {
 	 */
 	public static function injector(): Injector {
 		if ( null === self::$injector ) {
-			self::$injector = new Injector( self::context(), self::ledger() );
+			/*
+			 * THE PLACEHOLDER RESOLVER SHARES THE INSERT PHASE'S PRODUCT CACHE
+			 * (ADR-0014 §8). That cache was filled by this render's own evaluation
+			 * at frame push, so every matched product a placeholder asks about is
+			 * already in memory — which is what holds the product data class at zero
+			 * queries under the §8 cost contract, rather than resolution being free.
+			 */
+			self::$injector = new Injector(
+				self::context(),
+				self::ledger(),
+				new PlaceholderResolver( self::phase()->item_resolver() )
+			);
 		}
 
 		return self::$injector;

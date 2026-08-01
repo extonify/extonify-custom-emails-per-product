@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Email;
 
 use Extonify\WCEP\Delivery\HeaderGuard;
+use Extonify\WCEP\Domain\Text;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -119,21 +120,26 @@ class Custom_Email extends \WC_Email {
 	 * `object` is `WC_Email`'s own property; the rest are declared below.
 	 */
 	const RUNTIME_FIELDS = array(
-		'recipient'        => '',
-		'cc'               => '',
-		'bcc'              => '',
-		'delivery_subject' => '',
-		'delivery_heading' => '',
-		'delivery_content' => '',
-		'matched_items'    => array(),
-		'delivery_id'      => 0,
-		'object'           => null,
+		'recipient'              => '',
+		'cc'                     => '',
+		'bcc'                    => '',
+		'delivery_subject'       => '',
+		'delivery_heading'       => '',
+		'delivery_content'       => '',
+		// The SAME body, flattened and resolved for a text/plain destination
+		// (ADR-0014 §9). A field of its own rather than something derived at
+		// render time, because the two formats escape their placeholder values
+		// differently and deriving one from the other would have to un-escape.
+		'delivery_content_plain' => '',
+		'matched_items'          => array(),
+		'delivery_id'            => 0,
+		'object'                 => null,
 		// INHERITED FROM WC_Email, and the only parent property WooCommerce
 		// mutates mid-delivery (ADR-0012 §11c). `get_content()` sets it true and
 		// `handle_multipart()` — on `phpmailer_init` — sets it false again, so a
 		// nested delivery's multipart handler would otherwise switch the OUTER
 		// send off and cost it its plain-text alternative.
-		'sending'          => false,
+		'sending'                => false,
 	);
 
 	/**
@@ -168,12 +174,25 @@ class Custom_Email extends \WC_Email {
 	public $delivery_heading = '';
 
 	/**
-	 * Body for the current delivery, already `wp_kses_post`-filtered at the
-	 * storage boundary.
+	 * Body for the current delivery: `wp_kses_post`-filtered at the storage
+	 * boundary, with its placeholders already resolved for an HTML destination
+	 * (ADR-0014 §9).
 	 *
 	 * @var string
 	 */
 	public $delivery_content = '';
+
+	/**
+	 * Body for the current delivery, already flattened to text and resolved for
+	 * a `text/plain` destination (ADR-0014 §9).
+	 *
+	 * Empty means "not supplied": self::get_content_plain() then flattens
+	 * self::$delivery_content itself, which is what every caller that predates
+	 * placeholders does.
+	 *
+	 * @var string
+	 */
+	public $delivery_content_plain = '';
 
 	/**
 	 * Matched item records for the current delivery (ADR-0011 §5). Carried for
@@ -314,9 +333,12 @@ class Custom_Email extends \WC_Email {
 		$this->delivery_subject = HeaderGuard::strip( (string) ( $args['subject'] ?? '' ) );
 		$this->delivery_heading = (string) ( $args['heading'] ?? '' );
 		$this->delivery_content = (string) ( $args['content'] ?? '' );
-		$this->matched_items    = (array) ( $args['matched_items'] ?? array() );
-		$this->delivery_id      = (int) ( $args['delivery_id'] ?? 0 );
-		$this->object           = $args['object'] ?? null;
+
+		$this->delivery_content_plain = (string) ( $args['content_plain'] ?? '' );
+
+		$this->matched_items = (array) ( $args['matched_items'] ?? array() );
+		$this->delivery_id   = (int) ( $args['delivery_id'] ?? 0 );
+		$this->object        = $args['object'] ?? null;
 
 		// NOT a caller-supplied field: WooCommerce owns it. A new delivery
 		// simply starts "not sending", and `WC_Email::get_content()` sets it.
@@ -446,7 +468,10 @@ class Custom_Email extends \WC_Email {
 	 *     @type string    $bcc           Comma-joined `bcc` addresses.
 	 *     @type string    $subject       Subject line.
 	 *     @type string    $heading       Email heading.
-	 *     @type string    $content       Body, already kses-filtered.
+	 *     @type string    $content       Body, already kses-filtered, with
+	 *                                    placeholders resolved for HTML.
+	 *     @type string    $content_plain The same body resolved for text/plain;
+	 *                                    derived from $content when absent.
 	 *     @type array[]   $matched_items Matched item records.
 	 *     @type int       $delivery_id   Owning tombstone id.
 	 *     @type \WC_Order $object        The order.
@@ -546,8 +571,17 @@ class Custom_Email extends \WC_Email {
 	/**
 	 * Subject for the current delivery.
 	 *
-	 * Sent LITERALLY: placeholder substitution does not exist yet (ADR-0012 §6),
-	 * so `format_string()` is deliberately not applied.
+	 * ALREADY RESOLVED AND ALREADY HEADER-STRIPPED. The orchestrator substitutes
+	 * this rule's placeholders in the HEADER context before calling
+	 * self::trigger() (ADR-0014 §9), so every value in it has been through
+	 * `HeaderGuard` at substitution and the whole string again in
+	 * self::apply_runtime_state().
+	 *
+	 * ⚠ `WC_Email::format_string()` IS STILL DELIBERATELY NOT APPLIED. That is
+	 * WooCommerce's OWN `{site_title}`-style placeholder pass, driven by
+	 * `$this->placeholders` — a second, differently-spelled substitution engine
+	 * whose values this plugin does not control and whose rules are not
+	 * ADR-0014's. One resolver, one grammar, one escaping contract.
 	 *
 	 * @return string
 	 */
@@ -736,10 +770,28 @@ class Custom_Email extends \WC_Email {
 	/**
 	 * Plain-text body.
 	 *
+	 * ⚠ THIS USED TO DELETE THE MERCHANT'S ENTITIES, AND THE FIX IS ADR-0014 §9a.
+	 * It ran `wp_strip_all_tags( wp_kses_post( … ) )` with NO decode step, and
+	 * `WC_Email::get_content()` then runs every plain body through
+	 * `$plain_search`/`$plain_replace`, whose last-but-one pattern is
+	 * `/&[^&\s;]+;/i` → `''`: **every entity WooCommerce does not explicitly
+	 * handle is deleted outright**. A rule body containing `caf&eacute;` reached
+	 * the customer as `caf`. Prompt 5A fixed exactly this defect for INSERT mode
+	 * (ADR-0013 §4b) and separate mode kept it; both now flatten through the one
+	 * `Domain\Text::to_plain_text()`.
+	 *
+	 * A PRE-RENDERED plain body is preferred when the caller supplied one, because
+	 * placeholder VALUES must be substituted into text rather than flattened after
+	 * substitution — flattening afterwards would strip a customer's name of its
+	 * own angle brackets and mangle every `&` in a value (ADR-0014 §9).
+	 *
 	 * @return string
 	 */
 	public function get_content_plain(): string {
-		return $this->get_heading() . "\n\n"
-			. wp_strip_all_tags( wp_kses_post( $this->delivery_content ) ) . "\n";
+		$body = '' !== $this->delivery_content_plain
+			? $this->delivery_content_plain
+			: Text::to_plain_text( wp_kses_post( $this->delivery_content ) );
+
+		return $this->get_heading() . "\n\n" . $body . "\n";
 	}
 }

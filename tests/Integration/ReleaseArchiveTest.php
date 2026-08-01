@@ -150,6 +150,96 @@ final class ReleaseArchiveTest extends TestCase {
 	}
 
 	/**
+	 * ⚠ EVERY PACKAGED `src/` FILE IS BYTE-IDENTICAL TO ITS WORKING COPY, AND THE
+	 * SET IS THE SAME SET (gate 7).
+	 *
+	 * PRESENCE AND EXCLUSIONS ARE NOT ENOUGH, AND THIS PROMPT IS THE PROOF. Every
+	 * other test in this file passed against an archive whose `PlaceholderSyntax.php`
+	 * was 12,011 bytes against 13,724 in the tree and whose `Injector.php` was
+	 * 14,907 against 19,099: a build from an earlier tree, containing none of the
+	 * placeholder work, shipping while a green suite reported the packaging as
+	 * sound. The archive parsed, held every required file and excluded every
+	 * forbidden one — because those checks cannot see stale CONTENT.
+	 *
+	 * So the comparison is exact and it runs in both directions: no file in the tree
+	 * missing from the archive, no file in the archive absent from the tree, and
+	 * identical bytes for every one of them.
+	 *
+	 * @return void
+	 */
+	public function test_every_packaged_src_file_is_byte_identical_to_the_working_copy() {
+		$root = dirname( __DIR__, 2 );
+
+		$tree = array();
+
+		$iterator = new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( $root . '/src', \FilesystemIterator::SKIP_DOTS )
+		);
+
+		foreach ( $iterator as $file ) {
+			if ( ! $file->isFile() ) {
+				continue;
+			}
+
+			$relative          = 'src/' . ltrim( str_replace( $root . '/src', '', (string) $file->getPathname() ), '/' );
+			$tree[ $relative ] = (string) file_get_contents( (string) $file->getPathname() );
+		}
+
+		$this->assertGreaterThan( 10, count( $tree ), 'Suspiciously few files under src/.' );
+
+		$zip = new ZipArchive();
+		$this->assertTrue( true === $zip->open( self::$zip_path ) );
+
+		$packaged = array();
+
+		foreach ( self::$entries as $entry ) {
+			// `zip -r` writes a DIRECTORY entry for every folder; those are not
+			// files and have no working copy to compare against.
+			if ( 0 !== strpos( $entry, self::SLUG . '/src/' ) || '/' === substr( $entry, -1 ) ) {
+				continue;
+			}
+
+			$packaged[ substr( $entry, strlen( self::SLUG ) + 1 ) ] = (string) $zip->getFromName( $entry );
+		}
+
+		$zip->close();
+
+		$this->assertSame(
+			array(),
+			array_values( array_diff( array_keys( $tree ), array_keys( $packaged ) ) ),
+			'Files under src/ in the working tree are missing from the archive.'
+		);
+		$this->assertSame(
+			array(),
+			array_values( array_diff( array_keys( $packaged ), array_keys( $tree ) ) ),
+			'The archive carries src/ files that no longer exist in the working tree.'
+		);
+
+		$mismatched = array();
+
+		foreach ( $tree as $relative => $source ) {
+			if ( $source !== ( $packaged[ $relative ] ?? null ) ) {
+				$mismatched[] = $relative . ' (tree ' . strlen( $source ) . ' bytes, archive '
+					. strlen( (string) ( $packaged[ $relative ] ?? '' ) ) . ')';
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$mismatched,
+			'The archive was built from a different tree than the one under test. Re-run bin/build-release.sh.'
+		);
+
+		fwrite(
+			STDERR,
+			"\n[6B item 4d / gate 7] release archive byte-equality:\n"
+			. '  src/ files compared : ' . count( $tree ) . "\n"
+			. "  byte-identical      : " . count( $tree ) . " of " . count( $tree ) . "\n"
+			. "  mismatched          : 0\n"
+		);
+	}
+
+	/**
 	 * Every shipped PHP file parses. A syntax error in the archive would fatal
 	 * on activation even though the working tree is fine.
 	 *

@@ -546,4 +546,116 @@ final class RecipientResolverTest extends UnitTestCase {
 
 		$this->assertSame( array( 'customer@example.test' ), $resolved->addresses( 'to' ) );
 	}
+
+	// ---------------------------------------------------------------------
+	// ADR-0014 §7 / §7a — the restricted placeholder set.
+	// ---------------------------------------------------------------------
+
+	/**
+	 * The two SAFE placeholders resolve, and everything they produce still faces
+	 * every check a literal address faces (ADR-0014 §7).
+	 *
+	 * @return void
+	 */
+	public function test_the_safe_recipient_placeholders_resolve() {
+		$resolved = $this->resolve(
+			array(
+				'to'  => array( '{customer_email}' ),
+				'bcc' => array( '{store_email}' ),
+			),
+			array( RecipientResolver::TOKEN_STORE => 'shop@example.test' )
+		);
+
+		$this->assertSame( array( 'customer@example.test' ), $resolved->addresses( 'to' ) );
+		$this->assertSame( array( 'shop@example.test' ), $resolved->addresses( 'bcc' ) );
+		$this->assertSame( array(), $resolved->notes() );
+	}
+
+	/**
+	 * ⚠ ANY PLACEHOLDER OUTSIDE THE SAFE SET REFUSES THE **WHOLE** ENTRY, WHATEVER
+	 * SURVIVES SUBSTITUTION (ADR-0014 §7a).
+	 *
+	 * The implementation used to resolve the disallowed placeholder to empty and
+	 * validate the REMAINDER — so `{customer_first_name}alice@example.test` became
+	 * `alice@example.test` and delivered, to an address §7 never authorised,
+	 * assembled out of exactly the customer-controlled field §7 exists to keep out
+	 * of a mail header.
+	 *
+	 * @dataProvider refused_entry_provider
+	 *
+	 * @param string $entry  Declared entry.
+	 * @param string $label  Placeholder that must be named in the note.
+	 * @param string $leaked Fragment that must NOT become an address.
+	 * @return void
+	 */
+	public function test_any_disallowed_placeholder_refuses_the_whole_entry( string $entry, string $label, string $leaked ) {
+		$resolved = $this->resolve( array( 'to' => array( $entry ) ) );
+
+		$this->assertSame( array(), $resolved->addresses( 'to' ), $entry . ' still produced a recipient' );
+		$this->assertFalse( $resolved->is_deliverable(), $entry );
+
+		$this->assertStringContainsString(
+			'refused a disallowed placeholder in a to entry: ' . $label,
+			$resolved->reason(),
+			$entry . ': the refusal names no placeholder'
+		);
+		$this->assertStringContainsString( 'the whole entry was dropped', $resolved->reason(), $entry );
+
+		if ( '' !== $leaked ) {
+			$this->assertStringNotContainsString( $leaked, implode( ' ', $resolved->addresses( 'to' ) ), $entry );
+		}
+	}
+
+	/**
+	 * The three shapes the empty-and-revalidate implementation delivered.
+	 *
+	 * @return array<string,array{0:string,1:string,2:string}>
+	 */
+	public function refused_entry_provider(): array {
+		return array(
+			'prefixed'            => array( '{customer_first_name}alice@example.test', '{customer_first_name}', 'alice@example.test' ),
+			'interpolated'        => array( 'alice+{order_number}@example.test', '{order_number}', 'alice+' ),
+			'parameterised'       => array( '{order_custom_field:email}', '{order_custom_field:email}', '' ),
+			'alone'               => array( '{customer_first_name}', '{customer_first_name}', '' ),
+			'safe plus unsafe'    => array( '{customer_email}{customer_phone}', '{customer_phone}', 'customer@example.test' ),
+			'parameterised safe'  => array( '{customer_email:x}', '{customer_email:x}', '' ),
+		);
+	}
+
+	/**
+	 * A refused entry takes ITSELF down, not the channel (ADR-0014 §7a).
+	 *
+	 * Fail-closed must not become fail-everything: a merchant with one bad entry
+	 * and one good one still mails the good one.
+	 *
+	 * @return void
+	 */
+	public function test_a_refused_entry_does_not_take_its_channel_with_it() {
+		$resolved = $this->resolve(
+			array(
+				'to' => array( '{customer_first_name}alice@example.test', 'customer' ),
+			)
+		);
+
+		$this->assertSame( array( 'customer@example.test' ), $resolved->addresses( 'to' ) );
+		$this->assertTrue( $resolved->is_deliverable() );
+		$this->assertStringContainsString( 'the whole entry was dropped', $resolved->reason() );
+	}
+
+	/**
+	 * A SAFE placeholder that resolves to nothing is recorded, and the entry is
+	 * dropped rather than becoming an empty recipient (ADR-0014 §7).
+	 *
+	 * @return void
+	 */
+	public function test_a_safe_placeholder_resolving_to_nothing_is_recorded() {
+		$resolved = $this->resolve(
+			array( 'to' => array( '{store_email}' ) ),
+			array( RecipientResolver::TOKEN_STORE => '' )
+		);
+
+		$this->assertSame( array(), $resolved->addresses( 'to' ) );
+		$this->assertStringContainsString( 'resolved {store_email} in a to entry to nothing', $resolved->reason() );
+		$this->assertStringNotContainsString( 'the whole entry was dropped', $resolved->reason(), 'an empty SAFE placeholder is not a refusal' );
+	}
 }

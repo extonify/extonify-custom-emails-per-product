@@ -63,4 +63,46 @@ final class Text {
 
 		return $value;
 	}
+
+	/**
+	 * Flatten stored HTML to plain text, ready to be emitted verbatim
+	 * (ADR-0013 §4b, ADR-0014 §9a).
+	 *
+	 * FOUR STEPS, IN THIS ORDER, AND THE ORDER MATTERS:
+	 *
+	 *   1. block-ish tags become newlines, so the shape of the block survives;
+	 *   2. every remaining tag is removed;
+	 *   3. entities are DECODED — `&amp;` back to `&`, `&#8212;` back to an em
+	 *      dash;
+	 *   4. line endings are normalised to `\n`.
+	 *
+	 * Decoding AFTER stripping is deliberate: decoding first could reveal
+	 * character sequences that step 2 would then eat, so `<3` written by a
+	 * merchant as `&lt;3` would silently vanish.
+	 *
+	 * ⚠ STEP 3 IS NOT COSMETIC. `WC_Email::get_content()` runs every plain body
+	 * through `$plain_search`/`$plain_replace`, whose last-but-one pattern is
+	 * `/&[^&\s;]+;/i` → `''`: **every entity WooCommerce does not explicitly
+	 * handle is deleted outright**, so an un-decoded `caf&eacute;` reaches the
+	 * customer as `caf`.
+	 *
+	 * ⚠ ONE IMPLEMENTATION, TWO MODES, AND THAT IS WHY IT LIVES HERE. Prompt 5A
+	 * fixed this for INSERT mode only, inside `Render\Injector`. Separate mode's
+	 * `Custom_Email::get_content_plain()` kept doing
+	 * `wp_strip_all_tags( wp_kses_post( … ) )` with no decode step, so the
+	 * identical defect was live there the whole time (ADR-0014 §9a). Both modes
+	 * now call this, so the two halves cannot come apart again.
+	 *
+	 * @param string $content Stored content.
+	 * @return string
+	 */
+	public static function to_plain_text( string $content ): string {
+		$text = preg_replace( '/<\s*br\s*\/?\s*>/i', "\n", $content );
+		$text = preg_replace( '/<\s*\/\s*(p|div|li|h[1-6])\s*>/i', "\n", (string) $text );
+		$text = wp_strip_all_tags( (string) $text );
+		$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		$text = preg_replace( '/\r\n|\r/', "\n", $text );
+
+		return trim( (string) $text );
+	}
 }

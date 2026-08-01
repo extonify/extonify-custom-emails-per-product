@@ -12,6 +12,7 @@ use Extonify\WCEP\Domain\PreparedRule;
 use Extonify\WCEP\Domain\Specificity;
 use Extonify\WCEP\Install\Migrator;
 use Extonify\WCEP\Matching\ItemResolver;
+use Extonify\WCEP\Render\RenderLedger;
 use Extonify\WCEP\Repository\RuleRepository;
 
 defined( 'ABSPATH' ) || exit;
@@ -178,8 +179,12 @@ class InsertPhase {
 	}
 
 	/**
-	 * Record everything one finalized render inserted, under the outcome
+	 * Record everything one finalized render inserted, under the MESSAGE outcome
 	 * WooCommerce reported (ADR-0013 §1a).
+	 *
+	 * ⚠ THE OUTCOME PASSED HERE IS THE MESSAGE'S AND ONLY THE MESSAGE'S. Whether
+	 * each rule's content reached it is read per rule off the slot and passed
+	 * separately (ADR-0014 §10c).
 	 *
 	 * @param array $slot Resolved slot from `Render\RenderLedger::finalize()`.
 	 * @param bool  $sent Whether the mail callback reported success.
@@ -221,7 +226,8 @@ class InsertPhase {
 	 * Write one record per rule the slot carried.
 	 *
 	 * @param array  $slot    Slot.
-	 * @param string $outcome One of the DeliveryLogger::OUTCOME_* codes.
+	 * @param string $outcome The MESSAGE outcome; a member of
+	 *                        `DeliveryLogger::INSERT_OUTCOMES`.
 	 * @return array[]
 	 */
 	private function record( array $slot, string $outcome ): array {
@@ -242,7 +248,43 @@ class InsertPhase {
 				continue;
 			}
 
-			$results[ $rule_id ] = $this->logger->record_insert( $order_id, $rule_id, $email_id, $revision, $position, $outcome );
+			/*
+			 * ⚠ TWO FACTS, PASSED SEPARATELY, AND NEITHER OVERWRITES THE OTHER
+			 * (ADR-0014 §10c).
+			 *
+			 * `$outcome` is the MESSAGE'S — sent, failed, unresolved or abandoned —
+			 * and `$rendered` is THIS RULE'S: whether its content actually got into
+			 * that message. A rule whose resolution threw contributed nothing to a
+			 * message WooCommerce may well have delivered perfectly, so recording it
+			 * under the slot's `sent` alone would tell the merchant a customer
+			 * received content that was never emitted.
+			 *
+			 * ⚠ BUT THE FIX FOR THAT USED TO BE TO **REPLACE** THE MESSAGE OUTCOME
+			 * WITH `not_rendered`, WHICH DESTROYED THE OTHER FACT. An ABANDONED
+			 * render — a message that was never sent at all — was then stored
+			 * `state = 'failed'`, which `GENUINE_ATTEMPT_STATES` counts as a real
+			 * delivery attempt, so the merchant's next and FIRST genuine send was
+			 * typed `resend`: the ADR-0013 §6b defect Prompt 5C fixed, reappearing
+			 * through a different column. And the stored sentence said "the native
+			 * email was sent without it" about a message nobody sent.
+			 */
+			$rendered = false !== ( $entry['emitted'] ?? true );
+
+			// ADR-0014 §1a: an unrecognised placeholder or a refused meta key is
+			// known at RENDER time and recorded here, a whole send later, because
+			// this is where the attempt row is written. ⚠ Flattened HERE and only
+			// here (ADR-0014 §1d): the ledger keeps them as an exact-keyed, capped
+			// set per rule, and storage is the one place that needs a string.
+			$results[ $rule_id ] = $this->logger->record_insert(
+				$order_id,
+				$rule_id,
+				$email_id,
+				$revision,
+				$position,
+				$outcome,
+				RenderLedger::notes_line( $entry ),
+				$rendered
+			);
 		}
 
 		return $results;

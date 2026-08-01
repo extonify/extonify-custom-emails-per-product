@@ -9,6 +9,7 @@ namespace Extonify\WCEP\Delivery;
 
 use Extonify\WCEP\Domain\EvaluationResult;
 use Extonify\WCEP\Domain\MatchDecision;
+use Extonify\WCEP\Domain\PlaceholderSyntax;
 use Extonify\WCEP\Domain\TriggerEvent;
 use Extonify\WCEP\Email\Custom_Email;
 use Extonify\WCEP\Email\EmailIdentity;
@@ -70,16 +71,34 @@ class Orchestrator {
 	private $logger;
 
 	/**
+	 * Placeholder resolution (ADR-0014). PER REQUEST, and it holds NO per-delivery
+	 * state: it hands out one value set per delivery, over the matcher's product
+	 * cache, so nothing an inner delivery does can reach an outer one and the
+	 * ADR-0014 §8 cost contract holds — no per-placeholder and no per-occurrence
+	 * query growth, one bounded named cost per distinct data class a body reads.
+	 *
+	 * @var PlaceholderResolver
+	 */
+	private $placeholders;
+
+	/**
 	 * Constructor.
 	 *
-	 * @param RuleRepository|null $rules   Rule storage.
-	 * @param RuleMatcher|null    $matcher Matching engine.
-	 * @param DeliveryLogger|null $logger  Delivery logger.
+	 * @param RuleRepository|null      $rules        Rule storage.
+	 * @param RuleMatcher|null         $matcher      Matching engine.
+	 * @param DeliveryLogger|null      $logger       Delivery logger.
+	 * @param PlaceholderResolver|null $placeholders Placeholder resolution;
+	 *                                               defaults to one sharing THIS
+	 *                                               matcher's product cache, which
+	 *                                               is what keeps product
+	 *                                               placeholders at zero queries
+	 *                                               (ADR-0014 §8).
 	 */
-	public function __construct( ?RuleRepository $rules = null, ?RuleMatcher $matcher = null, ?DeliveryLogger $logger = null ) {
-		$this->rules   = null !== $rules ? $rules : new RuleRepository();
-		$this->matcher = null !== $matcher ? $matcher : new RuleMatcher( $this->rules );
-		$this->logger  = null !== $logger ? $logger : new DeliveryLogger();
+	public function __construct( ?RuleRepository $rules = null, ?RuleMatcher $matcher = null, ?DeliveryLogger $logger = null, ?PlaceholderResolver $placeholders = null ) {
+		$this->rules        = null !== $rules ? $rules : new RuleRepository();
+		$this->matcher      = null !== $matcher ? $matcher : new RuleMatcher( $this->rules );
+		$this->logger       = null !== $logger ? $logger : new DeliveryLogger();
+		$this->placeholders = null !== $placeholders ? $placeholders : new PlaceholderResolver( $this->matcher->item_resolver() );
 	}
 
 	/**
@@ -410,7 +429,29 @@ class Orchestrator {
 	}
 
 	/**
-	 * Resolve recipients, send, and record the outcome.
+	 * THE CONTAINMENT BOUNDARY: everything that happens after the identity is
+	 * claimed runs inside it (ADR-0014 §10).
+	 *
+	 * ⚠ THE BOUNDARY USED TO SIT AROUND `trigger()` ALONE, AND PROMPT 6 MADE THAT
+	 * REACHABLE. Recipient resolution, placeholder resolution and content assembly
+	 * all happen between the claim and the send, and ADR-0014 §6.4 introduced
+	 * `extonify_wcep_meta_placeholder_allowed` — a PLUGIN-OWNED extension point
+	 * invoked in the middle of that window. A callback on it that throws used to
+	 * propagate out through `woocommerce_order_status_changed`, breaking the
+	 * merchant's status change, while the tombstone stayed `claimed` with no detail
+	 * row and the consumed identity blocked every retry. That is the exact failure
+	 * Prompt 4a built containment to prevent; shipping a filter that reaches around
+	 * it is not something a plugin gets to do.
+	 *
+	 * SO THE RULE IS: A PLUGIN-OWNED FILTER INVOKED DURING RESOLUTION IS HOSTILE.
+	 * It can throw, and containing it is this plugin's job, not the site owner's.
+	 * The same applies to every WooCommerce formatter this resolution calls —
+	 * `wc_price()`, `get_formatted_billing_address()`, `wc_format_datetime()` — each
+	 * of which ends in filters a third party owns.
+	 *
+	 * `$settled` exists so the catch cannot double-record: a recording call that
+	 * throws half-way leaves it false and the failure is recorded, while one that
+	 * returned normally has already written the row this delivery gets.
 	 *
 	 * @param \WC_Order     $order    Order.
 	 * @param Custom_Email  $email    The live email object.
@@ -424,13 +465,138 @@ class Orchestrator {
 	private function send( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, array $claim, array $snapshot, RunOutcome $outcome ): void {
 		$delivery_id = (int) $claim['delivery_id'];
 
-		$recipients = RecipientResolver::resolve(
+		/*
+		 * Everything the catch needs, declared before anything can throw. A throw
+		 * during recipient resolution leaves `$recipients` null, which is the case
+		 * `DeliveryLogger::record_send_failure()` writes a recipient-less row for.
+		 *
+		 * ⚠ `values` HOLDS THE LIVE VALUE SET, NOT A COPY OF ITS NOTES (ADR-0014 §1c).
+		 * Notes used to be read out of it only AFTER subject, heading and both body
+		 * formats had all resolved, so a throw part way through discarded every note
+		 * taken before it: a merchant whose template carried an unknown token AND a
+		 * filter that then threw saw the exception alone, and never learnt about the
+		 * problem they could actually fix. The object accumulates as it resolves, so
+		 * holding it here means the failure row reports whatever it had reached.
+		 */
+		$state = array(
+			'recipients' => null,
+			'values'     => null,
+			'subject'    => '',
+			'notes'      => '',
+			'settled'    => false,
+		);
+
+		try {
+			$this->attempt( $order, $email, $rule, $decision, $claim, $snapshot, $outcome, $state );
+		} catch ( \Throwable $error ) {
+			if ( $state['settled'] ) {
+				// This delivery already has its row. The throw came from the
+				// recording itself, which `DeliveryLogger::verify()` has already
+				// reported as a shortfall — overwriting a recorded outcome with a
+				// second, contradictory one would be worse than the gap.
+				return;
+			}
+
+			try {
+				$outcome->record(
+					RunOutcome::FAILED,
+					$decision->rule_id(),
+					$delivery_id,
+					$this->logger->record_send_failure(
+						$delivery_id,
+						$state['recipients'],
+						(string) $state['subject'],
+						$error,
+						// PARTIAL NOTES INCLUDED (ADR-0014 §1c) — whatever resolution
+						// had recorded by the moment it threw.
+						self::notes_for( $state ),
+						$snapshot
+					)
+				);
+			} catch ( \Throwable $while_recording ) {
+				/*
+				 * ⚠ THE CATCH ITSELF MUST NOT THROW. It runs inside
+				 * `woocommerce_order_status_changed`; a throw escaping from here
+				 * would break the merchant's status change for the sake of a log
+				 * row, which inverts the whole purpose of the boundary. The
+				 * shortfall goes to the WooCommerce log, and the delivery stays
+				 * visible as one that never reached a terminal status.
+				 */
+				$this->logger->record_inert(
+					(int) $order->get_id(),
+					$decision->rule_id() . ' (delivery #' . $delivery_id . ')',
+					'recording a contained failure ALSO threw: ' . get_class( $while_recording ) . ': ' . $while_recording->getMessage()
+				);
+			}
+		}
+	}
+
+	/**
+	 * This delivery's notes: the non-placeholder ones plus whatever the LIVE value
+	 * set has accumulated so far (ADR-0014 §1a, §1c).
+	 *
+	 * READ AT THE POINT OF USE, NEVER SNAPSHOTTED. Both the success path and the
+	 * containment boundary call this, so a delivery that threw half way through
+	 * resolution reports exactly the notes it had reached — and one that completed
+	 * cannot report them twice.
+	 *
+	 * @param array $state Containment state.
+	 * @return string
+	 */
+	private static function notes_for( array $state ): string {
+		$notes  = (string) ( $state['notes'] ?? '' );
+		$values = $state['values'] ?? null;
+
+		if ( ! $values instanceof PlaceholderValues || ! $values->has_notes() ) {
+			return $notes;
+		}
+
+		return '' === $notes ? $values->notes_line() : $notes . '; ' . $values->notes_line();
+	}
+
+	/**
+	 * Resolve recipients, resolve placeholders, send, and record the outcome.
+	 *
+	 * RUNS INSIDE self::send()'s CONTAINMENT BOUNDARY and must only ever be called
+	 * from there. `$state` is this delivery's, by reference, so whatever has been
+	 * established when a throw happens is what the failure row reports.
+	 *
+	 * @param \WC_Order     $order    Order.
+	 * @param Custom_Email  $email    The live email object.
+	 * @param array         $rule     Rule row — the SAME one the matcher used.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $claim    Claim result.
+	 * @param array         $snapshot Extra snapshot payload (halt record).
+	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
+	 * @param array         $state    Containment state, by reference.
+	 * @return void
+	 */
+	private function attempt( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, array $claim, array $snapshot, RunOutcome $outcome, array &$state ): void {
+		$delivery_id = (int) $claim['delivery_id'];
+
+		/*
+		 * ONE VALUE SET FOR THE WHOLE DELIVERY (ADR-0014 §8). Subject, heading and
+		 * both body formats resolve against it, so each placeholder is resolved
+		 * ONCE however many times it appears and whatever format it appears in —
+		 * and the notes it accumulates are this delivery's, recorded once.
+		 */
+		$values = $this->placeholders->for_delivery( $order, $decision->matched_items() );
+
+		// HANDED TO THE BOUNDARY IMMEDIATELY, so every throw from here on reports
+		// the notes taken up to it (ADR-0014 §1c).
+		$state['values'] = $values;
+
+		$recipients          = RecipientResolver::resolve(
 			$this->recipients_value( $rule ),
 			array(
 				RecipientResolver::TOKEN_CUSTOMER => (string) $order->get_billing_email(),
 				RecipientResolver::TOKEN_ADMIN    => (string) get_option( 'admin_email', '' ),
+				// ADR-0014 §7: the second — and last — address a recipient
+				// placeholder may resolve to.
+				RecipientResolver::TOKEN_STORE    => PlaceholderValues::store_email(),
 			)
 		);
+		$state['recipients'] = $recipients;
 
 		if ( ! $recipients->is_valid() || ! $recipients->is_deliverable() ) {
 			// No direct recipient means nothing was sent to anybody, so this is
@@ -447,49 +613,69 @@ class Orchestrator {
 					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
 				)
 			);
+			$state['settled'] = true;
 			return;
 		}
 
-		$subject = HeaderGuard::strip( (string) ( $rule['subject'] ?? '' ) );
-		$notes   = $recipients->reason();
+		/*
+		 * PLACEHOLDERS RESOLVE HERE, AT SEND TIME, AGAINST THE LIVE ORDER
+		 * (ADR-0014 §8) — never at rule-save time, which ADR-0007 would have made
+		 * Prompt 7 undo.
+		 *
+		 * The subject and the heading resolve in the HEADER context, so every
+		 * value is `HeaderGuard`-stripped as it is substituted; the outer strip
+		 * below still catches a break the MERCHANT put in the template itself.
+		 * The body resolves twice — see PlaceholderResolver::render_body().
+		 */
+		$state['notes'] = $recipients->reason();
+
+		$subject          = HeaderGuard::strip( $values->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$state['subject'] = $subject;
+
+		$heading = HeaderGuard::strip( $values->render( (string) ( $rule['heading'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$body    = PlaceholderResolver::render_body( $values, (string) ( $rule['content'] ?? '' ) );
 
 		if ( HeaderGuard::has_break( (string) ( $rule['subject'] ?? '' ) ) ) {
-			$notes = '' === $notes ? 'stripped a line break from the subject' : $notes . '; stripped a line break from the subject';
+			$state['notes'] = '' === $state['notes']
+				? 'stripped a line break from the subject'
+				: $state['notes'] . '; stripped a line break from the subject';
 		}
 
-		try {
-			$result = $email->trigger(
-				array(
-					'recipient'     => implode( ', ', $recipients->addresses( 'to' ) ),
-					'cc'            => implode( ', ', $recipients->addresses( 'cc' ) ),
-					'bcc'           => implode( ', ', $recipients->addresses( 'bcc' ) ),
-					'subject'       => $subject,
-					'heading'       => (string) ( $rule['heading'] ?? '' ),
-					'content'       => (string) ( $rule['content'] ?? '' ),
-					'matched_items' => $decision->matched_items(),
-					'delivery_id'   => $delivery_id,
-					'object'        => $order,
-				)
-			);
-		} catch ( \Throwable $error ) {
-			/*
-			 * AN SMTP PLUGIN MUST NOT BREAK THE ORDER UPDATE. This runs inside
-			 * `woocommerce_order_status_changed`, so an uncaught throw would
-			 * propagate out through the merchant's status change — and would
-			 * leave the tombstone `claimed` forever with no detail row, while
-			 * the consumed identity blocked every retry.
-			 *
-			 * `\Throwable`, not `\Exception`: a TypeError from a badly-typed
-			 * third-party filter is exactly as fatal to the order update.
-			 */
-			$outcome->record(
-				RunOutcome::FAILED,
-				$decision->rule_id(),
-				$delivery_id,
-				$this->logger->record_send_failure( $delivery_id, $recipients, $subject, $error, $notes, $snapshot )
-			);
-			return;
-		}
+		/*
+		 * ADR-0014 §1a: an unrecognised placeholder, a refused meta key or a stripped
+		 * line break is recorded ONCE per delivery, so "why is this blank" has an
+		 * answer that does not require reading the source.
+		 *
+		 * ⚠ THE VALUE-SET NOTES ARE MERGED AT THE POINT OF USE, NOT COPIED INTO
+		 * `$state` HERE (ADR-0014 §1c). Copying them meant the state held a SNAPSHOT
+		 * taken at one instant, and every note recorded after that instant — or
+		 * before it, on a path that threw before reaching this line — was lost. It
+		 * also made the merge a thing that could happen twice. `self::notes_for()`
+		 * reads the live object, so the success path and the failure path get the
+		 * same answer by construction.
+		 */
+		$notes = self::notes_for( $state );
+
+		/*
+		 * AN SMTP PLUGIN MUST NOT BREAK THE ORDER UPDATE, AND NEITHER MAY A
+		 * PLACEHOLDER FILTER. The throw is caught by self::send()'s boundary, which
+		 * wraps this whole method rather than this one call: ADR-0014 §10 moved it
+		 * out because resolution — not just transport — now runs third-party code.
+		 */
+		$result = $email->trigger(
+			array(
+				'recipient'     => implode( ', ', $recipients->addresses( 'to' ) ),
+				'cc'            => implode( ', ', $recipients->addresses( 'cc' ) ),
+				'bcc'           => implode( ', ', $recipients->addresses( 'bcc' ) ),
+				'subject'       => $subject,
+				'heading'       => $heading,
+				'content'       => $body['html'],
+				'content_plain' => $body['plain'],
+				'matched_items' => $decision->matched_items(),
+				'delivery_id'   => $delivery_id,
+				'object'        => $order,
+			)
+		);
 
 		/*
 		 * THE PER-DELIVERY FILTER IS NOT A TRANSPORT FAILURE (ADR-0012 §5a).
@@ -512,6 +698,7 @@ class Orchestrator {
 					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
 				)
 			);
+			$state['settled'] = true;
 			return;
 		}
 
@@ -534,6 +721,7 @@ class Orchestrator {
 					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
 				)
 			);
+			$state['settled'] = true;
 			return;
 		}
 
@@ -545,6 +733,13 @@ class Orchestrator {
 			$delivery_id,
 			$this->logger->record_send( $delivery_id, $recipients, $subject, $sent, $notes, $snapshot )
 		);
+
+		// ⚠ AFTER THE RECORD, NOT AFTER THE SEND. A throw from the recording itself
+		// must not make the boundary write a SECOND, contradictory row saying a
+		// delivered message failed — but a throw before the record still has to
+		// produce one, or the tombstone is left `claimed` with nothing to explain
+		// it. Between those two is where this flag goes.
+		$state['settled'] = true;
 	}
 
 	/**

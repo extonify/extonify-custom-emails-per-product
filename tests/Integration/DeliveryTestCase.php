@@ -154,6 +154,15 @@ abstract class DeliveryTestCase extends MatchingTestCase {
 		if ( null !== $email ) {
 			$email->init_settings();
 			$email->enabled = $email->get_option( 'enabled', 'yes' );
+
+			/*
+			 * ⚠ `email_type` IS A PROPERTY, NOT A LOOKUP. `WC_Email::__construct()`
+			 * copies it out of the settings ONCE, and `get_email_type()` reads the
+			 * property — so `init_settings()` alone leaves the live object on the
+			 * format it booted with, and a test that switched the setting silently
+			 * kept rendering the old format.
+			 */
+			$email->email_type = $email->get_option( 'email_type', 'html' );
 		}
 	}
 

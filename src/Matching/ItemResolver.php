@@ -164,6 +164,26 @@ class ItemResolver {
 	}
 
 	/**
+	 * One product or variation, THROUGH THIS REQUEST'S CACHE (ADR-0014 §8).
+	 *
+	 * EXISTS SO PLACEHOLDER RESOLUTION COSTS NO QUERIES. The matcher has already
+	 * loaded every product on the order by the time a delivery renders, so a
+	 * placeholder asking for a matched product's SKU or permalink is answered
+	 * from memory. Calling `wc_get_product()` again instead would add one query
+	 * per placeholder — which is precisely what ADR-0014's cost gate forbids.
+	 *
+	 * Same contract as the internal reader: a product whose CRUD read did not
+	 * complete answers null rather than a plausible-looking empty object
+	 * (ADR-0011 §4).
+	 *
+	 * @param int $product_id Product or variation id.
+	 * @return \WC_Product|null
+	 */
+	public function product_for( int $product_id ): ?\WC_Product {
+		return $product_id > 0 ? $this->product( $product_id ) : null;
+	}
+
+	/**
 	 * Drop every cached product and fact.
 	 *
 	 * The escape hatch for the one case the caches do not cover: a product

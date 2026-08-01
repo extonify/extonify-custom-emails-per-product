@@ -8,6 +8,10 @@
 namespace Extonify\WCEP\Render;
 
 use Extonify\WCEP\Delivery\InsertPhase;
+use Extonify\WCEP\Delivery\PlaceholderResolver;
+use Extonify\WCEP\Delivery\PlaceholderValues;
+use Extonify\WCEP\Domain\PlaceholderSyntax;
+use Extonify\WCEP\Domain\Text;
 
 defined( 'ABSPATH' ) || exit;
 
@@ -90,14 +94,27 @@ class Injector {
 	private $ledger;
 
 	/**
+	 * Placeholder resolution (ADR-0014). PER REQUEST and stateless: it hands out
+	 * one value set per render — and, at the per-item position, one per LINE ITEM
+	 * (§5a) — over the insert phase's own product cache. That cache is the one this
+	 * render's evaluation at frame push already filled, which is what keeps product
+	 * placeholders at zero queries under the ADR-0014 §8 cost contract.
+	 *
+	 * @var PlaceholderResolver
+	 */
+	private $placeholders;
+
+	/**
 	 * Constructor.
 	 *
-	 * @param RenderContext $context Frame stack.
-	 * @param RenderLedger  $ledger  Slot ledger.
+	 * @param RenderContext            $context      Frame stack.
+	 * @param RenderLedger             $ledger       Slot ledger.
+	 * @param PlaceholderResolver|null $placeholders Placeholder resolution.
 	 */
-	public function __construct( RenderContext $context, RenderLedger $ledger ) {
-		$this->context = $context;
-		$this->ledger  = $ledger;
+	public function __construct( RenderContext $context, RenderLedger $ledger, ?PlaceholderResolver $placeholders = null ) {
+		$this->context      = $context;
+		$this->ledger       = $ledger;
+		$this->placeholders = null !== $placeholders ? $placeholders : new PlaceholderResolver();
 	}
 
 	/**
@@ -225,23 +242,52 @@ class Injector {
 				continue;
 			}
 
-			$this->emit( $render, $entry, self::SHARED_POSITION, (bool) $plain_text );
+			// ⚠ AND THE CONTENT RESOLVES AGAINST **THIS** ITEM (ADR-0014 §5a). This
+			// position exists to put content beside each matched item; item-scoped
+			// placeholders resolving against the first matched item printed item A's
+			// gift note beside item B.
+			$this->emit( $render, $entry, self::SHARED_POSITION, (bool) $plain_text, $item_id );
 		}
 	}
 
 	/**
-	 * Render one rule's content and register it against the slot.
+	 * THE PER-RULE CONTAINMENT BOUNDARY (ADR-0014 §10).
 	 *
-	 * Registration is a SET keyed by rule id (ADR-0013 §1), so a rule reaching
-	 * this twice within one render still records once.
+	 * ⚠ THIS FILE USED TO CONTAIN NO `try` AT ALL, AND IT RUNS INSIDE WOOCOMMERCE'S
+	 * OWN RENDERING HOOKS. A `Throwable` from placeholder resolution — from
+	 * `extonify_wcep_meta_placeholder_allowed`, which ADR-0014 §6.4 introduced, or
+	 * from any WooCommerce formatter's filters — propagated straight out of
+	 * `woocommerce_email_after_order_table` and ABORTED THE MERCHANT'S OWN
+	 * processing, completed or admin email. This plugin breaking WooCommerce's mail
+	 * is a strictly worse outcome than this plugin's own content going missing.
+	 *
+	 * SO CONTAINMENT IS PER RULE, AND EVERY PART OF THAT MATTERS:
+	 *
+	 *   - the throwing rule emits NOTHING — the render happens into a variable and
+	 *     is echoed only once it has succeeded, so a half-substituted body can
+	 *     never reach the customer;
+	 *   - the NATIVE EMAIL CONTINUES, because the throw stops here;
+	 *   - every OTHER matched rule still emits, because the loop that calls this is
+	 *     outside the boundary;
+	 *   - and the failure is RECORDED against that rule as `not_rendered` — which is
+	 *     the rule's RENDER outcome and a SEPARATE FACT from what happened to the
+	 *     message (ADR-0014 §10c). It never replaces the message outcome: a message
+	 *     that was `abandoned` stays `abandoned` even though this rule's content
+	 *     never got into it, because collapsing the two made an abandoned render
+	 *     count as a genuine delivery attempt.
+	 *
+	 * Registration is a SET keyed by rule id (ADR-0013 §1), so a rule reaching this
+	 * twice within one render still records once.
 	 *
 	 * @param array  $render     Current render record.
 	 * @param array  $entry      Matched `{rule, rule_id, matched_items}` entry.
 	 * @param string $position   Position emitting.
 	 * @param bool   $plain_text Whether the plain-text template is rendering.
+	 * @param int    $item_id    Line item being rendered at the per-item position,
+	 *                           or 0 everywhere else (ADR-0014 §5a).
 	 * @return void
 	 */
-	private function emit( array $render, array $entry, string $position, bool $plain_text ): void {
+	private function emit( array $render, array $entry, string $position, bool $plain_text, int $item_id = 0 ): void {
 		$rule    = $entry['rule'];
 		$content = (string) ( $rule['content'] ?? '' );
 
@@ -249,61 +295,217 @@ class Injector {
 			return;
 		}
 
-		$this->ledger->register(
-			$render['token'],
-			(int) $entry['rule_id'],
-			(int) ( $rule['revision'] ?? 0 ),
-			$position
-		);
+		/*
+		 * DECLARED BEFORE ANYTHING CAN THROW, so the catch reports what THIS emission
+		 * had actually established when it failed rather than assuming (ADR-0014 §10a):
+		 *
+		 *   - `$values` is the LIVE value set. It used to be a local inside
+		 *     `render_and_emit()` and the catch passed `null`, so an unknown token or a
+		 *     refused meta key noticed BEFORE the throw vanished from the record and
+		 *     the merchant got the exception with no sight of the earlier problem
+		 *     (ADR-0014 §1c). It is a by-reference local rather than a property
+		 *     because this object is request-shared and renders nest (ADR-0012 §11);
+		 *   - `$emitted` is set true only once the echo has RETURNED, so it states
+		 *     whether output reached the message rather than whether a render was
+		 *     attempted (ADR-0014 §10b).
+		 */
+		$values  = null;
+		$emitted = false;
 
-		// Content is stored through `wp_kses_post` at the repository boundary
-		// (ADR-0012 §6) and is rendered LITERALLY — placeholders do not exist
-		// yet, so `{customer_name}` is delivered as those characters.
+		try {
+			$this->render_and_emit( $render, $entry, $position, $plain_text, $item_id, $content, $values, $emitted );
+		} catch ( \Throwable $error ) {
+			/*
+			 * `\Throwable`, not `\Exception`: a TypeError from a badly-typed
+			 * third-party filter aborts WooCommerce's email exactly as thoroughly.
+			 */
+			$this->register(
+				$render,
+				$entry,
+				$position,
+				$values,
+				// PER EMISSION, NOT PER RULE, and the wording says so. At the
+				// per-item position one rule emits several times, so "nothing was
+				// inserted" would be false for a rule that threw on one line item
+				// and rendered on the next. Whether the RULE inserted anything is
+				// what `$emitted` decides, one layer down.
+				'rendering threw and that block was withheld: ' . get_class( $error ) . ': ' . $error->getMessage(),
+				// ⚠ THIS EMISSION'S OWN FACT, NEVER A BLANKET `false` (ADR-0014 §10b).
+				// A throw AFTER the echo returned — an output-buffer callback, say —
+				// really did put this block in front of the customer, and recording it
+				// as withheld would be as untrue as the inverse. The ledger's OR then
+				// accumulates across emissions and cannot erase a genuine one.
+				$emitted
+			);
+		}
+	}
+
+	/**
+	 * Render one rule's content, register it, and echo it.
+	 *
+	 * RUNS INSIDE self::emit()'s CONTAINMENT BOUNDARY and must only be called from
+	 * there.
+	 *
+	 * ⚠ THE ORDER IS: BUILD THE FINAL STRING, THEN REGISTER, THEN ECHO — AND THE
+	 * FIRST TWO USED TO BE THE OTHER WAY ROUND (ADR-0014 §10b). This docblock
+	 * claimed "the echo is last, deliberately: everything that can throw has
+	 * finished by then", and that claim was FALSE, because the escaping call was
+	 * still to come:
+	 *
+	 *     $this->register( … );                       // ledger: emitted = true
+	 *     echo wp_kses_post( wpautop( $html ) );       // ⚠ CAN THROW
+	 *
+	 * `wp_kses_post()` fires `wp_kses_allowed_html`, and `wpautop()` runs inside
+	 * whatever a third party has wrapped around it. A throw there left the ledger
+	 * holding `emitted = true`; the catch registered `false`; `register()` ORed the
+	 * two and the result stayed `true`. Nothing was printed and the history said
+	 * content was inserted — which then travels all the way to a merchant reading
+	 * `sent` for a block their customer never saw.
+	 *
+	 * So EVERY transformation that can throw now completes into a variable BEFORE
+	 * the registration, and the echo is genuinely the last statement that runs. The
+	 * same ordering applies to the plain-text branch, which has no escaping step
+	 * today but must not acquire one silently.
+	 *
+	 * @param array                  $render     Current render record.
+	 * @param array                  $entry      Matched entry.
+	 * @param string                 $position   Position emitting.
+	 * @param bool                   $plain_text Whether the plain-text template is
+	 *                                           rendering.
+	 * @param int                    $item_id    Current line item at the per-item
+	 *                                           position, else 0.
+	 * @param string                 $content    Stored rule content.
+	 * @param PlaceholderValues|null $values     THIS emission's value set, by
+	 *                                           reference, so a throw still reports
+	 *                                           the notes taken before it
+	 *                                           (ADR-0014 §1c).
+	 * @param bool                   $emitted    Set true only once the echo has
+	 *                                           returned (ADR-0014 §10b).
+	 * @return void
+	 */
+	private function render_and_emit( array $render, array $entry, string $position, bool $plain_text, int $item_id, string $content, ?PlaceholderValues &$values = null, bool &$emitted = false ): void {
+		/*
+		 * PLACEHOLDERS RESOLVE HERE, PER RENDER, AGAINST THE ORDER RECORDED AT
+		 * PUSH (ADR-0014 §8, §9). ⚠ NOT against `$email->object`: WooCommerce does
+		 * not restore that property after a nested render, so it can name an
+		 * entirely different order by now (ADR-0013 §5, flagged). The frame's order
+		 * is the only trustworthy source, and it is the same one this render's slot
+		 * will be recorded against.
+		 *
+		 * ⚠ AND AT THE PER-ITEM POSITION IT IS BOUND TO THE ITEM BEING RENDERED
+		 * (ADR-0014 §5a). `$item_id` is 0 everywhere else, which is the
+		 * first-matched-item rule §5 has always stated. A fresh value set per item
+		 * is required rather than tidy: the set memoises by `name:parameter`, so
+		 * reusing one across two line items would answer item B with item A's
+		 * memoised value — the very defect this fixes.
+		 */
+		$order  = isset( $render['order'] ) && $render['order'] instanceof \WC_Order ? $render['order'] : null;
+		$values = null === $order
+			? null
+			: $this->placeholders->for_delivery( $order, (array) ( $entry['matched_items'] ?? array() ), $item_id );
+
 		if ( $plain_text ) {
 			/*
-			 * NOT `esc_html()`, AND THAT IS THE FIX RATHER THAN AN OVERSIGHT
-			 * (ADR-0013 §4b). self::to_plain_text() has already removed every tag,
-			 * so there is no markup left for HTML escaping to protect; and this
-			 * string is going into a `text/plain` message body that is never
-			 * parsed as HTML, so escaping only corrupts it. A merchant writing
-			 * `Care for A & B` was sending `Care for A &amp; B` to the customer.
-			 * The HTML branch below keeps its escaping, unchanged.
+			 * FLATTEN FIRST, THEN SUBSTITUTE (ADR-0014 §9). The other order runs
+			 * `wp_strip_all_tags()` over the VALUES, so a customer named
+			 * `<script>x</script>` loses their name entirely and every `&` in a
+			 * value is mangled by the entity handling.
+			 *
+			 * NOT `esc_html()` EITHER, and that is ADR-0013 §4b rather than an
+			 * oversight: every tag is already gone, and this string is going into a
+			 * `text/plain` body that is never parsed as HTML, so escaping could only
+			 * corrupt it.
 			 */
-			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- plain-text email body: to_plain_text() strips all markup and decodes entities, and HTML-context escaping would corrupt a message that is never parsed as HTML. See the comment above.
-			echo "\n" . self::to_plain_text( $content ) . "\n";
+			$text = Text::to_plain_text( $content );
+			$text = null === $values ? $text : $values->render( $text, PlaceholderSyntax::CONTEXT_PLAIN );
+
+			// ASSEMBLED FIRST, for the ordering reason above. There is no escaping
+			// step in a plain body, so nothing here throws today — the shape is what
+			// stops a future one being added ahead of the registration by accident.
+			$output = "\n" . $text . "\n";
+
+			$this->register( $render, $entry, $position, $values );
+
+			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- plain-text email body: to_plain_text() strips all markup and decodes entities, placeholder values are substituted as text, and HTML-context escaping would corrupt a message that is never parsed as HTML. See the comment above.
+			echo $output;
+			$emitted = true;
 			return;
 		}
 
-		echo wp_kses_post( wpautop( $content ) );
+		/*
+		 * Values are HTML-escaped AS THEY ARE SUBSTITUTED (ADR-0014 §3), so
+		 * `wp_kses_post()` below sees `&lt;script&gt;` and has nothing to strip —
+		 * the template is the merchant's and was kses-filtered at storage, and the
+		 * values can never contribute markup.
+		 */
+		$html = null === $values ? $content : $values->render( $content, PlaceholderSyntax::CONTEXT_HTML );
+
+		// ⚠ THE SANITISATION RUNS **BEFORE** THE REGISTRATION, AND THAT IS THE WHOLE
+		// FIX. `wp_kses_post()` fires `wp_kses_allowed_html`; a callback there that
+		// throws must leave a ledger saying nothing was emitted, which it cannot do
+		// once `register()` has already said otherwise (ADR-0014 §10b).
+		$output = wp_kses_post( wpautop( $html ) );
+
+		$this->register( $render, $entry, $position, $values );
+
+		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $output is the return of wp_kses_post() two statements above; escaping is deliberately hoisted ahead of the registration so a throwing wp_kses_allowed_html callback cannot leave the ledger claiming content was emitted.
+		echo $output;
+		$emitted = true;
+	}
+
+	/**
+	 * Record this rule against the render's slot, with anything placeholder
+	 * resolution had to say (ADR-0014 §1a).
+	 *
+	 * A SET KEYED BY RULE ID (ADR-0013 §1), so a rule emitting beside two matched
+	 * line items records once — and records its notes once with it.
+	 *
+	 * ⚠ A FAILURE NOTE AND THE PARTIAL NOTES ARE BOTH KEPT (ADR-0014 §1c). This
+	 * used to be `'' !== $failure ? $failure : $values->notes_line()` — an
+	 * either/or — so a throw DISCARDED everything resolution had already recorded.
+	 * A merchant whose template carried an unknown token AND a filter that then
+	 * threw saw only the exception, and the earlier problem — the one they could
+	 * actually fix — was never written down.
+	 *
+	 * @param array                  $render   Current render record.
+	 * @param array                  $entry    Matched entry.
+	 * @param string                 $position Position emitting.
+	 * @param PlaceholderValues|null $values   This render's value set, if any.
+	 * @param string                 $failure  Failure note when nothing was emitted.
+	 * @param bool                   $emitted  Whether content actually reached the
+	 *                                         message (ADR-0014 §10).
+	 * @return void
+	 */
+	private function register( array $render, array $entry, string $position, ?PlaceholderValues $values, string $failure = '', bool $emitted = true ): void {
+		$notes = null === $values ? '' : $values->notes_line();
+
+		if ( '' !== $failure ) {
+			$notes = '' === $notes ? $failure : $failure . '; ' . $notes;
+		}
+
+		$this->ledger->register(
+			$render['token'],
+			(int) $entry['rule_id'],
+			(int) ( $entry['rule']['revision'] ?? 0 ),
+			$position,
+			$notes,
+			$emitted
+		);
 	}
 
 	/**
 	 * Flatten stored HTML to plain text, ready to be emitted verbatim.
 	 *
-	 * FOUR STEPS, IN THIS ORDER, AND THE ORDER MATTERS:
-	 *
-	 *   1. block-ish tags become newlines, so the shape of the block survives;
-	 *   2. every remaining tag is removed;
-	 *   3. entities are DECODED — `&amp;` back to `&`, `&#8212;` back to an
-	 *      em dash. This is the step that used to be missing while the caller
-	 *      additionally ran `esc_html()`, which encoded them a second time;
-	 *   4. line endings are normalised to `\n`.
-	 *
-	 * Decoding AFTER stripping is deliberate: decoding first could reveal
-	 * character sequences that step 2 would then eat, so `<3` written by a
-	 * merchant as `&lt;3` would silently vanish.
+	 * MOVED TO `Domain\Text` IN PROMPT 6 AND KEPT HERE AS THE NAME CALLERS KNOW.
+	 * Separate mode needed the identical flattening — it had been missing the
+	 * entity-decode step entirely (ADR-0014 §9a) — and two copies of a rule about
+	 * what WooCommerce deletes from plain bodies is one copy too many.
 	 *
 	 * @param string $content Stored content.
 	 * @return string
 	 */
 	public static function to_plain_text( string $content ): string {
-		$text = preg_replace( '/<\s*br\s*\/?\s*>/i', "\n", $content );
-		$text = preg_replace( '/<\s*\/\s*(p|div|li|h[1-6])\s*>/i', "\n", (string) $text );
-		$text = wp_strip_all_tags( (string) $text );
-		$text = html_entity_decode( $text, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-		$text = preg_replace( '/\r\n|\r/', "\n", $text );
-
-		return trim( (string) $text );
+		return Text::to_plain_text( $content );
 	}
 
 	/**
