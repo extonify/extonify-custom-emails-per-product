@@ -175,6 +175,65 @@ final class RenderLedgerNotesTest extends UnitTestCase {
 	}
 
 	/**
+	 * ⚠ A PROVISIONAL REGISTRATION STAYS `false` UNTIL IT IS PROMOTED (Prompt 7 C1).
+	 *
+	 * `Injector` registers with `emitted = false` before the echo and calls
+	 * `mark_emitted()` after it returns, so a throw from inside `echo` — an
+	 * output-buffer handler installed with a chunk size runs there — leaves the
+	 * ledger saying nothing was emitted. Registering `true` up front made that
+	 * window one statement wide instead of three, but it was the same window.
+	 *
+	 * @return void
+	 */
+	public function test_a_provisional_registration_is_not_emitted_until_promoted() {
+		$ledger = $this->ledger();
+
+		$ledger->register( 'tok-1', 7, 1, 'after_order_table', '', false );
+
+		$this->assertFalse( $this->entry( $ledger )['emitted'], 'a provisional registration claimed the output' );
+
+		$this->assertTrue( $ledger->mark_emitted( 'tok-1', 7 ), 'the promotion did not report success' );
+		$this->assertTrue( $this->entry( $ledger )['emitted'], 'the promotion did not take' );
+	}
+
+	/**
+	 * `mark_emitted()` reports FALSE rather than inventing a registration —
+	 * a preview has no slot, and an unregistered rule has no row to promote.
+	 *
+	 * @return void
+	 */
+	public function test_promoting_something_unregistered_reports_false() {
+		$ledger = $this->ledger();
+
+		$this->assertFalse( $ledger->mark_emitted( 'no-such-token', 7 ), 'a preview token was promoted' );
+
+		$ledger->register( 'tok-1', 7, 1, 'after_order_table', '', false );
+
+		$this->assertFalse( $ledger->mark_emitted( 'tok-1', 999 ), 'an unregistered rule was promoted' );
+		$this->assertFalse( $this->entry( $ledger )['emitted'], 'promoting rule 999 touched rule 7' );
+	}
+
+	/**
+	 * A promotion is TOKEN-exact: one render's echo cannot promote another's.
+	 *
+	 * @return void
+	 */
+	public function test_promotion_is_token_exact() {
+		$ledger = $this->ledger( 'tok-outer' );
+		$ledger->open( 'tok-inner', new \stdClass(), 56, 'customer_processing_order' );
+
+		$ledger->register( 'tok-outer', 7, 1, 'after_order_table', '', false );
+		$ledger->register( 'tok-inner', 7, 1, 'after_order_table', '', false );
+
+		$ledger->mark_emitted( 'tok-inner', 7 );
+
+		$slots = $ledger->slots();
+
+		$this->assertFalse( $slots[0]['rules'][7]['emitted'], 'the inner promotion reached the outer slot' );
+		$this->assertTrue( $slots[1]['rules'][7]['emitted'] );
+	}
+
+	/**
 	 * `emitted` ACCUMULATES WITH OR ACROSS EMISSIONS (ADR-0014 §10b): a rule that
 	 * emitted beside one line item and threw on the next DID reach the customer.
 	 *

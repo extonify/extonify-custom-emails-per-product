@@ -154,7 +154,10 @@ class Eraser {
 		// Report the retention truthfully, on the final call.
 		if ( $result['done'] && $has_tombstones ) {
 			$result['items_retained'] = true;
-			$result['messages'][]     = __( 'A minimal delivery record has been retained for each affected order. It contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries.', 'extonify-custom-emails-per-product' );
+			// ADR-0015 §2a: the second sentence covers a delivery that is still
+			// PENDING, whose tombstone temporarily carries the store's unrendered
+			// templates and recipient definitions.
+			$result['messages'][] = __( 'A minimal delivery record has been retained for each affected order. It contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries. Where a delayed email is still waiting to be sent, that record also temporarily holds the store\'s own unsent template text and recipient settings; this is released as soon as the email is sent or cancelled.', 'extonify-custom-emails-per-product' );
 		}
 
 		return $result;

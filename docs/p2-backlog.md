@@ -99,8 +99,14 @@ foundation) is built against them rather than rediscovering them.
   serialisation** into the scheduled args, **cross-request execution**, **order
   reloading** at execution, and **cancellation** on rule disable/delete
   ([ADR-0007](adr/ADR-0007.md), [ADR-0008](adr/ADR-0008.md)).
-- **Delayed-delivery snapshot execution** end-to-end ([ADR-0007](adr/ADR-0007.md))
-  — scheduling, snapshot storage, execution-time validation, re-arm avoidance.
+- ~~**Delayed-delivery snapshot execution** end-to-end~~ **DONE — Prompt 7**
+  ([ADR-0015](adr/ADR-0015.md)). Scheduling, snapshot storage on the durable
+  tombstone, the six execution-time checks, both cancellation directions, and
+  re-arm avoidance are implemented and asserted. The Action Scheduler bullet above
+  is discharged for the DELAYED hook specifically: uniqueness is proven NOT to come
+  from `$unique` (which ignores the argument set) but from the ADR-0004 claim;
+  cross-request execution is driven through the real queue; cancellation on rule
+  disable/delete is eager, with execution-time re-validation as the backstop.
 - **Orphan/unresolved slot policy.** A render that never sends (e.g. a customizer
   calling `get_content()`) legitimately orphans its slot; the POC reports these
   `unresolved` at shutdown. Production should decide whether to log/meter them and
@@ -602,10 +608,13 @@ ADR-0011 §5 violation filed as deferred work; it still holds.
   `Custom_Email::get_subject()` still deliberately does not call
   `format_string()` — that is WooCommerce's own, differently-spelled substitution
   pass, whose values this plugin does not control.
-- **`delay_seconds` and ADR-0007 snapshots (Prompt 6).** `delay_seconds` is stored
-  and revision-bearing but nothing reads it yet; every delivery in this prompt is
-  immediate. The `scheduled` final status exists in `FINAL_STATUSES` and is
-  currently unused.
+- ~~**`delay_seconds` and ADR-0007 snapshots.**~~ **DONE — Prompt 7**, see
+  [ADR-0015](adr/ADR-0015.md). A delayed rule now claims at scheduling time,
+  snapshots onto the DURABLE tombstone, queues an Action Scheduler job, and
+  re-validates against the live rule and order before sending. `scheduled` is no
+  longer an unused status. `delay_seconds` has left
+  `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` and become a phase discriminator, leaving
+  `consolidation` as the only entry.
 - **`consolidation` beyond `none`.** One email per rule per trigger. The engine
   returns both `matched_item_ids` and `matched_product_ids` so a later prompt can
   choose per-order or per-item without the engine having pre-judged it.
@@ -1317,3 +1326,229 @@ to do.
   handler and inside a rendering hook, but it means a genuinely broken site can
   fail every delivery quietly except for the `wc_get_logger()` error and the
   `failed` tombstones. A future admin surface should count them.
+
+## Prompt 7A — THE SCHEDULED STATE MACHINE
+
+Six reported findings were **one defect**: the `scheduled` state had no atomic
+transitions and no guaranteed terminal exit. All six are fixed together by
+[ADR-0015](adr/ADR-0015.md) §8, not by six patches. Everything below is what was
+found alongside and deliberately **not** fixed, plus the contracts this leaves on
+later prompts.
+
+### Contract-consistency gate
+
+- **⚠ The prompt's own transition table was incomplete, and adapting silently
+  would have weakened an ADR.** It named five edges; `executing → cancelled` and
+  `executing → skipped` are also required, and ADR-0015 §8.1 records why. ADR-0015
+  §4 mandates `cancelled` with a distinct reason for all six re-validation checks,
+  and those checks run **after** the lease is taken — without that edge they would
+  have had to record `failed`, which is untrue (nothing failed; the merchant
+  disabled the rule). ADR-0012 §2's claiming skips are likewise discovered inside
+  the send, under the lease. The alternative — taking the lease *after* the §4
+  checks — would have widened the duplicate-email window the lease exists to close.
+- **⚠ "The existing daily maintenance action" did not exist.** ADR-0015 §8.3's
+  stale-lease sweep needs a recurring action.
+  `Deactivator::RECURRING_HOOKS` has named `extonify_wcep_retention_purge` since
+  the foundation, but **nothing ever scheduled it and nothing ever handled it** —
+  it was a reserved name and a backlog item. A new `Install\Maintenance`
+  (`extonify_wcep_maintenance`) was created rather than borrowing a hook whose name
+  promises retention work the sweep does not do. **Retention joins that action when
+  the settings UI lands**; the hook name is deliberately generic so that addition
+  is not a rename.
+- **`DeliveryLogger::record_scheduled_cancellation()` and
+  `ScheduledDelivery::cancel()` now take a REQUIRED `$from`.** No default, on
+  purpose: the two possible answers (`scheduled` for the eager and lifecycle
+  paths, `executing` for anything discovered under the lease) are not
+  interchangeable, and a default is a decision somebody can skip making.
+
+### Required for the prompts that follow
+
+- **⚠ A MANUAL RESEND FEATURE MUST NOT TREAT `unresolved` AS "RETRY THIS".** ADR-0015
+  §8.3 records a swept lease as `unresolved` precisely because nobody knows whether
+  the message went out — the worker may have died one microsecond after the mailer
+  accepted it. A resend UI that offers `unresolved` deliveries a one-click retry
+  turns every stranded lease into a duplicate customer email, which is the failure
+  the whole state machine was built to end. Surface it, describe it honestly, and
+  make the human choose.
+- **The settings UI should expose the lease window.** `LEASE_WINDOW_SECONDS` is
+  one hour, argued from Action Scheduler's own 300 s `mark_failures()` period and
+  PHPMailer's 300 s SMTP timeout (ADR-0015 §8.3). A store on a host with a much
+  longer `max_execution_time`, or one using a queue backend with different timings,
+  may want it longer. It must never be shortened below Action Scheduler's own
+  failure period.
+- **The maintenance sweep has no admin surface.** `leases_recovered`,
+  `orphans_requeued` and `orphans_cancelled` go to the WooCommerce log only. Each
+  is a delivery that went wrong in a way nothing else can see, so the delivery
+  history phase should count them.
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ Tier 3 — a transient re-schedule that ALSO cannot reach Action Scheduler is
+  recovered only by the next daily sweep.** ADR-0015 §8.4's rule-3 branch fires when
+  `Migrator::is_operational()` is false, which by hypothesis means this plugin's
+  tables are unavailable — so a terminal state cannot be written, and if the
+  re-schedule *also* fails the tombstone stays `scheduled` with no job. It is logged
+  loudly, and §8.3's orphan half recovers it once the schema returns, so the delivery
+  is **late rather than lost**. Fixing it further would require writing to a table
+  that does not exist. Requires two simultaneous infrastructure failures.
+- **⚠ Tier 3 — `unschedule()` costs `MAX_RESCHEDULES + 1` queue lookups.** Args-exact
+  matching means a delivery re-scheduled past a transient condition owns a job whose
+  arguments differ, so cancelling one delivery must sweep the bounded attempt range
+  (4 lookups today). Every caller is a lifecycle or admin path — eager cancellation,
+  deactivation, uninstall, order deletion — and order deletion additionally skips
+  terminal tombstones, so the normal cost is zero. Not on any delivery path.
+- **⚠ Tier 2 — the `lease_sweep` index leads on `final_status`, whose cardinality is
+  low.** That is the intended shape: it narrows to deliveries **in flight**, whose
+  count is queue depth rather than the lifetime of the store (ADR-0015 §2). On a
+  store with a very large simultaneous backlog the residual scan grows with queue
+  depth; the batch cap bounds the work per pass regardless.
+- **⚠ Tier 2 — deactivation and uninstall cancel in BULK, permanently.** ADR-0015
+  §1a's identity-consumption rule means deactivating the plugin permanently cancels
+  every in-flight delayed delivery and reactivating does not resume them (§8.7).
+  This is correct and is the alternative to a plugin toggled off and on
+  re-delivering to every order still inside its delay window — but it is the
+  behaviour most likely to be reported as a bug, and **the deactivation confirmation
+  UI should say so** when there is one.
+- **⚠ Tier 2 — `uninstall.php` finalises tombstones in raw SQL.** The file is
+  dependency-free by design (no autoloader, no WooCommerce), which is the documented
+  exception to "SQL only in a repository". It therefore writes `cancelled` without
+  going through `DeliveryRepository::transition()`, so the permitted-transition
+  allowlist does not police it. The statement is guarded `WHERE final_status =
+  'scheduled'`, which is the same predicate the transition would apply, and a
+  delivery mid-flight or already terminal is left alone. A test asserts the
+  outcome; nothing asserts the two stay in step if the allowlist changes.
+- **⚠ Tier 2 — a `scheduled` tombstone whose order was TRASHED still holds its
+  snapshot until the job runs.** ADR-0015 §4 check 4 cancels it correctly at
+  execution, releasing the snapshot then — but a merchant who trashes an order with
+  a week-long delay leaves a week of retained rule content. Bounded by queue depth,
+  so not unbounded growth; eager cancellation on order trash would close it.
+- **⚠ Tier 3 — a third party can still throw between the lease and the send.**
+  The lease is taken first (ADR-0015 §8.2), so a worker that dies during §4's
+  re-validation strands the delivery until the sweep records `unresolved` — a
+  window that a lease-last design would not have. That trade is deliberate and
+  argued in §8.2: lease-last would leave the duplicate-email window open, and a
+  duplicate reaches a customer where an hour's delay in the log does not.
+- **⚠ Tier 3 — `RunOutcome::to_array()` now reports `scheduled`, `claim_failed` and
+  `deferred`.** Any consumer that compared the flat array by equality sees new
+  keys. Nothing outside the tests consumes it today.
+
+## Prompt 7B — SCHEDULED LIFECYCLE COMPLETENESS (the last delayed-delivery correction round)
+
+Three defects, fixed as three: a boolean that merged **"another actor won"** with
+**"the write failed"** ([ADR-0015](adr/ADR-0015.md) §8.1a), an orphan sweep that
+could not page past its first hundred rows (§8.3a), and `executing` having no
+lifecycle handling at all (§8.8). Everything below is what was found alongside and
+deliberately **not** fixed, plus what this leaves for later.
+
+### Contract-consistency gate
+
+- **The three Tier 2 items from the prompt were fixed in this round, not deferred.**
+  Detail rows are now written only after ownership is won (`record_scheduled_cancellation()`,
+  `record_expired_lease()`, `record_scheduled_failure()`, `record_schedule_throw()`,
+  and the new `record_arm_failure()`); the two-connection tests are described as
+  **competing writes** rather than interleaved races, and a genuinely interleaved
+  one was added (`test_a_lease_blocked_by_a_real_lock_wait_is_not_a_lost_race()`,
+  which blocks on an uncommitted row lock and proves the blocked writer reports
+  `query_failed`, not a lost race); the packaged `src/` file count is reported from
+  the tree rather than from memory.
+- **`DeliveryRepository::transition()` and `arm_scheduled()` no longer return
+  `bool`.** They return `Domain\WriteResult`. Any future call site that reads one as
+  a boolean is a **failing unit test** (`WriteResultTest::test_no_source_file_reads_a_guarded_write_as_a_boolean`),
+  not a defect somebody has to notice — the same shape as the collection census.
+- **The gate on removing a queued job is `finalized`, never `success`.** `success`
+  additionally requires the detail row to have been written, and a delivery that is
+  genuinely terminal with a missing log row must still not keep a live job.
+- **`find_scheduled_after()` became `find_pending_after()`** and selects both
+  `scheduled` and `executing`. The old name described the defect: `executing` was
+  invisible to every lifecycle path.
+
+### Required for the prompts that follow
+
+- **⚠ THE SETTINGS/UNINSTALL UI MUST SAY WHAT A SHUTDOWN DOES TO WORK IN FLIGHT.**
+  ADR-0015 §8.8: deactivating cancels every `scheduled` delivery permanently and
+  records every `executing` one as `unresolved`. The second is the one worth
+  wording carefully — it means *we do not know whether that customer got the email*,
+  and §8.7's identity rule means reactivating resumes nothing.
+- **The maintenance sweep's cycle has no admin surface.**
+  `extonify_wcep_sweep_cycle` is an implementation detail of §8.3b, but on a store
+  deep enough to need it, "the sweep is currently 400 rows into a 3,000-row cycle"
+  is exactly what a support person would want to see. `sweep()` already returns
+  `examined`, `cursor`, `high_water` and `cycle_complete` — which is the whole
+  progress bar.
+- **A store whose pending queue exceeds `SWEEP_THROUGHPUT` (1,000 rows per half per
+  run) takes more than one day to examine all of it.** That is the stated bound —
+  `ceil(E / T)` runs per cycle (§8.3b) — and the cycle mark is what makes it a bound
+  at all rather than a hope. But the daily interval is what turns a 10,000-row queue
+  into a ten-day cycle. If real stores get there, raise the page cap or run the sweep
+  more often; do not remove the cap, and do not remove the mark.
+
+### Findings recorded, deliberately not fixed
+
+- **⚠ Tier 2 — `uninstall.php` records no per-delivery REASON.** It writes the
+  terminal status and releases the snapshot in raw SQL, but a detail row is
+  allocated inside a transaction holding the parent lock
+  (`DeliveryDetailRepository::record_attempt()`) and cannot be reimplemented in a
+  dependency-free file without duplicating the repository it exists to do without.
+  This is also why there is no `plugin_uninstalled` reason code: a constant nothing
+  can produce is drift (gate 9). The **statuses** are asserted by
+  `ScheduledLifecycleTest`; the sentence is simply absent on that path.
+- **⚠ Tier 2 — a deactivation that cannot finalise leaves the maintenance action
+  queued too.** The hook-wide unschedule is skipped as a whole when any tombstone is
+  left pending (§8.8), and that sweep is also what removes
+  `extonify_wcep_maintenance`. A daily action for an inactive plugin fires against a
+  hook with no handler and does nothing — the strictly safer failure, and it is the
+  action that would recover those rows if the plugin comes back — but it is queue
+  litter until then.
+- **⚠ Tier 2 — the orphan sweep's cursor can delay (never prevent) reaching a row.**
+  A row that becomes orphaned BEHIND the cursor waits for the current cycle to close.
+  ~~The cursor resets to 0 whenever the candidate set is exhausted, and one wrap is
+  allowed inside a run, so the delay is bounded by one cycle.~~ **CORRECTED IN PROMPT
+  7C: that was true only of a quiet queue.** Under sustained inflow no page came back
+  short, the reset never fired, and the delay was UNBOUNDED — a Tier 1 defect, fixed
+  by the cycle high-water mark (ADR-0015 §8.3b). The delay is now `ceil(E / T)`
+  maintenance runs of the following cycle, `T` = 1,000 — bounded, but on a very deep
+  queue still measured in days.
+- **⚠ Tier 2 — the orphan half has no index of its own.** It filters
+  `final_status = 'scheduled' AND last_seen_at <= ? AND id BETWEEN ? AND ?` and there
+  is no `(final_status, last_seen_at)` index; it uses `lease_sweep`'s leading
+  `final_status` column, or the primary key for the bounded id range. The candidate
+  set is the pending queue rather than the table, and the page cap bounds the work
+  either way, so this is a plan-quality question and not a correctness one. Adding an
+  index means a migration and a change to `SchemaVerificationTest`'s exact index set,
+  which is not work to do in a correction round.
+- **⚠ Tier 3 — the lease half's throughput is reduced by rows it cannot recover.** A
+  row whose recovery WRITE fails stays `executing` and stays a candidate, so `P` such
+  rows cost `P` of each run's `T` (ADR-0015 §8.3b). It cannot starve the ROW — the
+  half reads ascending from 0 every run, so the poisoned rows are examined every time
+  — only the budget behind them. Requires a database that accepts reads and refuses
+  writes, and every occurrence is logged. Repairing it with a persisted cursor would
+  break the stronger property that inflow can never push an older lease backwards.
+- **⚠ Tier 3 — a maintenance action deleted by hand stays deleted for up to
+  `VERIFY_INTERVAL_SECONDS`.** `Maintenance::ensure_armed()` trusts its autoloaded
+  verification stamp for an hour (ADR-0015 §8.3c). Deactivation clears the stamp, and
+  a failed arm never writes one, so the window only opens when a merchant or a queue
+  purge removes the action from underneath a verification that was true when written.
+  One hour matches the lease window: a stranded delivery is already accepted as
+  stranded for that long before the sweep may touch it.
+- **⚠ Tier 3 — a cycle whose last full page lands exactly on the mark costs one short
+  read.** The next run reads one page, finds the frozen set exhausted, closes the
+  cycle and stops; the cycle after that gets a full budget. Rolling straight into the
+  next cycle in the same run would recover that page but would hand the new cycle a
+  partly-spent budget, and `ceil(E / T)` would stop being true of its first run
+  (ADR-0015 §8.3b). One indexed SELECT a day is the cheaper side of that trade.
+- **⚠ Tier 3 — a write that fails on BOTH the transition and the re-queue leaves a
+  `scheduled` row with no job until the next sweep.** `handle_ungranted_lease()`
+  re-queues (rule 3) and terminalises loudly when the cap is spent; if that
+  cancellation ALSO fails, the row keeps `scheduled` with no job — which is exactly
+  the shape §8.3a's orphan half recovers. Requires two simultaneous write failures.
+- **⚠ Tier 3 — `record_expired_lease()` serves two events.** The stale-lease sweep
+  (§8.3) and shutdown (§8.8) share the `executing → unresolved` transition and differ
+  only in the recorded reason code. If a third event ever needs it, give it a reason
+  rather than a second method: the transition is the contract, the reason is the
+  answer to *why didn't this send?*
+- **⚠ Tier 3 — `inspect()` reads `$wpdb->last_error` to tell a missing row from a
+  failed read.** `wpdb::query()` clears it through `flush()` before every statement,
+  so the value belongs to that read — verified against WordPress 6.8's `wpdb`. A
+  drop-in replacement for `$wpdb` that does not clear it would make a missing row
+  look like a failed read, which fails **safe** (the caller declines to act rather
+  than acting on a guess).

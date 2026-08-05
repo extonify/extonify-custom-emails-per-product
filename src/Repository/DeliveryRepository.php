@@ -8,6 +8,8 @@
 namespace Extonify\WCEP\Repository;
 
 use Extonify\WCEP\Domain\DeliveryIdentity;
+use Extonify\WCEP\Domain\DeliverySnapshot;
+use Extonify\WCEP\Domain\WriteResult;
 use Extonify\WCEP\Install\Migrator;
 
 defined( 'ABSPATH' ) || exit;
@@ -18,6 +20,16 @@ defined( 'ABSPATH' ) || exit;
  * The tombstone contains no direct contact or message-content fields, but
  * remains linked to an order and is retained to prevent unintended duplicate
  * automatic deliveries.
+ *
+ * ⚠ ONE QUALIFICATION, AND IT IS THE REASON THE PRIVACY WORDING CHANGED IN
+ * PROMPT 7A (ADR-0015 §2a). A delivery that is still PENDING carries a
+ * `snapshot`: the store's own unrendered templates and recipient DEFINITIONS,
+ * which may include a literal address a merchant typed into the rule. That is
+ * merchant configuration rather than the data subject's data — it is already in
+ * the rules table in the clear — and it is RELEASED the moment the delivery
+ * reaches a terminal state, so the sentence above holds for every row that is not
+ * currently owed. It does not hold for one that is, and the exporter, the eraser
+ * and the public privacy notice all say so.
  *
  * Rows here survive retention purges and privacy erasure: purging an identity
  * would silently re-arm an already-delivered order, which is the exact failure
@@ -32,6 +44,33 @@ class DeliveryRepository {
 	const CLAIMED    = 'claimed';
 	const SUPPRESSED = 'suppressed';
 	const FAILED     = 'failed';
+
+	/**
+	 * The armed state of a delayed delivery (ADR-0015 §1).
+	 *
+	 * Between `claimed` and its terminal state: the identity is consumed, the
+	 * snapshot is stored, and a job is queued to execute it.
+	 */
+	const SCHEDULED = 'scheduled';
+
+	/**
+	 * THE LEASE (ADR-0015 §8.2).
+	 *
+	 * Between `scheduled` and its terminal state: one worker has taken exclusive
+	 * ownership of this delivery and is running it right now.
+	 *
+	 * ⚠ IT EXISTS TO STOP A SECOND EMAIL, AND THE CASE NEEDS ONLY A PHP TIMEOUT.
+	 * A worker that dies AFTER `wp_mail()` returned but BEFORE the status write
+	 * leaves the action re-claimable. Without this state the next worker reads
+	 * `scheduled`, re-validates successfully, and sends the customer a duplicate.
+	 * `run()` begins by taking this lease and returns without sending when it
+	 * cannot — that is the whole mechanism.
+	 *
+	 * NOT TERMINAL, and therefore NOT in self::SNAPSHOT_RELEASING_STATUSES: a
+	 * delivery under lease is still pending work, and one whose lease is later
+	 * swept still has to know what it was going to send.
+	 */
+	const EXECUTING = 'executing';
 
 	/**
 	 * Terminal statuses a tombstone may record.
@@ -52,12 +91,51 @@ class DeliveryRepository {
 	 * `sent`, because a third party throwing a later render away does not undo a
 	 * delivery that happened.
 	 */
-	const FINAL_STATUSES = array( 'claimed', 'scheduled', 'sent', 'failed', 'cancelled', 'skipped', 'unresolved', DeliveryDetailRepository::ABANDONED );
+	const FINAL_STATUSES = array( 'claimed', 'scheduled', self::EXECUTING, 'sent', 'failed', 'cancelled', 'skipped', 'unresolved', DeliveryDetailRepository::ABANDONED );
+
+	/**
+	 * THE ONLY MOVES A DELAYED DELIVERY MAY MAKE (ADR-0015 §8.1).
+	 *
+	 * Keyed by source state; the value is every state that source may reach. A
+	 * pair absent from here is refused by self::transition() and logged, so an
+	 * impermissible move is a recorded error rather than a silent write.
+	 *
+	 * ⚠ `executing => cancelled` AND `executing => skipped` ARE LOAD-BEARING, AND
+	 * THE SHORTER FOUR-EDGE VERSION OF THIS TABLE LOOKS COMPLETE WITHOUT THEM.
+	 * ADR-0015 §4 requires `cancelled` with a distinct reason for all six
+	 * re-validation outcomes, and those checks run AFTER the lease is taken —
+	 * without this edge they would have to record `failed`, which would be untrue
+	 * (nothing failed; the merchant disabled the rule). ADR-0012 §2's claiming
+	 * skips — no deliverable recipient, the per-delivery
+	 * `woocommerce_email_enabled_{id}` filter refusing — are likewise discovered
+	 * inside the send, under the lease.
+	 *
+	 * There is no `executing => scheduled` edge and there must never be one: a
+	 * delivery that has been walked backwards out of its lease is a delivery two
+	 * workers can pick up.
+	 */
+	const TRANSITIONS = array(
+		self::SCHEDULED => array( self::EXECUTING, 'cancelled' ),
+		self::EXECUTING => array( 'sent', 'failed', 'unresolved', 'cancelled', 'skipped' ),
+	);
 
 	/**
 	 * How many ids to bind per statement when deleting in bulk.
 	 */
 	const DELETE_CHUNK_SIZE = 200;
+
+	/**
+	 * How many rows one LIFECYCLE pass reads at a time.
+	 *
+	 * Deactivation and uninstall walk a table whose whole design is to grow for the
+	 * lifetime of the store, so they page rather than selecting everything into
+	 * memory at once. They page to EXHAUSTION — a shutdown that finalised only the
+	 * first N deliveries would leave the rest stranded — which is what separates
+	 * them from the daily sweep, whose per-run budget is capped by
+	 * `ScheduledDelivery::SWEEP_MAX_PAGES` (ADR-0015 §8.3a) because it is entitled
+	 * to finish tomorrow.
+	 */
+	const SWEEP_CHUNK_SIZE = 200;
 
 	/**
 	 * Fully-prefixed table name.
@@ -338,7 +416,192 @@ class DeliveryRepository {
 	}
 
 	/**
+	 * Statuses at which a delayed delivery's snapshot is RELEASED (ADR-0015 §2).
+	 *
+	 * ⚠ THE SNAPSHOT IS PENDING WORK, NOT HISTORY. Tombstones are never purged, so
+	 * a snapshot left on one accumulates a rule body per delivery for the lifetime
+	 * of the store — a resource growing without bound in normal operation. It is
+	 * needed only between scheduling and execution, so every terminal state clears
+	 * it and durable storage tracks QUEUE DEPTH rather than delivery history.
+	 *
+	 * `scheduled` is pointedly absent: that is the state the snapshot exists for.
+	 * `claimed` is absent too — an immediate delivery passes through it and never
+	 * had a snapshot, and a scheduled one must not be walked backwards into it.
+	 */
+	const SNAPSHOT_RELEASING_STATUSES = array( 'sent', 'failed', 'cancelled', 'skipped', 'unresolved', DeliveryDetailRepository::ABANDONED );
+
+	/**
+	 * THE GUARDED TRANSITION: move a delivery from one state to another, but only
+	 * from the state the caller believes it is in (ADR-0015 §8.1).
+	 *
+	 * ONE STATEMENT DECIDES, and the decision is read purely from the affected-row
+	 * count — exactly as `claim()` does, and for exactly the same reason:
+	 *
+	 *   - 1 row changed  => CHANGED:      THIS caller won the transition and OWNS the outcome
+	 *   - 0 rows changed => LOST_RACE:    somebody else got there first; the row is not `$from`
+	 *   - false          => QUERY_FAILED: nothing happened at all; nobody owns it
+	 *   - not attempted  => REFUSED:      an unusable id, or a pair outside the table
+	 *
+	 * **Whoever wins owns the outcome; the loser exits without acting.** That
+	 * sentence is the whole concurrency design of the scheduled path, and it is why
+	 * this return value may never be discarded.
+	 *
+	 * ⚠ AND IT IS WHY THE RETURN VALUE IS NOT A BOOLEAN (ADR-0015 §8.1a, Prompt 7B).
+	 * "Somebody else won" and "the UPDATE failed" are DIFFERENT FACTS REQUIRING
+	 * OPPOSITE ACTIONS, and `false` merged them: a lost race means the delivery has
+	 * an owner and exiting is correct, while a failed query means it has none and
+	 * exiting strands it in the state it was already in. Three call sites acted on
+	 * the ambiguity — the lease read a failed UPDATE as a lost race and let the
+	 * action be consumed with the row still `scheduled`; the eager cancellation
+	 * unscheduled the job anyway; the arm left the tombstone `claimed` with no job.
+	 * `Domain\WriteResult` carries the distinction so no caller can re-merge them.
+	 *
+	 * ⚠ THE ROW COUNT IS TRUSTWORTHY HERE, AND THAT IS NOT AN ACCIDENT. WordPress
+	 * does not set `CLIENT_FOUND_ROWS`, so MySQL reports rows CHANGED rather than
+	 * matched — and every permitted transition writes a DIFFERENT `final_status`,
+	 * so a matching row always changes and a no-op update can never be mistaken for
+	 * a win. `WHERE id = %d` is the primary key, so the count is never above 1.
+	 * (`set_final_status()` needs its zero-rows-is-not-failure fallback precisely
+	 * because it CAN be asked to write a status the row already holds. This cannot.)
+	 *
+	 * @param int    $delivery_id        Tombstone id.
+	 * @param string $from               State the caller believes the row is in.
+	 * @param string $to                 State to move it to.
+	 * @param int    $rule_revision_sent Rule revision, audit only — never keyed.
+	 * @return WriteResult CHANGED only when THIS call changed exactly one row.
+	 */
+	public function transition( int $delivery_id, string $from, string $to, int $rule_revision_sent = 0 ): WriteResult {
+		global $wpdb;
+
+		$from      = DeliveryIdentity::normalize( $from );
+		$to        = DeliveryIdentity::normalize( $to );
+		$attempted = $from . ' -> ' . $to;
+
+		if ( $delivery_id <= 0 ) {
+			$this->log_error( 'refused a state transition for an unusable delivery id' );
+			return WriteResult::refused( $attempted );
+		}
+
+		if ( ! self::transition_is_permitted( $from, $to ) ) {
+			// AN ALLOWLIST, NOT A SANITISED PAIR. A move nobody reviewed is a move
+			// nothing can interpret afterwards, and the pair most worth refusing —
+			// `executing` back to `scheduled` — is the one that would let two
+			// workers pick up the same delivery.
+			$this->log_error(
+				'refused an impermissible delivery transition for #' . $delivery_id . ': ' . $attempted
+			);
+			return WriteResult::refused( $attempted );
+		}
+
+		$now         = current_time( 'mysql', true );
+		$assignments = array( 'final_status = %s', 'last_seen_at = %s' );
+		$values      = array( $to, $now );
+
+		if ( self::EXECUTING === $to ) {
+			// ADR-0015 §8.2: the lease clock, in a column nothing else writes.
+			$assignments[] = 'lease_taken_at = %s';
+			$values[]      = $now;
+		} else {
+			// Every exit from the lease clears it, so a terminal row can never be
+			// mistaken for one whose worker is still running.
+			$assignments[] = 'lease_taken_at = NULL';
+		}
+
+		if ( in_array( $to, self::SNAPSHOT_RELEASING_STATUSES, true ) ) {
+			// ADR-0015 §2: released in the one statement that already knows the
+			// delivery has finished.
+			$assignments[] = 'snapshot = NULL';
+		}
+
+		if ( $rule_revision_sent > 0 ) {
+			$assignments[] = 'rule_revision_sent = %d';
+			$values[]      = $rule_revision_sent;
+		}
+
+		$values[] = $delivery_id;
+		$values[] = $from;
+
+		$table = $this->table();
+		$set   = implode( ', ', $assignments );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- guarded primary-key update of the plugin-owned tombstone table; the final_status predicate IS the concurrency guard and a cached read would defeat it.
+		$updated = $wpdb->query(
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the replacements arrive as one $values array, which the sniff cannot count through; it is built beside the assignments above so the two are always the same length.
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier; {$set} is assembled from the hardcoded literal fragments directly above, every one of which binds its value through the $values array. No caller input reaches the SQL text.
+				"UPDATE {$table} SET {$set} WHERE id = %d AND final_status = %s",
+				$values
+			)
+		);
+
+		if ( false === $updated ) {
+			$this->log_error(
+				'delivery #' . $delivery_id . ': the ' . $attempted . ' transition failed with a query error, so '
+					. 'NOTHING was written and no other actor owns this delivery'
+			);
+			return WriteResult::failed( $attempted );
+		}
+
+		return 1 === (int) $updated ? WriteResult::changed( $attempted ) : WriteResult::lost( $attempted );
+	}
+
+	/**
+	 * Whether one state may move to another (ADR-0015 §8.1).
+	 *
+	 * @param string $from Source state.
+	 * @param string $to   Target state.
+	 * @return bool
+	 */
+	public static function transition_is_permitted( string $from, string $to ): bool {
+		$allowed = self::TRANSITIONS[ $from ] ?? array();
+
+		return in_array( $to, $allowed, true );
+	}
+
+	/**
+	 * The statuses from which a delivery can still move.
+	 *
+	 * The complement of "terminal", derived from self::TRANSITIONS rather than
+	 * listed a second time — a state with somewhere to go is exactly a state with
+	 * an entry there. `claimed` joins them because an immediate delivery passes
+	 * through it on its way to an outcome.
+	 */
+	const IN_FLIGHT_STATUSES = array( 'claimed', self::SCHEDULED, self::EXECUTING );
+
+	/**
+	 * Whether a delivery has already reached a terminal state.
+	 *
+	 * ⚠ USED TO CONFIRM THAT A DELIVERY THIS CALLER DID NOT FINALISE NEVERTHELESS
+	 * HAS AN OUTCOME. A lost race is somebody else's success and is not a shortfall
+	 * worth alarming a merchant about — but only a READ can say whether the winner
+	 * actually recorded something, and `WriteResult::LOST_RACE` alone cannot.
+	 *
+	 * ⚠ FALSE ALSO WHEN THE ROW IS MISSING OR THE READ FAILED, which is the safe
+	 * direction: it means "do not treat this delivery as finished". A caller that
+	 * needs to tell those two apart asks self::inspect() instead.
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return bool False when the row is missing or still in flight.
+	 */
+	public function is_terminal( int $delivery_id ): bool {
+		$row = $this->find_by_id( $delivery_id );
+
+		if ( null === $row ) {
+			return false;
+		}
+
+		return ! in_array( (string) $row['final_status'], self::IN_FLIGHT_STATUSES, true );
+	}
+
+	/**
 	 * Record the terminal outcome of a delivery.
+	 *
+	 * ⚠ THE IMMEDIATE PATH ONLY (ADR-0015 §8.1). It is an UNCONDITIONAL
+	 * primary-key update, which is correct for a tombstone that goes
+	 * `claimed -> terminal` inside one request with no second actor — and wrong for
+	 * a delayed one, where a cancellation could overwrite `sent` and a send could
+	 * overwrite `cancelled`. **No scheduled path may call this**; they call
+	 * self::transition() and declare the state they are leaving.
 	 *
 	 * @param int    $delivery_id        Tombstone id.
 	 * @param string $final_status       One of claimed|scheduled|sent|failed|cancelled.
@@ -361,6 +624,13 @@ class DeliveryRepository {
 			'last_seen_at' => current_time( 'mysql', true ),
 		);
 		$fmt  = array( '%s', '%s' );
+
+		if ( in_array( $status, self::SNAPSHOT_RELEASING_STATUSES, true ) ) {
+			// ADR-0015 §2: released here, in the one statement that already knows
+			// the delivery has finished, so no separate sweep has to find them.
+			$data['snapshot'] = null;
+			$fmt[]            = '%s';
+		}
 
 		if ( $rule_revision_sent > 0 ) {
 			$data['rule_revision_sent'] = $rule_revision_sent;
@@ -385,6 +655,461 @@ class DeliveryRepository {
 		// the row exists and already holds the value instead.
 		$current = $this->find_by_id( $delivery_id );
 		return null !== $current && $status === (string) $current['final_status'];
+	}
+
+	/**
+	 * Arm a claimed delivery as SCHEDULED, storing its snapshot (ADR-0015 §1, §2).
+	 *
+	 * ⚠ A SEPARATE STATEMENT FROM `claim()`, DELIBERATELY. The claim is ONE atomic
+	 * statement whose affected-row count decides the outcome, and it is the single
+	 * mechanism preventing a duplicate send. Widening it to carry a longtext
+	 * payload would put the plugin's most load-bearing query at risk for a column
+	 * that is not part of the decision — so the claim decides, and this arms.
+	 *
+	 * WRITTEN ONLY OVER A `claimed` ROW. A row already `scheduled`, `sent` or
+	 * `cancelled` is not re-armed: the caller reached here after a CLAIMED result,
+	 * so anything else means another request got there first, and overwriting its
+	 * snapshot would hand one delivery another's content. The predicate does that
+	 * check inside the UPDATE rather than around it, so there is no read-then-write
+	 * window.
+	 *
+	 * ⚠ ITS RESULT IS STRUCTURED FOR THE SAME REASON self::transition()'s IS
+	 * (ADR-0015 §8.1a). A `false` return meant either "another request armed this
+	 * first" or "the UPDATE failed", and the only call site treated both as an inert
+	 * skip — so an ordinary database failure, with nothing thrown, left the identity
+	 * claimed, no job queued, no detail row, and no sweep able to find the row,
+	 * silently suppressing every later trigger for that delivery.
+	 *
+	 * @param int   $delivery_id Tombstone id, from a CLAIMED claim.
+	 * @param array $snapshot    Snapshot from `Domain\DeliverySnapshot::create()`.
+	 * @return WriteResult CHANGED when this call armed the row.
+	 */
+	public function arm_scheduled( int $delivery_id, array $snapshot ): WriteResult {
+		global $wpdb;
+
+		if ( $delivery_id <= 0 || array() === $snapshot ) {
+			$this->log_error( 'refused to arm delivery #' . $delivery_id . ': unusable id or empty snapshot' );
+			return WriteResult::refused( 'arm ' . self::CLAIMED . ' -> ' . self::SCHEDULED );
+		}
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- guarded primary-key update of the plugin-owned tombstone table; the final_status predicate IS the concurrency guard and a cached read would defeat it.
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"UPDATE {$table}
+					SET snapshot = %s, final_status = %s, last_seen_at = %s
+				WHERE id = %d AND final_status = %s",
+				DeliverySnapshot::encode( $snapshot ),
+				self::SCHEDULED,
+				current_time( 'mysql', true ),
+				$delivery_id,
+				self::CLAIMED
+			)
+		);
+
+		$attempted = 'arm ' . self::CLAIMED . ' -> ' . self::SCHEDULED;
+
+		if ( false === $updated ) {
+			$this->log_error(
+				'arming delivery #' . $delivery_id . ' as scheduled failed with a query error, so the identity is '
+					. 'consumed with nothing behind it'
+			);
+			return WriteResult::failed( $attempted );
+		}
+
+		return $updated > 0 ? WriteResult::changed( $attempted ) : WriteResult::lost( $attempted );
+	}
+
+	/**
+	 * READ A TOMBSTONE'S STATE, AND SAY WHETHER THE ANSWER IS KNOWN
+	 * (ADR-0015 §8.1a).
+	 *
+	 * ⚠ `find_by_id()` RETURNS NULL FOR TWO DIFFERENT FACTS — the row is gone, or
+	 * the READ failed — and the lease branch acted on the first while the second was
+	 * live. "The order was permanently deleted, so there is nothing to record onto"
+	 * and "this plugin cannot currently reach its own table" call for opposite
+	 * handling, and a caller recovering from a failed write is exactly the caller
+	 * most likely to meet a failing read.
+	 *
+	 * `$wpdb->last_error` is the only thing that separates them: `wpdb::query()`
+	 * clears it through `flush()` before every statement, so a non-empty value after
+	 * this read belongs to this read.
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return array{known:bool,exists:bool,status:string,order_id:int} `known` false
+	 *         means the READ failed and nothing here may be relied on.
+	 */
+	public function inspect( int $delivery_id ): array {
+		global $wpdb;
+
+		if ( $delivery_id <= 0 ) {
+			// No row can exist for an unusable id, and no query is needed to know it.
+			return array(
+				'known'    => true,
+				'exists'   => false,
+				'status'   => '',
+				'order_id' => 0,
+			);
+		}
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key read of the plugin-owned tombstone table; a cached read would report a state another actor has already moved on from, which is the one thing this method exists to answer accurately.
+		$row = $wpdb->get_row(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+			$wpdb->prepare( "SELECT id, order_id, final_status FROM {$table} WHERE id = %d", $delivery_id ),
+			ARRAY_A
+		);
+
+		if ( ! is_array( $row ) ) {
+			$failed = '' !== (string) $wpdb->last_error;
+
+			if ( $failed ) {
+				$this->log_error( 'could not read the state of delivery #' . $delivery_id . ': ' . (string) $wpdb->last_error );
+			}
+
+			return array(
+				'known'    => ! $failed,
+				'exists'   => false,
+				'status'   => '',
+				'order_id' => 0,
+			);
+		}
+
+		return array(
+			'known'    => true,
+			'exists'   => true,
+			'status'   => (string) $row['final_status'],
+			'order_id' => (int) $row['order_id'],
+		);
+	}
+
+	/**
+	 * The stored snapshot of one delivery, or null when it has none.
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return array|null
+	 */
+	public function snapshot_of( int $delivery_id ): ?array {
+		$row = $this->find_by_id( $delivery_id );
+
+		if ( null === $row ) {
+			return null;
+		}
+
+		return DeliverySnapshot::read( (string) ( $row['snapshot'] ?? '' ) );
+	}
+
+	/**
+	 * Every PENDING scheduled delivery for one rule (ADR-0015 §5).
+	 *
+	 * Served by the `scheduled_lookup (rule_id, final_status)` index. Used by
+	 * eager cancellation when a merchant disables or deletes a rule — an admin
+	 * action, so the cost is paid once and never in a delivery path.
+	 *
+	 * @param int $rule_id Rule id.
+	 * @return array[] Tombstone rows still `scheduled`.
+	 */
+	public function find_scheduled_for_rule( int $rule_id ): array {
+		global $wpdb;
+
+		if ( $rule_id <= 0 ) {
+			return array();
+		}
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned tombstone table; a cached read would let a just-scheduled delivery escape eager cancellation.
+		$rows = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE rule_id = %d AND final_status = %s ORDER BY id ASC", $rule_id, self::SCHEDULED ),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * `executing` rows whose lease was taken before a cutoff (ADR-0015 §8.3).
+	 *
+	 * These are deliveries whose worker never came back — a PHP timeout, a fatal,
+	 * a host restart. The sweep records them `unresolved`, never `failed`: nobody
+	 * knows whether the mail went out, and asserting that it did not is the input a
+	 * resend feature would read as "retry this".
+	 *
+	 * ⚠ `COALESCE` RATHER THAN A BARE COLUMN TEST. Only self::transition() ever
+	 * writes `executing`, and it always stamps the lease — but a row that somehow
+	 * reached the state without one would otherwise be INVISIBLE to the only
+	 * mechanism that can free it, which is the exact stranding this sweep exists to
+	 * end. `last_seen_at` is the honest fallback and is never newer.
+	 *
+	 * Cost: the `lease_sweep` index narrows to `final_status = 'executing'`, whose
+	 * cardinality is the number of deliveries in flight — not the table.
+	 *
+	 * ⚠ CURSOR-PAGED, LIKE THE ORPHAN HALF, THOUGH FOR A NARROWER REASON. Every row
+	 * this returns is transitioned OUT of `executing` by the sweep, so the candidate
+	 * set drains itself and this half cannot starve the way the orphan half could.
+	 * The cursor is what keeps a row the sweep FAILED to recover — a poisoned row, a
+	 * failing write — from being re-read at the head of every page for the rest of
+	 * the run and hiding every row behind it.
+	 *
+	 * @param string $cutoff_utc `Y-m-d H:i:s` UTC; leases at or before this are stale.
+	 * @param int    $after_id   Return rows with an id strictly greater than this.
+	 * @param int    $limit      Maximum rows to return.
+	 * @return array[] Tombstone rows, ascending by id.
+	 */
+	public function find_stale_leases( string $cutoff_utc, int $after_id, int $limit ): array {
+		global $wpdb;
+
+		$limit = max( 1, $limit );
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would re-sweep rows a previous pass already recovered.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"SELECT * FROM {$table}
+					WHERE final_status = %s AND COALESCE(lease_taken_at, last_seen_at) <= %s AND id > %d
+					ORDER BY id ASC LIMIT %d",
+				self::EXECUTING,
+				$cutoff_utc,
+				max( 0, $after_id ),
+				$limit
+			),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * `scheduled` rows untouched since a cutoff (ADR-0015 §8.3).
+	 *
+	 * The candidates for the orphan half of the sweep. ⚠ THE AGE FILTER IS THE
+	 * SAFETY, NOT AN OPTIMISATION: a delivery armed microseconds ago has not queued
+	 * its job yet, and a sweep that read it would find no job and "recover" a
+	 * delivery that was never lost. `last_seen_at` is written by `arm_scheduled()`,
+	 * so it is the moment the row entered this state.
+	 *
+	 * Being `scheduled` says nothing about whether the job is DUE — a delivery
+	 * queued for next week is pending, and `as_has_scheduled_action()` reports it
+	 * as such. Only "no job at all" means orphaned, and that question is asked per
+	 * row by the caller, against the queue.
+	 *
+	 * ⚠ CURSOR-PAGED, AND THE MISSING CURSOR WAS A STARVATION DEFECT THAT NEEDED NO
+	 * FAILURE AT ALL (Prompt 7B, Group B). A HEALTHY row — one whose job exists —
+	 * stays a candidate: it is still `scheduled` and still older than the cutoff.
+	 * `ORDER BY id ASC LIMIT 100` with no cursor therefore returned the SAME first
+	 * hundred rows every day, so a store with more than a hundred pending
+	 * long-delayed deliveries never examined row 101 and an orphan behind them was
+	 * never reached. Only moderate volume and a long delay were required — which is
+	 * the feature this ADR exists to ship.
+	 *
+	 * ⚠ AND BOUNDED ABOVE BY A CYCLE HIGH-WATER MARK, WHICH IS WHAT MAKES THE CURSOR
+	 * FAIR (ADR-0015 §8.3b, Prompt 7C). A cursor alone only guarantees progress
+	 * THROUGH the candidate set; it guarantees nothing about REACHING the back of it,
+	 * because under sustained inflow the set grows in front of the cursor faster than
+	 * the cursor advances and the wrap that would revisit a low id never happens. The
+	 * caller freezes `$max_id` (and `$cutoff_utc`) once per cycle, so rows arriving
+	 * during a cycle join the NEXT one and the current candidate set can only shrink.
+	 *
+	 * ⚠ `$max_id` IS REQUIRED, NOT DEFAULTED. A default would be an unbounded page,
+	 * which is exactly the shape that starved — and a starving sweep produces no
+	 * error, no exception and no log line, so nothing but the type signature can stop
+	 * a future caller reintroducing it.
+	 *
+	 * @param string $cutoff_utc `Y-m-d H:i:s` UTC; rows last touched at or before this.
+	 * @param int    $after_id   Return rows with an id strictly greater than this.
+	 * @param int    $limit      Maximum rows to return.
+	 * @param int    $max_id     Cycle high-water mark; rows above it belong to the
+	 *                           next cycle. Zero or less means no cycle is open and
+	 *                           there is nothing to read.
+	 * @return array[] Tombstone rows, ascending by id.
+	 */
+	public function find_stale_scheduled( string $cutoff_utc, int $after_id, int $limit, int $max_id ): array {
+		global $wpdb;
+
+		if ( $max_id <= 0 ) {
+			return array();
+		}
+
+		$limit = max( 1, $limit );
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would act on a delivery another pass has already finalised.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"SELECT * FROM {$table}
+					WHERE final_status = %s AND last_seen_at <= %s AND id > %d AND id <= %d
+					ORDER BY id ASC LIMIT %d",
+				self::SCHEDULED,
+				$cutoff_utc,
+				max( 0, $after_id ),
+				$max_id,
+				$limit
+			),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * The highest id among the orphan half's candidates RIGHT NOW (ADR-0015 §8.3b).
+	 *
+	 * The cycle high-water mark. Read once when a sweep cycle opens and then frozen
+	 * for the whole cycle, so that `find_stale_scheduled()` describes a candidate set
+	 * that cannot grow while the sweep is working through it.
+	 *
+	 * ⚠ IT MEASURES THE CANDIDATE SET, NOT THE TABLE. `MAX(id)` over the whole table
+	 * would work for fairness — nothing above it can be eligible — but it would put
+	 * the mark past a long run of terminal rows, and a cycle is only complete once
+	 * the cursor has walked to the mark. Bounding the mark by the candidates keeps a
+	 * cycle as short as the work actually justifies.
+	 *
+	 * Returns 0 when there are no candidates, which the caller reads as "the cycle is
+	 * complete before it started" — the ordinary state of a store with nothing aged
+	 * and pending.
+	 *
+	 * ⚠ A FAILED READ IS INDISTINGUISHABLE FROM AN EMPTY SET HERE, AND THAT IS SAFE
+	 * IN THIS ONE DIRECTION ONLY. `get_var()` returns null for both, and both mean
+	 * "sweep nothing this run" — the sweep is a recovery mechanism, so doing nothing
+	 * costs a day's delay, never a delivery. This is the opposite of §8.1a's rule,
+	 * which governs WRITES: there, "somebody else won" and "nothing happened" have
+	 * different consequences, so they may never share a return value.
+	 *
+	 * @param string $cutoff_utc `Y-m-d H:i:s` UTC; rows last touched at or before this.
+	 * @return int Highest candidate id, or 0.
+	 */
+	public function max_stale_scheduled_id( string $cutoff_utc ): int {
+		global $wpdb;
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would freeze a cycle against a stale view of the queue.
+		$max = $wpdb->get_var(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"SELECT MAX(id) FROM {$table} WHERE final_status = %s AND last_seen_at <= %s",
+				self::SCHEDULED,
+				$cutoff_utc
+			)
+		);
+
+		return null === $max ? 0 : max( 0, (int) $max );
+	}
+
+	/**
+	 * The two states a DELAYED delivery can be pending in (ADR-0015 §8.8).
+	 *
+	 * Deliberately not `IN_FLIGHT_STATUSES`: that set includes `claimed`, which is
+	 * the immediate path's transient state and belongs to a request that is still
+	 * running, not to the scheduled state machine.
+	 */
+	const PENDING_SCHEDULED_STATUSES = array( self::SCHEDULED, self::EXECUTING );
+
+	/**
+	 * Every PENDING delayed delivery in the store, one page at a time
+	 * (ADR-0015 §8.6, §8.8).
+	 *
+	 * For deactivation and uninstall, which must finalise the lot. Paged by id
+	 * rather than selected whole: this table's whole design is to grow for the
+	 * lifetime of the store, and a lifecycle hook that loads all of it into memory
+	 * is a lifecycle hook that fails on the sites that most need it to work.
+	 *
+	 * ⚠ BOTH PENDING STATES, AND `executing` WAS MISSING UNTIL PROMPT 7B. The lease
+	 * exists so that no second actor touches a running delivery, and during normal
+	 * running that is exactly right — but a shutdown is not normal running. A
+	 * merchant who deactivated mid-flight left a row `executing` with its snapshot
+	 * retained, and deactivation ALSO removes the maintenance action, so the
+	 * stale-lease sweep that would have recovered it an hour later was gone too.
+	 * Nothing could ever move that row again. What each state becomes is the
+	 * caller's decision (§8.8); this method only has to stop hiding one of them.
+	 *
+	 * ⚠ THE CALLER MUST PAGE BY THE LAST ID IT SAW, NOT BY OFFSET. Each pass
+	 * finalises the rows it read, so they leave this result set — an `OFFSET` would
+	 * then skip exactly as many unprocessed rows as it had already handled.
+	 *
+	 * @param int $after_id Return rows with an id strictly greater than this.
+	 * @param int $limit    Maximum rows to return.
+	 * @return array[] Tombstone rows, ascending by id.
+	 */
+	public function find_pending_after( int $after_id, int $limit ): array {
+		global $wpdb;
+
+		$limit = max( 1, $limit );
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle read of the plugin-owned tombstone table; a cached read would let a just-scheduled delivery escape deactivation.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"SELECT * FROM {$table}
+					WHERE final_status IN ( %s, %s ) AND id > %d
+					ORDER BY id ASC LIMIT %d",
+				self::SCHEDULED,
+				self::EXECUTING,
+				max( 0, $after_id ),
+				$limit
+			),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * How many delayed deliveries are still pending, in either state.
+	 *
+	 * ⚠ THE DEACTIVATION PRECONDITION (ADR-0015 §8.8). The hook-wide unschedule is
+	 * a sweep with no tombstone in its hand: it removes every job this plugin owns
+	 * whether or not the row behind it was finalised. Running it while a pending row
+	 * survives produces exactly the stranded state this ADR exists to eliminate, so
+	 * the caller asks this first and leaves the jobs alone when the answer is not
+	 * zero.
+	 *
+	 * @return int -1 when the count could not be read, which is NOT zero.
+	 */
+	public function count_pending(): int {
+		global $wpdb;
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle aggregate over the plugin-owned tombstone table; a cached read would authorise a hook-wide unschedule against a stale answer.
+		$count = $wpdb->get_var(
+			$wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+				"SELECT COUNT(*) FROM {$table} WHERE final_status IN ( %s, %s )",
+				self::SCHEDULED,
+				self::EXECUTING
+			)
+		);
+
+		// ⚠ NULL IS NOT ZERO. A failed count must never read as "nothing is
+		// pending", which is the answer that authorises removing every job.
+		return null === $count ? -1 : (int) $count;
+	}
+
+	/**
+	 * How many tombstones currently hold one status.
+	 *
+	 * Used by the lifecycle assertions (ADR-0015 §8.6) and by future reporting.
+	 *
+	 * @param string $status One of self::FINAL_STATUSES.
+	 * @return int
+	 */
+	public function count_with_status( string $status ): int {
+		global $wpdb;
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned tombstone table.
+		return (int) $wpdb->get_var(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
+			$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE final_status = %s", DeliveryIdentity::normalize( $status ) )
+		);
 	}
 
 	/**

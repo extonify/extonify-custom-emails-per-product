@@ -247,7 +247,25 @@ final class DeferredDeliveryTest extends DeliveryTestCase {
 				),
 				'actions' => 0,
 			),
-			'only a delayed rule'            => array( 'to' => 'cancelled', 'rule' => array( 'delay_seconds' => 604800 ), 'actions' => 0 ),
+			/*
+			 * ⚠ THIS CASE FLIPPED IN PROMPT 7, AND THE FLIP IS THE POINT
+			 * (ADR-0015 §7). It expected 0: while `delay_seconds` was unimplemented
+			 * no phase could deliver a delayed rule, so deferring for one would have
+			 * queued a job to re-discover the same nothing.
+			 *
+			 * Prompt 7 implements it, so a delayed rule IS now a candidate — and a
+			 * zero-item order is exactly the shape `wc_create_order( array( 'status'
+			 * => … ) )`, the REST API and every CSV importer produce (ADR-0008). Had
+			 * the deferral not been extended to the scheduled phase, a store whose
+			 * only rules are delayed would have had every imported order's email
+			 * silently never scheduled: no claim, no job, no log line. That is the
+			 * ADR-0008 defect in the phase that did not exist when ADR-0008 was
+			 * written, and this row is what catches it.
+			 *
+			 * Still ONE job, not two: the rule targets `status:cancelled`, so the
+			 * `transition:pending>cancelled` family still has no candidate.
+			 */
+			'only a delayed rule'            => array( 'to' => 'cancelled', 'rule' => array( 'delay_seconds' => 604800 ), 'actions' => 1 ),
 			'a rule on another trigger only' => array( 'to' => 'refunded', 'rule' => array( 'trigger_value' => 'completed' ), 'actions' => 0 ),
 			// One, not two: the rule targets `status:{to}`, so the
 			// `transition:pending>{to}` family still has no candidate.

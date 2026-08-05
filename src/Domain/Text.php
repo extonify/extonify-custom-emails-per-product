@@ -38,17 +38,58 @@ final class Text {
 	const MAX_LOG_LENGTH = 2000;
 
 	/**
+	 * Cap for ONE entry of a bounded note collection (Prompt 7 C2).
+	 *
+	 * ⚠ SIZED TO BOUND A HOSTILE NOTE WITHOUT GUTTING AN HONEST ONE, and the first
+	 * attempt got that wrong. At 80 bytes the containment note
+	 *
+	 *     rendering threw and that block was withheld: RuntimeException: <message>
+	 *
+	 * lost the exception message — the single most useful diagnostic this plugin
+	 * records, and the reason `PlaceholderContainmentTest` exists at all. A cap
+	 * that destroys the content it is protecting is not a bound, it is data loss
+	 * with a justification. Caught by that suite rather than by inspection.
+	 *
+	 * 250 bytes holds every note this plugin composes, including a class name and
+	 * a realistic third-party exception message, while still cutting a 4 KB one
+	 * down to something a column can hold.
+	 *
+	 * ⚠ AND THE COLLECTION BOUND IS `count × this`, NOT "fits in one column".
+	 * 20 entries — the count cap `PlaceholderValues::MAX_NOTES` and
+	 * `RenderLedger::MAX_RULE_NOTES` both use — comes to about 5 KB, so
+	 * self::log_value() DOES truncate the tail at storage. That is the honest
+	 * arrangement: the caps make the collection finite, and the column cap decides
+	 * how much of a finite collection is worth keeping. Claiming the two multiply
+	 * to under self::MAX_LOG_LENGTH would only be true for notes shorter than
+	 * anything real.
+	 */
+	const MAX_NOTE_LENGTH = 250;
+
+	/**
 	 * Sanitise a free-text diagnostic value for storage.
 	 *
+	 * ⚠ THE VALIDITY CHECK RUNS **AFTER** THE TRUNCATION, AND THE OTHER ORDER LOST
+	 * WHOLE ROWS (Prompt 7 C2). `substr()` cuts BYTES, so truncating at a byte
+	 * boundary inside a multibyte character produces invalid UTF-8 — and this ran
+	 * `wp_check_invalid_utf8()` FIRST, so nothing ever inspected the result. On a
+	 * `utf8mb4` column MySQL rejects that string, `$wpdb->insert()` fails, and the
+	 * diagnostic row is lost **entirely**: the failure a merchant most needs to see
+	 * is the one most likely to carry a long non-ASCII SMTP response.
+	 *
+	 * So the order is: strip control characters → truncate → **then** validate, so
+	 * the check sees the string that will actually be written. `wp_check_invalid_utf8()`
+	 * with `$strip = true` removes the partial character rather than emptying the
+	 * value, which is why it is the right tool for the second pass as well as the
+	 * first.
+	 *
 	 * @param string $value Raw value.
-	 * @param int    $max   Maximum stored length.
+	 * @param int    $max   Maximum stored length in BYTES.
 	 * @return string
 	 */
 	public static function log_value( string $value, int $max = self::MAX_LOG_LENGTH ): string {
-		$value = wp_check_invalid_utf8( $value, true );
-
 		// Drop control characters, keeping tab and newline so a multi-line
-		// server response stays readable.
+		// server response stays readable. Run against the raw bytes first,
+		// because the `/u` pattern needs valid UTF-8 to apply at all.
 		$stripped = preg_replace( '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u', '', $value );
 		if ( null === $stripped ) {
 			// Invalid UTF-8 defeated the /u pattern; fall back to bytes.
@@ -61,7 +102,48 @@ final class Text {
 			$value = substr( $value, 0, $max );
 		}
 
-		return $value;
+		// LAST, over exactly the bytes that will be stored: a character split by
+		// the truncation above is removed here, not carried into the INSERT.
+		return (string) wp_check_invalid_utf8( $value, true );
+	}
+
+	/**
+	 * Cap ONE entry of a bounded collection, leaving room for its own notice.
+	 *
+	 * ⚠ A COUNT CAP IS NOT A SIZE BOUND (Prompt 7 C2). Every note collection in
+	 * this plugin caps the number of ENTRIES — 20 in `PlaceholderValues` and in
+	 * `RenderLedger` — and none of them capped an entry's LENGTH. Twenty entries of
+	 * unbounded length is unbounded, and the entries are not all plugin-authored:
+	 * an unknown-placeholder note embeds the merchant's token text, and a
+	 * containment note embeds a third party's exception message.
+	 *
+	 * The truncation announces itself. A silently shortened diagnostic reads as a
+	 * complete one, which is how a merchant concludes the plugin lost the rest of
+	 * the sentence rather than that it chose to.
+	 *
+	 * @param string $value Note text.
+	 * @param int    $max   Maximum stored length in BYTES, notice included.
+	 * @return string
+	 */
+	public static function note_value( string $value, int $max = self::MAX_NOTE_LENGTH ): string {
+		$value = self::log_value( $value, 0 );
+
+		if ( $max <= 0 || strlen( $value ) <= $max ) {
+			return $value;
+		}
+
+		// ROOM IS RESERVED FOR THE NOTICE, so the returned string honours `$max`
+		// rather than overshooting it by the length of its own explanation.
+		$notice = ' […truncated]';
+		$room   = $max - strlen( $notice );
+
+		if ( $room <= 0 ) {
+			// A cap too small to hold its own notice: truncate plainly rather
+			// than return something longer than asked for.
+			return self::log_value( $value, $max );
+		}
+
+		return self::log_value( $value, $room ) . $notice;
 	}
 
 	/**

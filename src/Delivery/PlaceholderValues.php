@@ -745,6 +745,12 @@ final class PlaceholderValues {
 	 * not twenty events — and twenty copies of one sentence would push the useful
 	 * notes beside it out of the `reason` column.
 	 *
+	 * ⚠ CAPPED IN BOTH DIMENSIONS (Prompt 7 C2). The count cap alone left each
+	 * entry unbounded, and the entries are not all plugin-authored: the LABEL is
+	 * the merchant's token text, and the grammar deliberately places no length
+	 * limit on a parameter (ADR-0014 §1b), so a 4 KB meta key produced a 4 KB note.
+	 * Twenty of those is not a bounded collection.
+	 *
 	 * @param string $label  Token label, `{name}` or `{name:param}`.
 	 * @param string $reason What happened.
 	 * @return void
@@ -759,7 +765,7 @@ final class PlaceholderValues {
 			return;
 		}
 
-		$this->notes[ $label ] = $reason . ' ' . $label;
+		$this->notes[ $label ] = Text::note_value( $reason . ' ' . $label );
 	}
 
 	/**

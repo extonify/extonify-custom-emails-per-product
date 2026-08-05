@@ -68,6 +68,54 @@ if ( ! function_exists( 'is_email' ) ) {
 	}
 }
 
+if ( ! function_exists( 'wp_check_invalid_utf8' ) ) {
+	/**
+	 * Shim for wp_check_invalid_utf8().
+	 *
+	 * SIMPLIFICATION: WordPress consults `$blog_charset`, prefers `mbstring` and
+	 * falls back to `iconv`, and returns `''` when `$strip` is false and the
+	 * string is invalid. This shim assumes UTF-8 (which the plugin's own tables
+	 * are) and implements only the `$strip = true` behaviour `Domain\Text` uses:
+	 * valid input is returned unchanged, invalid byte sequences are removed.
+	 *
+	 * ⚠ WHAT THIS DOES AND DOES NOT PROVE. The unit tests using it assert that
+	 * truncation never yields an invalid string — a property of the ORDER of
+	 * operations in `Text::log_value()`, which this shim exercises faithfully
+	 * because it really does reject a split multibyte character. The exact
+	 * stripping WordPress performs on pathological input is the integration
+	 * suite's business, where the real function runs.
+	 *
+	 * @param string $text  Text to check.
+	 * @param bool   $strip Whether to strip invalid sequences.
+	 * @return string
+	 */
+	function wp_check_invalid_utf8( $text, $strip = false ) { // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedFunctionFound -- deliberately shimming the WordPress function of this exact name.
+		$text = (string) $text;
+
+		if ( '' === $text || 1 === preg_match( '//u', $text ) ) {
+			return $text;
+		}
+
+		if ( ! $strip ) {
+			return '';
+		}
+
+		/*
+		 * Keep every COMPLETE UTF-8 sequence and drop everything else — which is
+		 * what a truncation that split a multibyte character leaves behind. The
+		 * alternation is the standard UTF-8 grammar; the trailing `.` matches one
+		 * stray byte at a time and the callback discards it.
+		 */
+		return (string) preg_replace_callback(
+			'/[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2}|./s',
+			static function ( $match ) {
+				return 1 === strlen( $match[0] ) && "\x7F" < $match[0] ? '' : $match[0];
+			},
+			$text
+		);
+	}
+}
+
 if ( ! function_exists( '__' ) ) {
 	/**
 	 * Shim for __().

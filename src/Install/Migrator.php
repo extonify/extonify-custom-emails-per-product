@@ -119,9 +119,23 @@ class Migrator {
 				'final_status',
 				'suppressed_count',
 				'rule_revision_sent',
+				// ADR-0015 §2: the DELAYED-DELIVERY snapshot, on the durable row
+				// because the purgeable one is emptied by retention AND by
+				// erasure — both correct for history, both fatal for pending
+				// work. Released at a terminal state so it tracks queue depth
+				// rather than delivery history. Schema v1 is unreleased, so this
+				// is an in-place amendment of v1 and NOT migration 2.
+				'snapshot',
+				// ADR-0015 §8.2: WHEN the execution lease was taken, in a column
+				// nothing else writes. `last_seen_at` looks like it would do and
+				// does not — claim()'s ON DUPLICATE KEY UPDATE bumps it whenever
+				// the same trigger fires again, so a busy order would silently
+				// extend its own lease and postpone recovery indefinitely.
+				// In-place amendment of the unreleased v1, as `snapshot` was.
+				'lease_taken_at',
 			),
 			'indexes' => array(
-				'PRIMARY'       => array(
+				'PRIMARY'          => array(
 					'columns' => array( 'id' ),
 					'unique'  => true,
 				),
@@ -130,12 +144,32 @@ class Migrator {
 				// a composite unique index over (identity_hash, order_id) would
 				// still permit two rows with the same identity, which is exactly
 				// the duplicate send this table exists to prevent.
-				'identity_hash' => array(
+				'identity_hash'    => array(
 					'columns' => array( 'identity_hash' ),
 					'unique'  => true,
 				),
-				'order_id'      => array(
+				'order_id'         => array(
 					'columns' => array( 'order_id' ),
+					'unique'  => false,
+				),
+				// ADR-0015 §5: eager cancellation finds a rule's PENDING scheduled
+				// deliveries when the merchant disables or deletes it. Without this
+				// that is a full scan of a table whose whole design is to grow for
+				// the lifetime of the store. In-place amendment of the unreleased
+				// v1, as `insert_lookup` was.
+				'scheduled_lookup' => array(
+					'columns' => array( 'rule_id', 'final_status' ),
+					'unique'  => false,
+				),
+				// ADR-0015 §8.3: the daily sweep reads `executing` rows whose lease
+				// expired and `scheduled` rows old enough to have lost their job.
+				// The leading `final_status` is what does the work — it narrows to
+				// deliveries IN FLIGHT, whose cardinality is queue depth rather
+				// than the lifetime of the store. Without it the sweep is a full
+				// scan of a table that only ever grows. In-place amendment of the
+				// unreleased v1, as `scheduled_lookup` was.
+				'lease_sweep'      => array(
+					'columns' => array( 'final_status', 'lease_taken_at' ),
 					'unique'  => false,
 				),
 			),
@@ -565,9 +599,13 @@ class Migrator {
 	final_status varchar(20) NOT NULL default 'claimed',
 	suppressed_count int(10) unsigned NOT NULL default 0,
 	rule_revision_sent int(10) unsigned NOT NULL default 0,
+	snapshot longtext NULL,
+	lease_taken_at datetime NULL default NULL,
 	PRIMARY KEY  (id),
 	UNIQUE KEY identity_hash (identity_hash),
-	KEY order_id (order_id)
+	KEY order_id (order_id),
+	KEY scheduled_lookup (rule_id, final_status),
+	KEY lease_sweep (final_status, lease_taken_at)
 ) {$charset_collate};";
 
 		// One row per RESOLVED recipient (ADR-0009, amended Prompt 2a): the

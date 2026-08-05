@@ -81,7 +81,8 @@ final class CollectionCensusTest extends UnitTestCase {
 	 */
 	const NESTED_COLLECTIONS = array(
 		'RenderLedger::$slots[*][rules]'         => 'lifecycle: a SET keyed by rule id, so it is bounded by the number of active rules that matched this render',
-		'RenderLedger::$slots[*][rules][*][notes]' => 'cap: MAX_RULE_NOTES, overflow counted in the entry\'s dropped_notes',
+		'RenderLedger::$slots[*][rules][*][notes]' => 'cap: MAX_RULE_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in the entry\'s dropped_notes',
+		'PlaceholderValues::$notes'               => 'cap: MAX_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in $dropped_notes',
 	);
 
 	/**
@@ -176,6 +177,20 @@ final class CollectionCensusTest extends UnitTestCase {
 		);
 
 		$this->assertGreaterThan( 0, RenderLedger::MAX_RULE_NOTES );
+
+		/*
+		 * ⚠ AND THE COUNT CAP IS ONLY HALF A BOUND (Prompt 7 C2). Twenty entries of
+		 * unbounded length is unbounded, and the entries are not all plugin-authored
+		 * — a note embeds the merchant's token text or a third party's exception
+		 * message. Both dimensions are asserted, because the collection was capped
+		 * in one of them for two prompts.
+		 */
+		$this->assertGreaterThan( 0, \Extonify\WCEP\Domain\Text::MAX_NOTE_LENGTH );
+		$this->assertLessThan(
+			\Extonify\WCEP\Domain\Text::MAX_LOG_LENGTH,
+			\Extonify\WCEP\Domain\Text::MAX_NOTE_LENGTH,
+			'a single note may not be allowed to fill the whole log column'
+		);
 		$this->assertSame( RenderLedger::MAX_DIAGNOSTIC_ENTRIES, RenderContext::MAX_DIAGNOSTIC_ENTRIES );
 	}
 }

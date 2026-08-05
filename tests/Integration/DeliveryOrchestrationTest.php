@@ -233,12 +233,18 @@ final class DeliveryOrchestrationTest extends DeliveryTestCase {
 
 		// HELD TO THE VERIFIED-WRITE CONTRACT (ADR-0012 §3). This branch used to
 		// insert and finalise while checking neither result.
+		//
+		// ⚠ `transition` IS NULL HERE, AND THAT IS THE POINT (ADR-0015 §8.1a). A
+		// failed claim never entered the scheduled state machine, so there is no
+		// guarded write to report — the immediate path's unconditional writer is
+		// the correct mechanism for it.
 		$this->assertSame(
 			array(
 				'success'       => true,
 				'rows_expected' => 1,
 				'rows_written'  => 1,
 				'finalized'     => true,
+				'transition'    => null,
 			),
 			$result
 		);

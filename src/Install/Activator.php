@@ -64,6 +64,12 @@ final class Activator {
 		add_option( self::OPTION_SETTINGS, self::default_settings(), '', 'no' );
 		add_option( self::OPTION_REMOVE_ON_UNINSTALL, 'no', '', 'no' );
 
+		// ADR-0015 §8.3: arm the daily sweep. Idempotent, and mirrored on
+		// `admin_init` because a plugin UPDATE never runs the activation hook —
+		// an existing site would otherwise have no way to recover a stranded
+		// delivery.
+		Maintenance::ensure_scheduled();
+
 		update_option( self::OPTION_PLUGIN_VERSION, EXTONIFY_WCEP_VERSION, false );
 	}
 

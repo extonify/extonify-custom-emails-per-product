@@ -59,9 +59,16 @@ final class RunOutcome {
 	const CLAIM_FAILED = 'claim_failed';
 
 	/**
-	 * The matcher's account of the run.
+	 * A delayed rule's identity was claimed, its snapshot stored and its job
+	 * queued (ADR-0015 §1). Nothing has been sent yet, and that is the point:
+	 * `SENT` on this run would claim a delivery that is still hours away.
+	 */
+	const SCHEDULED = 'scheduled';
+
+	/**
+	 * The matcher's account of the run, or null for a scheduled execution.
 	 *
-	 * @var EvaluationResult
+	 * @var EvaluationResult|null
 	 */
 	private $evaluation;
 
@@ -73,11 +80,35 @@ final class RunOutcome {
 	private $records = array();
 
 	/**
+	 * Whether this RUN deferred, as opposed to whether one evaluation asked to.
+	 *
+	 * ⚠ THE TWO STOPPED BEING THE SAME THING IN PROMPT 7 (ADR-0015 §7). A trigger
+	 * now produces TWO evaluations — immediate and scheduled — and either may want
+	 * to defer. `deferred()` read the immediate evaluation alone, so a zero-item
+	 * order whose only rules are DELAYED queued a deferral and then reported
+	 * `deferred() === false`: a return value contradicting what the run had just
+	 * done. Recorded by the orchestrator at the moment it defers, so the answer
+	 * describes the RUN rather than one of its parts.
+	 *
+	 * @var bool
+	 */
+	private $deferred = false;
+
+	/**
 	 * Constructor.
 	 *
-	 * @param EvaluationResult $evaluation Matcher result this run delivered.
+	 * ⚠ NULL FOR A SCHEDULED EXECUTION, AND THAT IS A REAL DISTINCTION RATHER THAN
+	 * A CONVENIENCE (ADR-0015 §3). A delayed delivery's evaluation happened hours
+	 * earlier, in a different request; this run EXECUTES a decision rather than
+	 * making one, so there is no `EvaluationResult` to hand over. Manufacturing an
+	 * empty one would let a caller read "nothing matched" from a run that is
+	 * sending a message *because* something did.
+	 *
+	 * @param EvaluationResult|null $evaluation Matcher result this run delivered,
+	 *                                          or null when the run is executing a
+	 *                                          decision taken earlier.
 	 */
-	public function __construct( EvaluationResult $evaluation ) {
+	public function __construct( ?EvaluationResult $evaluation = null ) {
 		$this->evaluation = $evaluation;
 	}
 
@@ -105,9 +136,10 @@ final class RunOutcome {
 	/**
 	 * The matcher's account of this run.
 	 *
-	 * @return EvaluationResult
+	 * @return EvaluationResult|null Null when this run executed a decision taken
+	 *                               in an earlier request (ADR-0015 §3).
 	 */
-	public function evaluation(): EvaluationResult {
+	public function evaluation(): ?EvaluationResult {
 		return $this->evaluation;
 	}
 
@@ -169,12 +201,30 @@ final class RunOutcome {
 	}
 
 	/**
+	 * Record that this run deferred under ADR-0008 (ADR-0015 §7).
+	 *
+	 * @return void
+	 */
+	public function mark_deferred(): void {
+		$this->deferred = true;
+	}
+
+	/**
 	 * Whether the run was deferred under ADR-0008 rather than delivered.
+	 *
+	 * EITHER PHASE'S evaluation can produce a deferral, so this reports what the
+	 * RUN did — see self::$deferred. The evaluation is still consulted, so an
+	 * outcome built by a caller that never reached the orchestrator's deferral
+	 * branch still answers correctly.
 	 *
 	 * @return bool
 	 */
 	public function deferred(): bool {
-		return $this->evaluation->deferred();
+		if ( $this->deferred ) {
+			return true;
+		}
+
+		return null !== $this->evaluation && $this->evaluation->deferred();
 	}
 
 	/**
@@ -184,12 +234,24 @@ final class RunOutcome {
 	 */
 	public function to_array(): array {
 		return array(
-			'evaluation' => $this->evaluation->to_array(),
-			'records'    => $this->records,
-			'sent'       => $this->count_of( self::SENT ),
-			'failed'     => $this->count_of( self::FAILED ),
-			'skipped'    => $this->count_of( self::SKIPPED ),
-			'shortfalls' => count( $this->shortfalls() ),
+			'evaluation'   => null === $this->evaluation ? null : $this->evaluation->to_array(),
+			'records'      => $this->records,
+			'sent'         => $this->count_of( self::SENT ),
+			'failed'       => $this->count_of( self::FAILED ),
+			'skipped'      => $this->count_of( self::SKIPPED ),
+
+			/*
+			 * ⚠ REPORTED, NOT MERELY DEFINED. `SCHEDULED` was declared in Prompt 7
+			 * and then omitted here, so the flat form of a run that queued three
+			 * delayed deliveries read `sent 0, failed 0, skipped 0` — indistinguishable
+			 * from a run that did nothing at all. `claim_failed` joins it for the same
+			 * reason: a run whose claims all failed sent nothing, and that is a
+			 * different fact from having nothing to send.
+			 */
+			'scheduled'    => $this->count_of( self::SCHEDULED ),
+			'claim_failed' => $this->count_of( self::CLAIM_FAILED ),
+			'deferred'     => $this->deferred(),
+			'shortfalls'   => count( $this->shortfalls() ),
 		);
 	}
 }

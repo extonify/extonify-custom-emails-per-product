@@ -7,6 +7,8 @@
 
 namespace Extonify\WCEP\Render;
 
+use Extonify\WCEP\Domain\Text;
+
 defined( 'ABSPATH' ) || exit;
 
 /**
@@ -334,6 +336,15 @@ class RenderLedger {
 	 * render outcome and is recorded ALONGSIDE the message's, never instead of it
 	 * (ADR-0014 §10c).
 	 *
+	 * ⚠ WHAT `emitted = true` ACTUALLY ASSERTS, STATED EXACTLY (Prompt 7 C1):
+	 * **this plugin's output operation for that rule completed** — the string was
+	 * fully built, `echo` was reached, and `echo` returned. It does NOT assert that
+	 * a downstream output-buffer handler kept the bytes, that the web server
+	 * flushed them, or that the message WooCommerce later assembled still contained
+	 * them. Those are outside this plugin's reach, and a flag cannot honestly claim
+	 * more than the operation it observed. `Injector` therefore registers `false`
+	 * and promotes with self::mark_emitted() once the echo has returned.
+	 *
 	 * @param string $token    Render token.
 	 * @param int    $rule_id  Rule id.
 	 * @param int    $revision Rule revision, for the audit.
@@ -393,6 +404,36 @@ class RenderLedger {
 	}
 
 	/**
+	 * Promote one rule's provisional registration to `emitted` (Prompt 7 C1).
+	 *
+	 * TOKEN-AND-RULE EXACT, AND THAT IS THE WHOLE POINT. `Injector` registers with
+	 * `emitted = false` before the echo and calls this immediately after it
+	 * returns, so the flag is set by the code that watched the output operation
+	 * finish rather than by the code that intended it to. A second `register()`
+	 * call would work but reads as a re-registration, and would have to re-supply
+	 * the revision, position and notes it is not there to change.
+	 *
+	 * Returns FALSE for a token with no slot (a preview) or a rule that was never
+	 * registered against it — so a caller can use the return as its own record of
+	 * whether the promotion took, rather than assuming it did.
+	 *
+	 * @param string $token   Render token.
+	 * @param int    $rule_id Rule id.
+	 * @return bool True when a registration was promoted.
+	 */
+	public function mark_emitted( string $token, int $rule_id ): bool {
+		$index = $this->index_of( $token );
+
+		if ( $index < 0 || ! isset( $this->slots[ $index ]['rules'][ $rule_id ] ) ) {
+			return false;
+		}
+
+		$this->slots[ $index ]['rules'][ $rule_id ]['emitted'] = true;
+
+		return true;
+	}
+
+	/**
 	 * Add one note to a rule's set, EXACTLY KEYED AND CAPPED (ADR-0014 §1d).
 	 *
 	 * A DISTINCT LATER NOTE IS KEPT, NOT DROPPED. The first registration wins on
@@ -430,7 +471,14 @@ class RenderLedger {
 		}
 
 		foreach ( explode( '; ', $notes ) as $note ) {
-			$note = trim( $note );
+			/*
+			 * ⚠ CAPPED PER ENTRY, NOT ONLY PER COUNT (Prompt 7 C2). A containment
+			 * note carries a third party's exception message verbatim, which has no
+			 * length bound at all — so 20 entries could still be megabytes. Capping
+			 * BEFORE the key is taken also keeps de-duplication working on exactly
+			 * the string that gets stored.
+			 */
+			$note = Text::note_value( trim( $note ) );
 
 			if ( '' === $note || isset( $this->slots[ $index ]['rules'][ $rule_id ]['notes'][ $note ] ) ) {
 				continue;

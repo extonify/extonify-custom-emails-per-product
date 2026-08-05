@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Repository;
 
 use Extonify\WCEP\Delivery\Orchestrator;
+use Extonify\WCEP\Delivery\ScheduledCancellation;
 use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\RecipientsDocument;
 use Extonify\WCEP\Domain\Targeting;
@@ -225,7 +226,26 @@ class RuleRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key update of the plugin-owned rules table; $wpdb->update() prepares every value.
 		$updated = $wpdb->update( $this->table(), $row, array( 'id' => $rule_id ), $this->formats( $row ), array( '%d' ) );
 
-		return false !== $updated;
+		if ( false === $updated ) {
+			return false;
+		}
+
+		/**
+		 * Fires after a rule row is written (ADR-0015 §5).
+		 *
+		 * The storage boundary announces the change and knows nothing about what
+		 * anyone does with it; `Delivery\ScheduledCancellation` subscribes and
+		 * cancels the rule's pending delayed deliveries when the write took it out
+		 * of the delayed phase.
+		 *
+		 * @since 1.0.0
+		 *
+		 * @param int $rule_id The rule that was written.
+		 */
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound -- the constant IS the prefixed name (`extonify_wcep_rule_updated`); it is referenced rather than repeated so the hook this repository fires and the hook the subscriber listens on cannot drift apart.
+		do_action( ScheduledCancellation::ACTION_UPDATED, $rule_id );
+
+		return true;
 	}
 
 	/**
@@ -335,6 +355,18 @@ class RuleRepository {
 			return array();
 		}
 
+		/*
+		 * ⚠ THE ZERO DELAY BELOW IS A PHASE DISCRIMINATOR, NOT AN
+		 * UNIMPLEMENTED-BEHAVIOUR DEFAULT (ADR-0015 §7). It used to read
+		 * `delay_seconds` out of `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS`, which was true
+		 * only while no phase implemented delay. Prompt 7 implements it, so that
+		 * constant no longer carries the key — and insert mode's zero is now its OWN
+		 * requirement: ADR-0013 §2 refuses a delayed insert rule at the write
+		 * boundary, and this is the read side refusing exactly what the write side
+		 * refuses. Stated literally so the two cannot drift apart through a constant
+		 * that has come to mean something else.
+		 */
+
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned rules table.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
@@ -346,7 +378,8 @@ class RuleRepository {
 				'active',
 				'insert',
 				$native_email_id,
-				(int) Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS['delay_seconds'],
+				// The literal 0 is INSERT MODE'S OWN phase requirement — see above.
+				0,
 				Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS['consolidation']
 			),
 			ARRAY_A
@@ -604,7 +637,25 @@ class RuleRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key delete of the plugin-owned rules table.
 		$deleted = $wpdb->delete( $this->table(), array( 'id' => $rule_id ), array( '%d' ) );
 
-		return is_int( $deleted ) && $deleted > 0;
+		if ( ! is_int( $deleted ) || $deleted <= 0 ) {
+			return false;
+		}
+
+		/**
+		 * Fires after a rule row is deleted (ADR-0015 §5).
+		 *
+		 * ⚠ AFTER the delete, deliberately: a subscriber that re-reads the rule
+		 * must find it GONE, or it would decide the rule is still schedulable and
+		 * leave the queued mail in place.
+		 *
+		 * @since 1.0.0
+		 *
+		 * @param int $rule_id The rule that was deleted.
+		 */
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.DynamicHooknameFound -- the constant IS the prefixed name (`extonify_wcep_rule_deleted`); it is referenced rather than repeated so the hook this repository fires and the hook the subscriber listens on cannot drift apart.
+		do_action( ScheduledCancellation::ACTION_DELETED, $rule_id );
+
+		return true;
 	}
 
 	/**

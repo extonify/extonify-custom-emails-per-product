@@ -8,7 +8,9 @@
 namespace Extonify\WCEP;
 
 use Extonify\WCEP\Delivery\Events;
+use Extonify\WCEP\Delivery\ScheduledDelivery;
 use Extonify\WCEP\Render\RenderEvents;
+use Extonify\WCEP\Install\Maintenance;
 use Extonify\WCEP\Install\Migrator;
 use Extonify\WCEP\Privacy\Eraser;
 use Extonify\WCEP\Privacy\Exporter;
@@ -153,10 +155,25 @@ final class Plugin {
 		// the storefront guarantee, not a runtime check.
 		RenderEvents::register();
 
+		// ADR-0015 §8.3: the daily sweep that recovers deliveries no other
+		// mechanism can reach — an expired execution lease, or a `scheduled`
+		// tombstone whose job is gone. Registers the handler AND arms the action
+		// from `action_scheduler_init`, because activation and `admin_init` are
+		// both events a live store can go a long time without (§8.3c).
+		Maintenance::register();
+
 		// Admin-only concerns: schema upgrade on plugin update without
-		// reactivation, privacy-policy suggestion, degraded-mode notice.
+		// reactivation, arming the maintenance sweep on an install that upgraded
+		// rather than activated, privacy-policy suggestion, degraded-mode notice.
 		if ( is_admin() ) {
 			add_action( 'admin_init', array( Migrator::class, 'maybe_upgrade' ) );
+
+			// KEPT, AND NOW THE CACHED FORM. It is no longer the only self-heal —
+			// §8.3c made that the point — but an admin request is still the one
+			// where a merchant is present to see a notice if arming fails, and
+			// `ensure_armed()` costs an autoloaded option read rather than the
+			// scheduler query the raw call made on every admin page.
+			add_action( 'admin_init', array( Maintenance::class, 'ensure_armed' ) );
 			add_action( 'admin_init', array( $this, 'register_privacy_policy_content' ) );
 			add_action( 'admin_notices', array( $this, 'maybe_degraded_notice' ) );
 		}
@@ -186,6 +203,9 @@ final class Plugin {
 		if ( $order_id <= 0 || ! Migrator::is_operational() ) {
 			return;
 		}
+
+		$this->unschedule_pending_for_order( $order_id );
+
 		$result = $this->deliveries()->delete_for_order( $order_id );
 
 		// Cleanup is fail-closed: on failure the tombstones are deliberately
@@ -206,6 +226,48 @@ final class Plugin {
 	}
 
 	/**
+	 * Remove the queued jobs of an order about to lose its tombstones
+	 * (ADR-0015 §8.6).
+	 *
+	 * ⚠ BEFORE THE DELETE, NOT AFTER, SO NO ACTION OUTLIVES THE ROW IT POINTS AT.
+	 * A job left behind fires against a `delivery_id` that no longer resolves; it
+	 * is harmless — `run()` finds no tombstone and stops — but it is a queue entry
+	 * nobody can account for, and gate 19 asserts that every job has a row.
+	 *
+	 * An unschedule failure is LOGGED AND CLEANUP PROCEEDS. The tombstone delete is
+	 * the load-bearing half (ADR-0004: the identity's bound is the order lifetime),
+	 * and refusing to do it because a queue lookup failed would leave rows for an
+	 * order that no longer exists.
+	 *
+	 * Only IN-FLIGHT tombstones are considered. A terminal one has had its job
+	 * removed already, so asking the queue about it would be a fixed number of
+	 * lookups per historical delivery on an order that may have many.
+	 *
+	 * @param int $order_id Order id.
+	 * @return void
+	 */
+	private function unschedule_pending_for_order( int $order_id ): void {
+		foreach ( $this->deliveries()->find_for_order( $order_id ) as $tombstone ) {
+			if ( ! in_array( (string) ( $tombstone['final_status'] ?? '' ), DeliveryRepository::IN_FLIGHT_STATUSES, true ) ) {
+				continue;
+			}
+
+			try {
+				ScheduledDelivery::unschedule( (int) $tombstone['id'], $order_id );
+			} catch ( \Throwable $error ) {
+				if ( function_exists( 'wc_get_logger' ) ) {
+					wc_get_logger()->error(
+						'could not unschedule the queued job for delivery #' . (int) $tombstone['id']
+							. ' while deleting order #' . $order_id . '; cleanup continued — '
+							. get_class( $error ) . ': ' . $error->getMessage(),
+						array( 'source' => 'extonify-wcep' )
+					);
+				}
+			}
+		}
+	}
+
+	/**
 	 * Suggested privacy-policy text.
 	 *
 	 * @return void
@@ -217,7 +279,14 @@ final class Plugin {
 		wp_add_privacy_policy_content(
 			__( 'Extonify Custom Emails Per Product for WooCommerce', 'extonify-custom-emails-per-product' ),
 			wp_kses_post(
-				'<p>' . __( 'When this site sends you a product-specific order email, it records the delivery locally in this site&#8217;s database so that unintended duplicate automatic deliveries are prevented. The record of what was sent — the recipient address, subject line and any delivery failure details — is kept for a limited retention period and is included in personal-data export and erasure requests. A smaller record that the email was already delivered for your order, holding no address or message content, is kept for longer, so that a later change to your order does not trigger the same automatic email again. A store administrator can still deliberately resend an email to you.', 'extonify-custom-emails-per-product' ) . '</p>'
+				// ⚠ THE PENDING-DELIVERY SENTENCE IS NOT OPTIONAL (ADR-0015 §2a).
+				// "holding no address or message content" was true of every tombstone
+				// until delayed delivery shipped; a tombstone waiting for its job now
+				// carries the store's unrendered templates and recipient definitions,
+				// released at the terminal state. A public privacy notice that a
+				// reader cannot check has to be kept true by whoever changes what it
+				// describes.
+				'<p>' . __( 'When this site sends you a product-specific order email, it records the delivery locally in this site&#8217;s database so that unintended duplicate automatic deliveries are prevented. The record of what was sent — the recipient address, subject line and any delivery failure details — is kept for a limited retention period and is included in personal-data export and erasure requests. A smaller record that the email was already delivered for your order, holding no address or message content, is kept for longer, so that a later change to your order does not trigger the same automatic email again. Where the store has set up an email to be sent to you after a delay, that smaller record also temporarily holds the store&#8217;s own unsent template text and recipient settings for that message, until the email is sent or cancelled. A store administrator can still deliberately resend an email to you.', 'extonify-custom-emails-per-product' ) . '</p>'
 			)
 		);
 	}

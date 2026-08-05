@@ -58,6 +58,12 @@ class Events {
 		add_action( 'woocommerce_order_partially_refunded', array( self::class, 'on_refunded' ), 10, 2 );
 
 		DeferredEvaluation::register();
+
+		// ADR-0015: delayed delivery. The job handler executes a delivery claimed
+		// and snapshotted hours earlier; the cancellation subscriber stops a rule's
+		// queued mail the moment the merchant disables or deletes it.
+		ScheduledDelivery::register();
+		ScheduledCancellation::register();
 	}
 
 	/**

@@ -7,15 +7,18 @@
 
 namespace Extonify\WCEP\Delivery;
 
+use Extonify\WCEP\Domain\DeliverySnapshot;
 use Extonify\WCEP\Domain\EvaluationResult;
 use Extonify\WCEP\Domain\MatchDecision;
 use Extonify\WCEP\Domain\PlaceholderSyntax;
 use Extonify\WCEP\Domain\TriggerEvent;
+use Extonify\WCEP\Domain\WriteResult;
 use Extonify\WCEP\Email\Custom_Email;
 use Extonify\WCEP\Email\EmailIdentity;
 use Extonify\WCEP\Install\Migrator;
 use Extonify\WCEP\Matching\OrderStatuses;
 use Extonify\WCEP\Matching\RuleMatcher;
+use Extonify\WCEP\Repository\DeliveryRepository;
 use Extonify\WCEP\Repository\RuleRepository;
 
 defined( 'ABSPATH' ) || exit;
@@ -264,9 +267,24 @@ class Orchestrator {
 		 * The fetch is skipped entirely for an event that cannot trigger, so a
 		 * non-triggering status change still costs no query.
 		 */
-		$rules = self::deliverable_in_this_phase(
-			null !== $rules ? $rules : $this->fetch_rules( $event )
-		);
+		$candidates = null !== $rules ? $rules : $this->fetch_rules( $event );
+
+		/*
+		 * ⚠ THE DELAYED PHASE IS EVALUATED SEPARATELY, FROM THE SAME FETCH
+		 * (ADR-0015 §7). One query, two phases — and they must be two, because
+		 * `stop_processing` is phase-local: a delayed rule halting the immediate
+		 * rules (or the reverse) would make one merchant's scheduling choice
+		 * silently suppress deliveries in the other phase.
+		 *
+		 * The second evaluation costs NO extra queries. `RuleMatcher` re-resolves
+		 * the order, and re-resolution is free: `WC_Order::get_items()` is memoised
+		 * on the order object and the item meta is already in the cache by then
+		 * (measured in Prompt 4C when the order-contents cache was removed, and
+		 * measured again by this prompt's query gate).
+		 */
+		$scheduled_rules = ScheduledPhase::deliverable_in_this_phase( $candidates );
+
+		$rules = self::deliverable_in_this_phase( $candidates );
 
 		/*
 		 * THE RULE SNAPSHOT IS A LOCAL, NOT A PROPERTY (ADR-0012 §11).
@@ -286,7 +304,20 @@ class Orchestrator {
 		$result  = $this->matcher->evaluate( $order, $event, $rules );
 		$outcome = new RunOutcome( $result );
 
-		if ( $result->deferred() ) {
+		// ⚠ EITHER PHASE MAY WANT TO DEFER (ADR-0008, ADR-0015 §7). A zero-item
+		// order with only DELAYED rules used to be evaluated as "nothing matched",
+		// so its delayed email was silently never scheduled — the same defect
+		// Prompt 4B fixed for the immediate phase, in the phase that did not exist
+		// yet. The deferral is still ONE job, and the deferred run redoes both.
+		$scheduled_result = array() === $scheduled_rules
+			? null
+			: $this->matcher->evaluate( $order, $event, $scheduled_rules );
+
+		if ( $result->deferred() || ( null !== $scheduled_result && $scheduled_result->deferred() ) ) {
+			// RECORDED ON THE RUN, not inferred from one phase's evaluation: either
+			// can produce the deferral, and the caller asked what the RUN did.
+			$outcome->mark_deferred();
+
 			// ADR-0008: zero line items is not evidence that nothing matches.
 			// Claim NOTHING — the identity is preserved for the deferred run,
 			// and claiming here would make that run's claim a duplicate.
@@ -303,6 +334,10 @@ class Orchestrator {
 		}
 
 		$this->deliver( $order, $result, $snapshot, $outcome );
+
+		if ( null !== $scheduled_result ) {
+			$this->schedule_delayed( $order, $scheduled_result, self::snapshot_by_id( $scheduled_rules ), $outcome );
+		}
 
 		return $outcome;
 	}
@@ -429,6 +464,441 @@ class Orchestrator {
 	}
 
 	/**
+	 * Claim, snapshot and QUEUE every delayed rule that matched (ADR-0015 §1).
+	 *
+	 * THE CLAIM HAPPENS HERE, NOT WHEN THE JOB RUNS, and that is the decision
+	 * ADR-0015 §1 exists to record. ADR-0004's atomic claim is the only mechanism
+	 * preventing a duplicate send, and the duplicate it has to prevent is the
+	 * TRIGGER firing twice before either job runs. Claiming at execution would
+	 * leave nothing between those two triggers to say a delivery was already owed.
+	 *
+	 * ⚠ AND A SCHEDULING FAILURE CANCELS THE DELIVERY IT COULD NOT QUEUE. The
+	 * identity is consumed by then — so leaving the tombstone `scheduled` with no
+	 * job behind it would strand it forever in a state that reads as "in progress",
+	 * with no queue entry anyone could find. `cancelled` with the failure recorded
+	 * is the truthful terminal state, and it is loud (ADR-0015 §6): a delivery that
+	 * silently never scheduled is a lost email, and the one thing it must never be
+	 * mistaken for is a duplicate correctly suppressed.
+	 *
+	 * @param \WC_Order        $order    Order.
+	 * @param EvaluationResult $result   Evaluation of the DELAYED rule set.
+	 * @param array<int,array> $snapshot Those rule rows, keyed by id.
+	 * @param RunOutcome       $outcome  THIS run's outcome, collected into.
+	 * @return void
+	 */
+	private function schedule_delayed( \WC_Order $order, EvaluationResult $result, array $snapshot, RunOutcome $outcome ): void {
+		if ( array() === $result->decisions() ) {
+			return;
+		}
+
+		$order_id = (int) $order->get_id();
+		$identity = $result->trigger_identity();
+		$email    = $this->email();
+
+		// The same two pre-claim gates the immediate phase applies, for the same
+		// reasons (ADR-0012 §5): nothing is consumed while the feature is off.
+		if ( null === $email ) {
+			$this->logger->record_inert( $order_id, $identity, 'the custom email class is not registered with WooCommerce' );
+			return;
+		}
+
+		if ( ! $email->is_globally_enabled() ) {
+			$this->logger->record_inert( $order_id, $identity, 'custom product emails are switched off in WooCommerce settings' );
+			return;
+		}
+
+		foreach ( $result->decisions() as $decision ) {
+			$reason = $decision->reason();
+
+			if ( ! DeliveryLogger::consumes_identity( $reason ) ) {
+				continue;
+			}
+
+			$rule = $snapshot[ $decision->rule_id() ] ?? null;
+
+			if ( null === $rule ) {
+				continue;
+			}
+
+			$claim = $this->logger->claim( $order_id, $decision->rule_id(), $identity, (int) ( $rule['revision'] ?? 0 ) );
+
+			if ( \Extonify\WCEP\Repository\DeliveryRepository::FAILED === $claim['result'] ) {
+				// FAIL CLOSED (ADR-0012 §3): never queue on a failed claim.
+				$outcome->record(
+					RunOutcome::CLAIM_FAILED,
+					$decision->rule_id(),
+					(int) ( $claim['delivery_id'] ?? 0 ),
+					$this->logger->record_claim_failure( $claim, $order_id, $decision->rule_id(), $reason )
+				);
+				continue;
+			}
+
+			if ( \Extonify\WCEP\Repository\DeliveryRepository::SUPPRESSED === $claim['result'] ) {
+				// ⚠ THE IDEMPOTENCY GUARANTEE, AND IT IS THE CLAIM THAT PROVIDES IT
+				// (ADR-0015 §6). The same trigger firing twice reaches here the
+				// second time, queues NOTHING, and the counter has already
+				// incremented atomically inside claim().
+				continue;
+			}
+
+			if ( MatchDecision::MATCHED !== $reason ) {
+				$outcome->record(
+					RunOutcome::SKIPPED,
+					$decision->rule_id(),
+					(int) $claim['delivery_id'],
+					$this->logger->record_skip( $claim, $reason )
+				);
+				continue;
+			}
+
+			$this->queue( $order_id, $rule, $decision, $claim, $identity, $outcome );
+		}
+	}
+
+	/**
+	 * Snapshot one matched delayed rule and put its job on the queue, contained.
+	 *
+	 * @param int           $order_id Order id.
+	 * @param array         $rule     The rule row the matcher decided on.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $claim    Claim result.
+	 * @param string        $identity Trigger identity.
+	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
+	 * @return void
+	 */
+	private function queue( int $order_id, array $rule, MatchDecision $decision, array $claim, string $identity, RunOutcome $outcome ): void {
+		/*
+		 * ⚠ THE CONTAINMENT BOUNDARY FOR THE SCHEDULING PATH (ADR-0015 §8.5).
+		 *
+		 * Everything below runs AFTER the identity is claimed and inside
+		 * `woocommerce_order_status_changed`. Action Scheduler is a database-backed
+		 * queue with its own tables, its own filters and — through
+		 * `action_scheduler_pre_*` and the store's own hooks — third-party code; a
+		 * throw from any of it used to escape into the merchant's status change,
+		 * breaking the order update AND leaving the tombstone `scheduled` with no
+		 * job, no reason and a consumed identity.
+		 *
+		 * That is the same failure `attempt()` has been contained against since
+		 * Prompt 4a, reached through the phase that did not exist then.
+		 */
+		try {
+			$this->queue_contained( $order_id, $rule, $decision, $claim, $identity, $outcome );
+		} catch ( \Throwable $error ) {
+			$this->record_queue_failure( $order_id, $decision, $claim, $error, $outcome );
+		}
+	}
+
+	/**
+	 * Recover from a throw during scheduling, without letting it escape
+	 * (ADR-0015 §8.5).
+	 *
+	 * TWO OUTCOMES, DECIDED BY WHETHER A JOB ACTUALLY EXISTS — never by where the
+	 * throw appeared to come from. `as_schedule_single_action()` can create the
+	 * action and then throw on the way back, so "it threw" and "nothing was queued"
+	 * are independent facts and only the queue can be asked which happened:
+	 *
+	 *   - a job EXISTS: the delivery is genuinely owed. The tombstone keeps
+	 *     `scheduled`, the snapshot stays, and the diagnostic shortfall is
+	 *     recorded — nothing is lost, only the record of it is incomplete.
+	 *   - NO job exists: the identity is consumed with nothing behind it, so the
+	 *     tombstone transitions to a terminal state and the snapshot is released.
+	 *
+	 * @param int           $order_id Order id.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $claim    Claim result.
+	 * @param \Throwable    $error    What was thrown.
+	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
+	 * @return void
+	 */
+	private function record_queue_failure( int $order_id, MatchDecision $decision, array $claim, \Throwable $error, RunOutcome $outcome ): void {
+		$delivery_id = (int) ( $claim['delivery_id'] ?? 0 );
+		$message     = get_class( $error ) . ': ' . $error->getMessage();
+
+		try {
+			if ( ScheduledDelivery::has_any_job( $delivery_id, $order_id ) ) {
+				$this->logger->record_inert(
+					$order_id,
+					'delivery #' . $delivery_id,
+					'scheduling threw AFTER the job was queued, so the delivery still stands but its record is '
+						. 'incomplete — ' . $message
+				);
+				$outcome->record( RunOutcome::SCHEDULED, $decision->rule_id(), $delivery_id, self::inert_result() );
+				return;
+			}
+
+			$outcome->record(
+				RunOutcome::FAILED,
+				$decision->rule_id(),
+				$delivery_id,
+				// ⚠ NOT `record_scheduled_cancellation()`: the throw may have beaten
+				// the arm, leaving the row `claimed` rather than `scheduled`. That
+				// method takes ONE source state, and picking either would strand the
+				// other (ADR-0015 §8.5).
+				$this->logger->record_schedule_throw( $delivery_id, $message )
+			);
+		} catch ( \Throwable $while_recording ) {
+			/*
+			 * ⚠ THE CATCH ITSELF MUST NOT THROW. Escaping here would break the
+			 * merchant's status change for the sake of a log row — the same inversion
+			 * `send()`'s boundary guards against.
+			 */
+			$this->logger->record_inert(
+				$order_id,
+				'delivery #' . $delivery_id,
+				'recording a contained scheduling failure ALSO threw: ' . get_class( $while_recording )
+					. ': ' . $while_recording->getMessage() . ' (original: ' . $message . ')'
+			);
+		}
+	}
+
+	/**
+	 * Snapshot one matched delayed rule and put its job on the queue, inside
+	 * self::queue()'s containment boundary.
+	 *
+	 * @param int           $order_id Order id.
+	 * @param array         $rule     The rule row the matcher decided on.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $claim    Claim result.
+	 * @param string        $identity Trigger identity.
+	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
+	 * @return void
+	 */
+	private function queue_contained( int $order_id, array $rule, MatchDecision $decision, array $claim, string $identity, RunOutcome $outcome ): void {
+		$delivery_id   = (int) $claim['delivery_id'];
+		$delay         = (int) ( $rule['delay_seconds'] ?? 0 );
+		$scheduled_for = time() + $delay;
+
+		// ADR-0015 §2a: templates, definitions and ids. Built from the row the
+		// MATCHER used, never a re-read (ADR-0012 §10).
+		$snapshot = DeliverySnapshot::create( $rule, $decision->matched_items(), $identity, $scheduled_for );
+
+		$armed = $this->logger->record_scheduled( $claim, $snapshot, $scheduled_for );
+
+		if ( ! $armed->won() ) {
+			// ⚠ NOT AN INERT SKIP (ADR-0015 §8.1a, Prompt 7B A1). This branch used to
+			// treat every non-arm as harmless on the reasoning that a job whose
+			// tombstone is not `scheduled` would stop anyway — which is true, and
+			// says nothing about the case where THERE IS NO JOB. A database failure
+			// that throws nothing lands here with the identity claimed, the tombstone
+			// `claimed`, no job, no detail row, and nothing for the maintenance sweep
+			// to find, because the sweep looks for `scheduled` rows. Every later
+			// trigger for that identity is then suppressed by a delivery that will
+			// never happen. The recovery added for a THROW before arming does not
+			// cover a returned failure.
+			$this->record_arm_shortfall( $order_id, $decision, $delivery_id, $armed, $outcome );
+			return;
+		}
+
+		$queued = ScheduledDelivery::schedule( $delivery_id, $order_id, $scheduled_for );
+
+		if ( ScheduledDelivery::SCHEDULED === $queued['result'] || ScheduledDelivery::ALREADY_PENDING === $queued['result'] ) {
+			$outcome->record(
+				RunOutcome::SCHEDULED,
+				$decision->rule_id(),
+				$delivery_id,
+				$this->logger->record_schedule_outcome( $delivery_id, $queued, $scheduled_for, $delay )
+			);
+			return;
+		}
+
+		// ⚠ NOTHING IS QUEUED AND THE IDENTITY IS ALREADY CONSUMED. Cancel, loudly.
+		$outcome->record(
+			RunOutcome::FAILED,
+			$decision->rule_id(),
+			$delivery_id,
+			$this->logger->record_schedule_failure( $delivery_id, $queued )
+		);
+	}
+
+	/**
+	 * Act on an ARM that did not take the row (ADR-0015 §8.1a).
+	 *
+	 * ⚠ THE ROW DECIDES, NOT THE WRITE. Whether this delivery is stranded depends on
+	 * what the tombstone holds NOW, and the four answers need four different
+	 * actions — which is the whole reason `arm_scheduled()` stopped returning a
+	 * boolean:
+	 *
+	 *   - **still `claimed`** — nobody armed it and nothing is queued. The identity
+	 *     is consumed with nothing behind it, so it is terminalised with
+	 *     `arm_failed`: a delivery that will not happen must not sit in a state that
+	 *     claims it is about to.
+	 *   - **missing** — order cleanup deleted the tombstone between the claim and
+	 *     here (ADR-0004). Inert: there is nothing to record onto and nothing owed.
+	 *   - **already terminal** — somebody else recorded an outcome. NOT overwritten:
+	 *     the later write would replace a truthful state with a guess.
+	 *   - **`scheduled` or `executing`** — another actor armed it first and owns
+	 *     queueing it. Queueing a second job here would be this request acting on a
+	 *     delivery it does not own.
+	 *
+	 * A read that FAILS is its own fifth case and is treated as "do not touch": the
+	 * state is unknown, and the §8.3 sweep reaches a `scheduled` row on its own.
+	 *
+	 * @param int           $order_id    Order id.
+	 * @param MatchDecision $decision    The matched decision.
+	 * @param int           $delivery_id Tombstone id.
+	 * @param WriteResult   $armed       What the arm reported.
+	 * @param RunOutcome    $outcome     THIS run's outcome, collected into.
+	 * @return void
+	 */
+	private function record_arm_shortfall( int $order_id, MatchDecision $decision, int $delivery_id, WriteResult $armed, RunOutcome $outcome ): void {
+		$probe  = $this->logger->deliveries()->inspect( $delivery_id );
+		$status = (string) $probe['status'];
+
+		if ( ! (bool) $probe['known'] ) {
+			$this->logger->record_inert(
+				$order_id,
+				'delivery #' . $delivery_id,
+				'arming this delayed delivery failed (' . $armed->describe() . ') and its state could not be read '
+					. 'afterwards, so nothing was written; the daily maintenance sweep is the backstop'
+			);
+			$outcome->record( RunOutcome::FAILED, $decision->rule_id(), $delivery_id, self::inert_result() );
+			return;
+		}
+
+		if ( ! (bool) $probe['exists'] ) {
+			$this->logger->record_inert(
+				$order_id,
+				'delivery #' . $delivery_id,
+				'arming this delayed delivery found no tombstone, so the order was deleted while it was being '
+					. 'scheduled and nothing is owed'
+			);
+			$outcome->record( RunOutcome::SKIPPED, $decision->rule_id(), $delivery_id, self::inert_result() );
+			return;
+		}
+
+		if ( DeliveryRepository::CLAIMED === $status ) {
+			$outcome->record(
+				RunOutcome::FAILED,
+				$decision->rule_id(),
+				$delivery_id,
+				$this->logger->record_arm_failure( $delivery_id, $armed->describe() )
+			);
+			return;
+		}
+
+		if ( in_array( $status, DeliveryRepository::PENDING_SCHEDULED_STATUSES, true ) ) {
+			$this->logger->record_inert(
+				$order_id,
+				'delivery #' . $delivery_id,
+				'another request armed this delayed delivery first (it is "' . $status . '"), so this one queued nothing'
+			);
+			$outcome->record( RunOutcome::SCHEDULED, $decision->rule_id(), $delivery_id, self::inert_result() );
+			return;
+		}
+
+		$this->logger->record_inert(
+			$order_id,
+			'delivery #' . $delivery_id,
+			'this delayed delivery was already "' . $status . '" when arming ran, so its recorded outcome was left alone'
+		);
+		$outcome->record( RunOutcome::SKIPPED, $decision->rule_id(), $delivery_id, self::inert_result() );
+	}
+
+	/**
+	 * The structured result used when a write was deliberately not attempted.
+	 *
+	 * @return array
+	 */
+	private static function inert_result(): array {
+		return array(
+			'success'       => false,
+			'rows_expected' => 1,
+			'rows_written'  => 0,
+			'finalized'     => false,
+			'transition'    => null,
+		);
+	}
+
+	/**
+	 * Send a delivery the SCHEDULED phase queued earlier (ADR-0015 §3).
+	 *
+	 * ⚠ IT REUSES `attempt()` AND ITS CONTAINMENT BOUNDARY RATHER THAN REPEATING
+	 * THEM. A scheduled send runs the same third-party code an immediate one does
+	 * — recipient resolution, WooCommerce's formatters, this plugin's own meta
+	 * filter — so it needs the same boundary; and a second implementation of
+	 * "resolve, send, record" is a second place for the two to disagree about what
+	 * a delivery is. The differences are entirely in the ARGUMENTS: the rule row
+	 * carries snapshotted content, and the identity is already claimed.
+	 *
+	 * @param \WC_Order $order         Live order.
+	 * @param array     $rule          Rule row built from the snapshot.
+	 * @param array[]   $matched_items The snapshotted items that survived §4.
+	 * @param int       $delivery_id   Tombstone id, already `scheduled`.
+	 * @param int       $revision      Snapshotted revision, recorded on send.
+	 * @param string    $identity      Trigger identity this delivery was claimed
+	 *                                 under.
+	 * @return RunOutcome|null Null when orchestration was inert.
+	 */
+	public function send_scheduled( \WC_Order $order, array $rule, array $matched_items, int $delivery_id, int $revision, string $identity = '' ): ?RunOutcome {
+		if ( ! self::is_operational() ) {
+			return null;
+		}
+
+		$email = $this->email();
+
+		if ( null === $email ) {
+			// ⚠ TERMINAL, NOT AN INERT LOG (ADR-0015 §8.4). The identity was consumed
+			// at scheduling time and this run holds the lease, so a bare return left
+			// the tombstone `executing` with its job spent and nothing able to reach
+			// it again except the §8.3 sweep an hour later.
+			$this->logger->record_inert( (int) $order->get_id(), 'delivery #' . $delivery_id, 'the custom email class is not registered with WooCommerce' );
+			$this->logger->record_scheduled_cancellation(
+				$delivery_id,
+				ScheduledDelivery::REASON_EMAIL_UNAVAILABLE,
+				ScheduledDelivery::reason_text( ScheduledDelivery::REASON_EMAIL_UNAVAILABLE ),
+				\Extonify\WCEP\Repository\DeliveryRepository::EXECUTING
+			);
+			return null;
+		}
+
+		if ( ! $email->is_globally_enabled() ) {
+			// ⚠ A TERMINAL SKIP, NOT A SILENT RETURN. The identity was consumed at
+			// scheduling time, so returning without recording would leave the
+			// tombstone in flight for ever. The immediate phase can return
+			// silently here because it has not claimed yet; this one cannot.
+			$this->logger->record_scheduled_cancellation(
+				$delivery_id,
+				'globally_disabled',
+				'custom product emails were switched off in WooCommerce settings before this delayed delivery ran',
+				\Extonify\WCEP\Repository\DeliveryRepository::EXECUTING
+			);
+			return null;
+		}
+
+		$decision = MatchDecision::create( (int) $rule['id'], MatchDecision::MATCHED, $identity, $matched_items );
+
+		// No `EvaluationResult`: this run EXECUTES a decision taken hours ago in a
+		// different request rather than making one (ADR-0015 §3).
+		$outcome = new RunOutcome();
+
+		$this->send(
+			$order,
+			$email,
+			$rule,
+			$decision,
+			array(
+				'result'          => \Extonify\WCEP\Repository\DeliveryRepository::CLAIMED,
+				'delivery_id'     => $delivery_id,
+
+				/*
+				 * ⚠ THE ONE FIELD THAT MAKES THE SHARED SEND PATH SAFE FOR A DELAYED
+				 * DELIVERY (ADR-0015 §8.1). `send()` and `attempt()` serve both
+				 * phases, and every terminal write they reach must be CONDITIONAL for
+				 * this one — otherwise a `sent` tombstone could be overwritten by a
+				 * cancellation, or the reverse. Carrying it on the claim means the
+				 * shared code does the right thing without knowing which phase called
+				 * it, and its absence is what marks the immediate path.
+				 */
+				'transition_from' => \Extonify\WCEP\Repository\DeliveryRepository::EXECUTING,
+			),
+			array( 'scheduled' => array( 'revision' => $revision ) ),
+			$outcome
+		);
+
+		return $outcome;
+	}
+
+	/**
 	 * THE CONTAINMENT BOUNDARY: everything that happens after the identity is
 	 * claimed runs inside it (ADR-0014 §10).
 	 *
@@ -510,7 +980,10 @@ class Orchestrator {
 						// PARTIAL NOTES INCLUDED (ADR-0014 §1c) — whatever resolution
 						// had recorded by the moment it threw.
 						self::notes_for( $state ),
-						$snapshot
+						$snapshot,
+						// ADR-0015 §8.1: conditional on the lease for a delayed
+						// delivery, unconditional for an immediate one.
+						DeliveryLogger::transition_from( $claim )
 					)
 				);
 			} catch ( \Throwable $while_recording ) {
@@ -731,7 +1204,9 @@ class Orchestrator {
 			$sent ? RunOutcome::SENT : RunOutcome::FAILED,
 			$decision->rule_id(),
 			$delivery_id,
-			$this->logger->record_send( $delivery_id, $recipients, $subject, $sent, $notes, $snapshot )
+			// ADR-0015 §8.1: `executing -> sent|failed` for a delayed delivery, an
+			// unconditional write for an immediate one.
+			$this->logger->record_send( $delivery_id, $recipients, $subject, $sent, $notes, $snapshot, DeliveryLogger::transition_from( $claim ) )
 		);
 
 		// ⚠ AFTER THE RECORD, NOT AFTER THE SEND. A throw from the recording itself
@@ -823,19 +1298,25 @@ class Orchestrator {
 	/**
 	 * Keep only the rules THIS PHASE delivers (ADR-0012 §9).
 	 *
-	 * A TEMPORARY, DELIBERATE BOUNDARY, not a permanent rule. Prompt 5 claims
-	 * insert rules under `mode = 'insert'` and Prompt 6 owns delayed rules; until
-	 * then a rule belonging to either must be left ENTIRELY untouched, because
-	 * the alternative is what this filter exists to stop: a rule the merchant
-	 * configured as INSERT being claimed under `mode = separate` and delivered to
-	 * the customer as a standalone email — content meant to appear inside their
-	 * normal order email arriving as a surprise message, under an identity the
-	 * rule never had.
+	 * A DELIBERATE BOUNDARY, not an incidental one. A rule belonging to another
+	 * phase must be left ENTIRELY untouched here, because the alternative is what
+	 * this filter exists to stop: a rule the merchant configured as INSERT being
+	 * claimed under `mode = separate` and delivered to the customer as a standalone
+	 * email — content meant to appear inside their normal order email arriving as a
+	 * surprise message, under an identity the rule never had.
 	 *
 	 * An unfiltered rule is therefore a DEFECT, never a default.
 	 *
-	 * THE FILTER COVERS EVERY COLUMN WHOSE BEHAVIOUR IS UNIMPLEMENTED, and the list
-	 * is maintained as such rather than grown one incident at a time
+	 * ⚠ THIS PHASE IS NOW `separate` + **`delay_seconds = 0`** (ADR-0015 §7).
+	 * `delay_seconds` used to be an UNIMPLEMENTED-behaviour column, excluded from
+	 * every phase; Prompt 7 implements it, so a non-zero delay is no longer
+	 * "nobody's" — it is `ScheduledPhase`'s. The zero check moves here, into the
+	 * phase definition, and stays explicit: dropping it would make this phase send
+	 * a delayed rule immediately, which is the behaviour of `delay = 0` under
+	 * another name.
+	 *
+	 * THE UNIMPLEMENTED-BEHAVIOUR LIST COVERS WHAT IS STILL UNOWNED, and is
+	 * maintained as a list rather than grown one incident at a time
 	 * (self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS). ⚠ `consolidation` was missing until
 	 * Prompt 5C: Prompt 5B gave it validated storage, so a merchant could store
 	 * `daily` and have the rule delivered **immediately, once per trigger**, which is
@@ -854,6 +1335,13 @@ class Orchestrator {
 				continue;
 			}
 
+			// THE IMMEDIATE PHASE IS THE ZERO-DELAY ONE (ADR-0015 §7). A delayed
+			// rule belongs to `ScheduledPhase` and must not also be sent here, or
+			// the customer gets it twice — once now and once when the job runs.
+			if ( 0 !== (int) ( $rule['delay_seconds'] ?? 0 ) ) {
+				continue;
+			}
+
 			if ( ! self::behaviour_is_implemented( $rule ) ) {
 				continue;
 			}
@@ -866,19 +1354,25 @@ class Orchestrator {
 
 	/**
 	 * Columns carrying behaviour no phase implements yet, with the ONLY value each
-	 * may hold to be deliverable (ADR-0012 §9, ADR-0013 §8a).
+	 * may hold to be deliverable (ADR-0012 §9, ADR-0013 §8a, ADR-0015 §7).
 	 *
 	 * | Column | Deliverable value | Owner |
 	 * |---|---|---|
-	 * | `delay_seconds` | `0` | Prompt 6 — ADR-0007 scheduling |
 	 * | `consolidation` | `none` | a later prompt — ADR-0005 consolidation |
 	 *
-	 * A rule holding anything else is left ENTIRELY untouched by both phases: no
-	 * claim, no send, no record, and — because the filter runs BEFORE evaluation —
-	 * no halt of a supported rule through its `stop_processing` flag.
+	 * A rule holding anything else is left ENTIRELY untouched by EVERY phase: no
+	 * claim, no send, no schedule, no record, and — because the filter runs BEFORE
+	 * evaluation — no halt of a supported rule through its `stop_processing` flag.
+	 *
+	 * ⚠ `delay_seconds` WAS REMOVED FROM THIS LIST IN PROMPT 7, and the removal is
+	 * an explicit, asserted change rather than a silently weakened check
+	 * (ADR-0015 §7). It is now a PHASE DISCRIMINATOR — `0` for the immediate
+	 * phase, `> 0` for `ScheduledPhase` — which is a different kind of fact from
+	 * "no code implements this yet". The enumeration test asserts this list
+	 * exactly, so a future addition or removal has to be written down by whoever
+	 * makes it; that discipline is what caught `consolidation`.
 	 */
 	const UNIMPLEMENTED_BEHAVIOUR_DEFAULTS = array(
-		'delay_seconds' => '0',
 		'consolidation' => 'none',
 	);
 

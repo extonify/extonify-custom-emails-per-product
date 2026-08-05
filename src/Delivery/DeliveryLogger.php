@@ -11,6 +11,7 @@ use Extonify\WCEP\Domain\DeliveryIdentity;
 use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\MatchDecision;
 use Extonify\WCEP\Domain\Text;
+use Extonify\WCEP\Domain\WriteResult;
 use Extonify\WCEP\Repository\DeliveryDetailRepository;
 use Extonify\WCEP\Repository\DeliveryRepository;
 
@@ -205,19 +206,151 @@ class DeliveryLogger {
 	 * left the tombstone `claimed` forever while the consumed identity blocked
 	 * every retry. Both failures were silent, and both are now reported.
 	 *
-	 * @param bool $success       Whether everything intended was written.
-	 * @param int  $rows_expected Rows that should have been written.
-	 * @param int  $rows_written  Rows actually written.
-	 * @param bool $finalized     Whether the tombstone reached its terminal status.
-	 * @return array{success:bool,rows_expected:int,rows_written:int,finalized:bool}
+	 * ⚠ `finalized` IS THE KEY A LIFECYCLE CALLER MUST GATE ON, NOT `success`
+	 * (ADR-0015 §8.1a). It answers "does the tombstone hold a terminal status now",
+	 * which is the question "may I remove this delivery's job" reduces to. `success`
+	 * is stricter and different — it also requires every DETAIL row to have been
+	 * written — and gating an unschedule on it would leave a live job behind for a
+	 * delivery that really is terminal.
+	 *
+	 * `transition` carries the underlying `WriteResult` when there was one, so a
+	 * caller can tell a lost race from a failed write without a second read.
+	 *
+	 * @param bool             $success       Whether everything intended was written.
+	 * @param int              $rows_expected Rows that should have been written.
+	 * @param int              $rows_written  Rows actually written.
+	 * @param bool             $finalized     Whether the tombstone holds a terminal status.
+	 * @param WriteResult|null $transition    The guarded write's own outcome, when there was one.
+	 * @return array{success:bool,rows_expected:int,rows_written:int,finalized:bool,transition:WriteResult|null}
 	 */
-	private static function result( bool $success, int $rows_expected, int $rows_written, bool $finalized ): array {
+	private static function result( bool $success, int $rows_expected, int $rows_written, bool $finalized, ?WriteResult $transition = null ): array {
 		return array(
 			'success'       => $success,
 			'rows_expected' => $rows_expected,
 			'rows_written'  => $rows_written,
 			'finalized'     => $finalized,
+			'transition'    => $transition,
 		);
+	}
+
+	/**
+	 * Record a guarded write that did NOT take ownership, as its own diagnostic
+	 * (ADR-0015 §8.1a, Prompt 7B Tier 2).
+	 *
+	 * ⚠ NOT AS THE DELIVERY'S OUTCOME. A recorder that loses the transition has
+	 * learned something about ITS ATTEMPT, not about the delivery — the delivery's
+	 * outcome belongs to whoever won — so this writes to the log and never to the
+	 * attempt rows.
+	 *
+	 * Two levels, because the two facts differ in kind: a lost race is the
+	 * concurrency design working, and a failed or refused write is a delivery that
+	 * may now be owed to nobody.
+	 *
+	 * @param int              $delivery_id Tombstone id.
+	 * @param string           $what        What was being recorded.
+	 * @param WriteResult|null $write       The write that did not win.
+	 * @return void
+	 */
+	private function record_lost_transition( int $delivery_id, string $what, ?WriteResult $write ): void {
+		$described = $write instanceof WriteResult ? $write->describe() : 'no write attempted';
+
+		if ( null === $write || $write->is_shortfall() ) {
+			$this->log_error(
+				'delivery #' . $delivery_id . ': ' . $what . ' could not be written (' . $described
+					. '), so nothing was recorded and no other actor took ownership of this delivery'
+			);
+			return;
+		}
+
+		$this->log_notice(
+			'delivery #' . $delivery_id . ': ' . $what . ' did not take ownership (' . $described
+				. '), so its outcome was left to whoever did'
+		);
+	}
+
+	/**
+	 * The shape self::finalize() reports, for callers that did not attempt one.
+	 *
+	 * @param bool             $terminal Whether the tombstone holds a terminal status.
+	 * @param WriteResult|null $write    The guarded write's outcome, when there was one.
+	 * @return array{write:WriteResult|null,terminal:bool}
+	 */
+	private static function finalization( bool $terminal, ?WriteResult $write = null ): array {
+		return array(
+			'write'    => $write,
+			'terminal' => $terminal,
+		);
+	}
+
+	/**
+	 * Write a tombstone's terminal status through the right mechanism for its
+	 * path (ADR-0015 §8.1).
+	 *
+	 * ⚠ TWO MECHANISMS, AND WHICH ONE IS CORRECT IS A PROPERTY OF THE CALLER, NOT
+	 * OF THE STATUS. The immediate path owns its tombstone from `claimed` to
+	 * terminal inside one request with no second actor, so an unconditional write
+	 * is right. A delayed one is contended by definition — a queue worker, a
+	 * merchant disabling the rule, a stale-lease sweep — so every write must be
+	 * conditional on the state the caller believes it is leaving, or a cancellation
+	 * can overwrite `sent` and a send can overwrite `cancelled`.
+	 *
+	 * A caller on the scheduled path passes `$from`. **Passing null there is the
+	 * defect this method exists to make visible**, which is why the scheduled
+	 * entry points take it as a REQUIRED argument and carry it in the claim array
+	 * rather than defaulting it.
+	 *
+	 * A LOST TRANSITION IS NOT AUTOMATICALLY A SHORTFALL. A guarded write can fail
+	 * to change a row because somebody else finalised it first, and that delivery
+	 * HAS an outcome — so a terminal row counts as finalised even when this caller
+	 * was not the one who finalised it. **A failed QUERY is a different fact**, and
+	 * the returned `write` keeps it distinguishable: `terminal` then stays false,
+	 * because the row really is still pending and nobody owns it.
+	 *
+	 * @param int         $delivery_id Tombstone id.
+	 * @param string      $status      Terminal status to record.
+	 * @param string|null $from        State being left, or null for the immediate path.
+	 * @param int         $revision    Rule revision, audit only.
+	 * @return array{write:WriteResult|null,terminal:bool} `terminal` says whether the
+	 *         tombstone holds a terminal status afterwards.
+	 */
+	private function finalize( int $delivery_id, string $status, ?string $from, int $revision = 0 ): array {
+		if ( null === $from ) {
+			$written = $this->deliveries->set_final_status( $delivery_id, $status, $revision );
+
+			return self::finalization(
+				$written,
+				$written ? WriteResult::changed( 'set ' . $status ) : WriteResult::failed( 'set ' . $status )
+			);
+		}
+
+		$write = $this->deliveries->transition( $delivery_id, $from, $status, $revision );
+
+		if ( $write->won() ) {
+			return self::finalization( true, $write );
+		}
+
+		// ⚠ THE READ IS WHAT SEPARATES "SOMEBODY ELSE FINISHED IT" FROM "NOTHING
+		// HAPPENED". Both arrive here as a non-winning write, and only the row can
+		// say which — including after a query failure, where the honest answer is
+		// almost always "still pending", which is what `is_terminal()` reports.
+		return self::finalization( $this->deliveries->is_terminal( $delivery_id ), $write );
+	}
+
+	/**
+	 * The state a claim array says its delivery is leaving (ADR-0015 §8.1).
+	 *
+	 * The scheduled path puts `transition_from` in the claim it hands to
+	 * `Orchestrator::send()`, so every recording call reached through that shared
+	 * code knows which mechanism to use without the shared code having to know
+	 * which phase invoked it.
+	 *
+	 * @param array $claim Claim result.
+	 * @return string|null Null for the immediate path.
+	 */
+	public static function transition_from( array $claim ): ?string {
+		$from = (string) ( $claim['transition_from'] ?? '' );
+
+		return '' === $from ? null : $from;
 	}
 
 	/**
@@ -227,27 +360,30 @@ class DeliveryLogger {
 	 * @param string $what          What was being recorded.
 	 * @param int    $rows_expected Rows that should have been written.
 	 * @param int    $rows_written  Rows actually written.
-	 * @param bool   $finalized     Whether the terminal status was written.
+	 * @param array  $finalization  self::finalize()'s report.
 	 * @return array Structured result.
 	 */
-	private function verify( int $delivery_id, string $what, int $rows_expected, int $rows_written, bool $finalized ): array {
-		$success = ( $rows_written === $rows_expected ) && $finalized;
+	private function verify( int $delivery_id, string $what, int $rows_expected, int $rows_written, array $finalization ): array {
+		$finalized = (bool) ( $finalization['terminal'] ?? false );
+		$write     = $finalization['write'] ?? null;
+		$success   = ( $rows_written === $rows_expected ) && $finalized;
 
 		if ( ! $success ) {
 			$this->log_error(
 				sprintf(
-					'delivery #%d: %s was not fully recorded (%d of %d detail rows written, tombstone %s). '
+					'delivery #%d: %s was not fully recorded (%d of %d detail rows written, tombstone %s%s). '
 					. 'The delivery identity is consumed, so this cannot be retried automatically.',
 					$delivery_id,
 					$what,
 					$rows_written,
 					$rows_expected,
-					$finalized ? 'finalized' : 'NOT finalized'
+					$finalized ? 'finalized' : 'NOT finalized',
+					$write instanceof WriteResult ? ', status write ' . $write->describe() : ''
 				)
 			);
 		}
 
-		return self::result( $success, $rows_expected, $rows_written, $finalized );
+		return self::result( $success, $rows_expected, $rows_written, $finalized, $write instanceof WriteResult ? $write : null );
 	}
 
 	/**
@@ -280,9 +416,467 @@ class DeliveryLogger {
 			)
 		) > 0 ? 1 : 0;
 
-		$finalized = $this->deliveries->set_final_status( $delivery_id, 'skipped' );
+		// ADR-0015 §8.1: `executing -> skipped` when the claim carries a
+		// `transition_from`, an unconditional write when it does not. A delayed
+		// delivery reaches here from inside its lease — ADR-0012 §2's claiming
+		// skips are discovered during the send, not before it.
+		$finalized = $this->finalize( $delivery_id, 'skipped', self::transition_from( $claim ) );
 
 		return $this->verify( $delivery_id, 'a skip', 1, $written, $finalized );
+	}
+
+	/**
+	 * Arm a freshly-claimed delayed delivery: store the snapshot, set the
+	 * tombstone `scheduled` (ADR-0015 §1, §2).
+	 *
+	 * NO DETAIL ROW YET. Nothing has been attempted — the attempt row belongs to
+	 * the send, hours from now — and writing one here would put a `scheduled` row
+	 * in the PURGEABLE store, where retention would delete it before the delivery
+	 * ran. The tombstone's own `scheduled` status is the record that a delivery is
+	 * owed; self::record_schedule_outcome() adds the diagnostic row.
+	 *
+	 * ⚠ IT REPORTS *WHY* IT DID NOT ARM (ADR-0015 §8.1a). A `false` return meant
+	 * both "another actor armed this first" and "the UPDATE failed", and the caller
+	 * treated the pair as an inert skip — so a plain database failure left the
+	 * identity consumed, the tombstone `claimed`, no job, no detail row, nothing for
+	 * the maintenance sweep to find, and every later trigger for that delivery
+	 * silently suppressed. The caller now terminalises the first case and lets the
+	 * second alone.
+	 *
+	 * @param array $claim         Claim result; must be CLAIMED.
+	 * @param array $snapshot      Snapshot from `Domain\DeliverySnapshot::create()`.
+	 * @param int   $scheduled_for UTC timestamp the job is queued for.
+	 * @return WriteResult CHANGED when this call armed the row.
+	 */
+	public function record_scheduled( array $claim, array $snapshot, int $scheduled_for ): WriteResult {
+		if ( DeliveryRepository::CLAIMED !== ( $claim['result'] ?? '' ) ) {
+			return WriteResult::refused( 'arm a delivery that was not claimed' );
+		}
+
+		$armed = $this->deliveries->arm_scheduled( (int) $claim['delivery_id'], $snapshot );
+
+		if ( ! $armed->won() ) {
+			$this->log_error(
+				'failed to arm delivery #' . (int) $claim['delivery_id'] . ' as scheduled for '
+					. gmdate( 'Y-m-d H:i:s', $scheduled_for ) . ' UTC (' . $armed->describe() . '); nothing was queued'
+			);
+		}
+
+		return $armed;
+	}
+
+	/**
+	 * Terminalise a delivery whose ARM did not land (ADR-0015 §8.1a).
+	 *
+	 * ⚠ THE ROW IS STILL `claimed`, WHICH IS NOT A STATE THE SCHEDULED MACHINE OWNS.
+	 * `claimed -> cancelled` is not in `DeliveryRepository::TRANSITIONS` and must not
+	 * be: `claimed` is the immediate path's transient state, held by one actor inside
+	 * one request. A delivery whose arm failed never entered the scheduled machine —
+	 * that is precisely what failed — so the unconditional writer is the correct
+	 * mechanism here, exactly as it is in self::record_schedule_throw(), and using it
+	 * is not a breach of §8.1.
+	 *
+	 * ⚠ AND THE DETAIL ROW COMES AFTER THE STATUS WRITE (Prompt 7B Tier 2). Writing
+	 * the outcome row first would leave a `cancelled` detail row on a tombstone that
+	 * a concurrent actor had meanwhile finalised some other way.
+	 *
+	 * @param int    $delivery_id Tombstone id.
+	 * @param string $why         What the arm reported.
+	 * @return array Structured result.
+	 */
+	public function record_arm_failure( int $delivery_id, string $why ): array {
+		if ( $delivery_id <= 0 ) {
+			return self::result( false, 1, 0, false );
+		}
+
+		$this->log_error(
+			'delivery #' . $delivery_id . ' was claimed but could NOT be armed as scheduled (' . $why . '); '
+				. 'it is being closed so the consumed identity does not sit in a state nothing can reach'
+		);
+
+		$final = $this->finalize( $delivery_id, 'cancelled', null );
+
+		if ( ! $final['terminal'] ) {
+			return $this->verify( $delivery_id, 'a delayed delivery that could not be armed', 1, 0, $final );
+		}
+
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'     => 'auto',
+				'state'    => 'cancelled',
+				'reason'   => Text::log_value(
+					'this delayed delivery could not be armed for sending, so nothing was queued and it will not be sent'
+				),
+				'snapshot' => array(
+					'cancelled' => array( 'reason_code' => ScheduledDelivery::REASON_ARM_FAILED ),
+				),
+			)
+		) > 0 ? 1 : 0;
+
+		return $this->verify( $delivery_id, 'a delayed delivery that could not be armed', 1, $written, $final );
+	}
+
+	/**
+	 * Record that a delayed delivery reached the queue (ADR-0015 §6).
+	 *
+	 * A `scheduled` DETAIL row, so a merchant can see when the message is due and
+	 * which action carries it. The tombstone keeps `scheduled` until the job runs.
+	 *
+	 * @param int   $delivery_id   Tombstone id.
+	 * @param array $queued        Outcome from `ScheduledDelivery::schedule()`.
+	 * @param int   $scheduled_for UTC timestamp the job runs at.
+	 * @param int   $delay         Delay in seconds, for the audit.
+	 * @return array Structured result.
+	 */
+	public function record_schedule_outcome( int $delivery_id, array $queued, int $scheduled_for, int $delay ): array {
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'     => 'auto',
+				'state'    => 'scheduled',
+				'reason'   => Text::log_value(
+					ScheduledDelivery::describe( $queued ) . ' for ' . gmdate( 'Y-m-d H:i:s', $scheduled_for ) . ' UTC'
+				),
+				'snapshot' => array(
+					'scheduled' => array(
+						'delay_seconds' => $delay,
+						'scheduled_for' => $scheduled_for,
+						'action_id'     => (int) ( $queued['action_id'] ?? 0 ),
+						'result'        => (string) ( $queued['result'] ?? '' ),
+					),
+				),
+			)
+		) > 0 ? 1 : 0;
+
+		// ⚠ THE TOMBSTONE IS NOT FINALISED. `scheduled` is not a terminal state:
+		// the delivery is owed, not done, and `arm_scheduled()` already set it.
+		return $this->verify( $delivery_id, 'a scheduled delivery', 1, $written, self::finalization( true ) );
+	}
+
+	/**
+	 * Record that a delayed delivery COULD NOT be queued (ADR-0015 §6).
+	 *
+	 * ⚠ TERMINAL, AND LOUD. The identity was consumed when the delivery was
+	 * claimed, so a tombstone left `scheduled` with no job behind it would sit for
+	 * ever in a state that reads as "in progress", with nothing in the queue for
+	 * anyone to find. `cancelled` is the truthful end state, and the reason says
+	 * plainly that the email will not happen — a delivery that silently never
+	 * scheduled must never be mistaken for a duplicate correctly suppressed.
+	 *
+	 * @param int   $delivery_id Tombstone id.
+	 * @param array $queued      Outcome from `ScheduledDelivery::schedule()`.
+	 * @return array Structured result.
+	 */
+	public function record_schedule_failure( int $delivery_id, array $queued ): array {
+		$this->log_error(
+			'delivery #' . $delivery_id . ' was claimed but NOT queued: ' . ScheduledDelivery::describe( $queued )
+				. '; this delayed email will not be sent'
+		);
+
+		return $this->record_scheduled_cancellation(
+			$delivery_id,
+			'schedule_failed',
+			ScheduledDelivery::describe( $queued ),
+			DeliveryRepository::SCHEDULED
+		);
+	}
+
+	/**
+	 * Cancel a scheduled delivery with its own truthful reason (ADR-0015 §4).
+	 *
+	 * ⚠ ONE REASON CODE PER CAUSE, NEVER A GENERIC "cancelled". The delivery log
+	 * exists to answer *why didn't this send?*, and six causes with one reason
+	 * makes it unable to. The code goes in the snapshot so a query can group by
+	 * it; the sentence goes in `reason` so a merchant can read it.
+	 *
+	 * ⚠ `$from` IS REQUIRED, AND DELIBERATELY HAS NO DEFAULT (ADR-0015 §8.1). Every
+	 * caller of this method is on the scheduled path, where an unconditional write
+	 * would let a cancellation overwrite a `sent` tombstone. A default would be a
+	 * value somebody could forget to think about, and the two possible answers —
+	 * `scheduled` for the eager and lifecycle paths, `executing` for everything
+	 * discovered under the lease — are not interchangeable.
+	 *
+	 * ⚠ OWNERSHIP FIRST, DETAIL ROW SECOND (Prompt 7B Tier 2). The two used to be the
+	 * other way round, so a cancellation that LOST to a worker still wrote its
+	 * `cancelled` detail row — leaving a `sent` tombstone carrying a row that says
+	 * the delivery was cancelled, which is a log that contradicts itself about an
+	 * email the customer has in their inbox. A lost transition is recorded as its own
+	 * diagnostic instead: it is a fact about this attempt, not about the delivery.
+	 *
+	 * @param int    $delivery_id Tombstone id.
+	 * @param string $code        Machine-readable cause.
+	 * @param string $sentence    What to tell the merchant.
+	 * @param string $from        State the tombstone is being moved OUT of.
+	 * @return array Structured result.
+	 */
+	public function record_scheduled_cancellation( int $delivery_id, string $code, string $sentence, string $from ): array {
+		if ( $delivery_id <= 0 ) {
+			return self::result( false, 1, 0, false );
+		}
+
+		// Releases the snapshot too — `cancelled` is terminal (ADR-0015 §2), and
+		// the transition is conditional on `$from` (ADR-0015 §8.1).
+		$final = $this->finalize( $delivery_id, 'cancelled', $from );
+		$write = $final['write'] ?? null;
+
+		if ( ! ( $write instanceof WriteResult ) || ! $write->won() ) {
+			/*
+			 * THIS CALL DID NOT CANCEL ANYTHING. Whatever the row holds now was
+			 * decided by somebody else — or by nobody, if the write failed — and
+			 * stamping a `cancelled` outcome row onto it would describe an outcome
+			 * this call did not produce.
+			 *
+			 * The two are logged at DIFFERENT LEVELS on purpose: losing to a worker
+			 * that sent the email is the design working, while a failed write is a
+			 * delivery nobody owns and belongs in the same log as every other
+			 * shortfall.
+			 */
+			$this->record_lost_transition( $delivery_id, 'a cancellation (' . $code . ')', $write );
+
+			return self::result( false, 1, 0, (bool) $final['terminal'], $write instanceof WriteResult ? $write : null );
+		}
+
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'     => 'auto',
+				'state'    => 'cancelled',
+				'reason'   => Text::log_value( $sentence ),
+				'snapshot' => array(
+					'cancelled' => array( 'reason_code' => $code ),
+				),
+			)
+		) > 0 ? 1 : 0;
+
+		return $this->verify( $delivery_id, 'a cancelled delayed delivery (' . $code . ')', 1, $written, $final );
+	}
+
+	/**
+	 * Record a throw that reached the SCHEDULING containment boundary
+	 * (ADR-0015 §8.5).
+	 *
+	 * ⚠ THE TOMBSTONE CAN BE IN EITHER OF TWO STATES HERE, AND THE FIRST VERSION OF
+	 * THIS CODE ONLY HANDLED ONE. `queue()` claims, then arms `claimed -> scheduled`,
+	 * then queues. A throw AFTER the arm leaves a `scheduled` row, which
+	 * `scheduled -> cancelled` finalises. A throw BEFORE or DURING the arm leaves the
+	 * row `claimed` — and that transition then lands on nothing, stranding a consumed
+	 * identity in a state with no job, no reason and nothing able to reach it. Found
+	 * by this prompt's own boundary test, which threw from WordPress's `query` filter
+	 * during the arming UPDATE.
+	 *
+	 * A `claimed` row has NOT entered the scheduled state machine: it is in exactly
+	 * the state an immediate delivery occupies, with one actor and no contention, so
+	 * the unconditional writer is the correct mechanism for it and using it here is
+	 * not a breach of §8.1. The order below is what makes that safe — the guarded
+	 * transition is tried FIRST, so a row that did reach `scheduled` is never written
+	 * unconditionally.
+	 *
+	 * @param int    $delivery_id Tombstone id.
+	 * @param string $message     What threw.
+	 * @return array Structured result.
+	 */
+	public function record_schedule_throw( int $delivery_id, string $message ): array {
+		if ( $delivery_id <= 0 ) {
+			return self::result( false, 1, 0, false );
+		}
+
+		$this->log_error(
+			'delivery #' . $delivery_id . ' was claimed but queueing THREW and nothing was queued; '
+				. 'this delayed email will not be sent — ' . $message
+		);
+
+		$write = $this->deliveries->transition( $delivery_id, DeliveryRepository::SCHEDULED, 'cancelled' );
+		$owned = $write->won();
+
+		if ( ! $owned && ! $this->deliveries->is_terminal( $delivery_id ) ) {
+			// Still `claimed`: the throw beat the arm. See the docblock.
+			$owned = $this->deliveries->set_final_status( $delivery_id, 'cancelled' );
+		}
+
+		$final = self::finalization( $owned || $this->deliveries->is_terminal( $delivery_id ), $write );
+
+		if ( ! $owned ) {
+			// Somebody else finalised it, or nothing landed at all. Either way this
+			// call did not produce the outcome, so it does not write one.
+			$this->record_lost_transition( $delivery_id, 'a scheduling attempt that threw', $write );
+
+			return self::result( false, 1, 0, (bool) $final['terminal'], $write );
+		}
+
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'            => 'auto',
+				'state'           => 'cancelled',
+				'reason'          => Text::log_value(
+					'queueing this delayed delivery threw and nothing was queued, so it will not be sent'
+				),
+				'failure_message' => Text::log_value( $message ),
+				'snapshot'        => array(
+					'cancelled' => array( 'reason_code' => 'schedule_threw' ),
+				),
+			)
+		) > 0 ? 1 : 0;
+
+		return $this->verify( $delivery_id, 'a scheduling attempt that threw', 1, $written, $final );
+	}
+
+	/**
+	 * Record a throw that reached `ScheduledDelivery::run()`'s boundary.
+	 *
+	 * ⚠ THE THROW CAN LAND ON EITHER SIDE OF THE LEASE, AND THE TWO NEED DIFFERENT
+	 * TRANSITIONS (ADR-0015 §8.1). A run that threw while holding the lease goes
+	 * `executing -> failed`. One that threw before it could take the lease — the
+	 * window is small but not empty — is still `scheduled`, and `scheduled ->
+	 * failed` is not a permitted edge, so it goes `scheduled -> cancelled`: nothing
+	 * was attempted, and the detail row carries the exception either way.
+	 *
+	 * Both are tried, in that order, rather than trusted from a flag alone: the
+	 * caller's belief about whether it holds the lease can be wrong precisely when
+	 * something threw.
+	 *
+	 * ⚠ AND THE DETAIL ROW IS WRITTEN AFTER ONE OF THEM LANDS (Prompt 7B Tier 2).
+	 * The `state` it carries — `failed` for a throw under the lease, `cancelled` for
+	 * one before it — is decided by WHICH transition won, so writing it first meant
+	 * writing a state the tombstone might never reach.
+	 *
+	 * @param int        $delivery_id Tombstone id.
+	 * @param \Throwable $error       The throw.
+	 * @param bool       $leased      Whether the run had taken the lease.
+	 * @return array Structured result.
+	 */
+	public function record_scheduled_failure( int $delivery_id, \Throwable $error, bool $leased = true ): array {
+		$write = $leased
+			? $this->deliveries->transition( $delivery_id, DeliveryRepository::EXECUTING, 'failed' )
+			: WriteResult::refused( 'the run never took its lease' );
+		$state = 'failed';
+
+		if ( ! $write->won() ) {
+			$write = $this->deliveries->transition( $delivery_id, DeliveryRepository::SCHEDULED, 'cancelled' );
+			$state = 'cancelled';
+		}
+
+		$final = self::finalization( $write->won() ? true : $this->deliveries->is_terminal( $delivery_id ), $write );
+
+		if ( ! $write->won() ) {
+			// ⚠ THE EXCEPTION GOES IN THE LOG LINE. No detail row is written here,
+			// and this is the only other place it would be recorded at all.
+			$this->record_lost_transition(
+				$delivery_id,
+				'a scheduled delivery that threw (' . Text::log_value( get_class( $error ) . ': ' . $error->getMessage() ) . ')',
+				$write
+			);
+
+			return self::result( false, 1, 0, (bool) $final['terminal'], $write );
+		}
+
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'            => 'auto',
+				'state'           => $state,
+				'reason'          => Text::log_value(
+					$leased
+						? 'the scheduled delivery threw before it could be sent'
+						: 'the scheduled delivery threw before it could take its execution lease'
+				),
+				'failure_message' => Text::log_value( get_class( $error ) . ': ' . $error->getMessage() ),
+			)
+		) > 0 ? 1 : 0;
+
+		return $this->verify( $delivery_id, 'a scheduled delivery that threw', 1, $written, $final );
+	}
+
+	/**
+	 * THE LAST GUARANTEE: close a lease nothing recorded an outcome for
+	 * (ADR-0015 §8.4).
+	 *
+	 * ⚠ IT IS A NO-OP UNLESS THE ROW IS STILL `executing`, AND THAT IS HOW IT
+	 * DETECTS ITS OWN CASE. Every path through the send records an outcome and
+	 * moves the tombstone off the lease, so this transition normally finds nothing
+	 * to do and costs one refused write. When it DOES land, something returned
+	 * from the send path having recorded nothing — the recording itself threw
+	 * after the message went out is the realistic way — and the delivery would
+	 * otherwise sit `executing` until the §8.3 sweep found it an hour later.
+	 *
+	 * `unresolved` rather than `failed`, for §8.3's reason: the mail may well have
+	 * gone out, and nobody knows.
+	 *
+	 * @param int $delivery_id Tombstone id.
+	 * @return bool True when this call closed an open lease.
+	 */
+	public function close_unrecorded_lease( int $delivery_id ): bool {
+		// Only a WIN closes a lease. A lost race means the send recorded its own
+		// outcome after all, and a failed write means the row is still `executing`
+		// — which is the §8.3 sweep's case, not this one.
+		if ( ! $this->deliveries->transition( $delivery_id, DeliveryRepository::EXECUTING, DeliveryDetailRepository::UNRESOLVED )->won() ) {
+			return false;
+		}
+
+		$this->log_error(
+			'delivery #' . $delivery_id . ' returned from its send path with the execution lease still held and '
+				. 'no outcome recorded; it has been closed as unresolved. Whether the message went out is NOT known.'
+		);
+
+		$this->details->insert(
+			$delivery_id,
+			array(
+				'type'   => 'auto',
+				'state'  => DeliveryDetailRepository::UNRESOLVED,
+				'reason' => Text::log_value(
+					'the delayed send returned without recording an outcome, so whether the message was sent is unknown'
+				),
+			)
+		);
+
+		return true;
+	}
+
+	/**
+	 * Recover a delivery whose worker never came back (ADR-0015 §8.3).
+	 *
+	 * ⚠ OWNERSHIP FIRST, DETAIL ROW SECOND (Prompt 7B Tier 2), for the reason
+	 * self::record_scheduled_cancellation() gives: a sweep that loses to the worker
+	 * finishing its send must not leave an `unresolved` attempt row on a `sent`
+	 * tombstone.
+	 *
+	 * ⚠ THE REASON CODE IS A PARAMETER BECAUSE TWO DIFFERENT EVENTS END A LEASE
+	 * UNRESOLVED, and both are honest: a worker that never came back (§8.3) and a
+	 * plugin shut down while a worker was running (§8.8). The TRANSITION is the same
+	 * one — `executing -> unresolved` — but "nobody knows because the worker
+	 * vanished" and "nobody knows because the site owner deactivated the plugin" are
+	 * different answers to *why didn't this send?*, which is the only question the
+	 * delivery log exists to answer.
+	 *
+	 * @param int    $delivery_id Tombstone id.
+	 * @param string $sentence    What to tell the merchant.
+	 * @param string $code        Machine-readable cause.
+	 * @return array Structured result.
+	 */
+	public function record_expired_lease( int $delivery_id, string $sentence, string $code = ScheduledDelivery::REASON_LEASE_EXPIRED ): array {
+		$final = $this->finalize( $delivery_id, DeliveryDetailRepository::UNRESOLVED, DeliveryRepository::EXECUTING );
+		$write = $final['write'] ?? null;
+
+		if ( ! ( $write instanceof WriteResult ) || ! $write->won() ) {
+			$this->record_lost_transition( $delivery_id, 'an expired execution lease', $write );
+
+			return self::result( false, 1, 0, (bool) $final['terminal'], $write instanceof WriteResult ? $write : null );
+		}
+
+		$written = $this->details->insert(
+			$delivery_id,
+			array(
+				'type'     => 'auto',
+				'state'    => DeliveryDetailRepository::UNRESOLVED,
+				'reason'   => Text::log_value( $sentence ),
+				'snapshot' => array(
+					'cancelled' => array( 'reason_code' => $code ),
+				),
+			)
+		) > 0 ? 1 : 0;
+
+		return $this->verify( $delivery_id, 'an expired execution lease', 1, $written, $final );
 	}
 
 	/**
@@ -294,9 +888,11 @@ class DeliveryLogger {
 	 * @param bool               $sent        Whether WooCommerce reported success.
 	 * @param string             $reason      Notes recorded during resolution.
 	 * @param array              $snapshot    Structured diagnostic payload.
+	 * @param string|null        $from        State being left on the scheduled path
+	 *                                        (ADR-0015 §8.1); null for the immediate one.
 	 * @return array Structured result.
 	 */
-	public function record_send( int $delivery_id, ResolvedRecipients $recipients, string $subject, bool $sent, string $reason = '', array $snapshot = array() ): array {
+	public function record_send( int $delivery_id, ResolvedRecipients $recipients, string $subject, bool $sent, string $reason = '', array $snapshot = array(), ?string $from = null ): array {
 		return $this->write_attempt_rows(
 			$delivery_id,
 			$recipients,
@@ -305,7 +901,8 @@ class DeliveryLogger {
 			$reason,
 			$sent ? null : 'the mailer reported the message as not sent',
 			$snapshot,
-			$sent ? 'a send' : 'a failed send'
+			$sent ? 'a send' : 'a failed send',
+			$from
 		);
 	}
 
@@ -335,9 +932,11 @@ class DeliveryLogger {
 	 * @param \Throwable              $error       What was thrown.
 	 * @param string                  $reason      Notes recorded during resolution.
 	 * @param array                   $snapshot    Structured diagnostic payload.
+	 * @param string|null             $from        State being left on the scheduled
+	 *                                             path (ADR-0015 §8.1).
 	 * @return array Structured result.
 	 */
-	public function record_send_failure( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, \Throwable $error, string $reason = '', array $snapshot = array() ): array {
+	public function record_send_failure( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, \Throwable $error, string $reason = '', array $snapshot = array(), ?string $from = null ): array {
 		$message = get_class( $error ) . ': ' . $error->getMessage();
 
 		$this->log_error( 'delivery #' . $delivery_id . ' threw during send — ' . $message );
@@ -350,12 +949,34 @@ class DeliveryLogger {
 			$reason,
 			$message,
 			$snapshot,
-			'a send that threw'
+			'a send that threw',
+			$from
 		);
 	}
 
 	/**
 	 * Write one attempt row per resolved recipient, then finalise.
+	 *
+	 * ⚠ THIS ONE RECORDER WRITES ITS DETAIL ROWS *BEFORE* IT TAKES OWNERSHIP, AND
+	 * UNLIKE THE OTHER FOUR THAT IS CORRECT (ADR-0015 §8.9, Prompt 7C Tier 2). The
+	 * cancellation, arm-failure, expired-lease and scheduled-failure recorders all
+	 * finalise first, because for them the detail row IS the outcome — writing one
+	 * before winning the transition would be claiming an outcome that belongs to
+	 * whoever did win. Here the detail row is EVIDENCE OF A SIDE EFFECT THAT HAS
+	 * ALREADY HAPPENED: by the time this method runs, the mailer has been called and
+	 * a message is or is not in a customer's inbox. That fact is not conditional on
+	 * winning anything, and suppressing it would delete the only record of a real
+	 * email.
+	 *
+	 * **AND REORDERING WOULD NOT FIX WHAT IT APPEARS TO FIX.** The state that looks
+	 * wrong — an `unresolved` tombstone carrying a `sent` detail row — is produced by
+	 * a CONCURRENT finaliser (deactivation, the sweep), not by the order of these two
+	 * writes: finalise-first would lose the same race, still have to write the same
+	 * evidence, and additionally risk a terminal tombstone with no detail row at all
+	 * if the process died between the two. What the pair actually needs is to be
+	 * SELF-EXPLAINING, which is what the lost-transition note below provides — and
+	 * what was missing, because a lost race leaves `finalized` true and therefore
+	 * passed `verify()` silently.
 	 *
 	 * @param int                     $delivery_id Tombstone id.
 	 * @param ResolvedRecipients|null $recipients  Resolved recipients, or null.
@@ -365,9 +986,11 @@ class DeliveryLogger {
 	 * @param string|null             $failure     Failure message, or null.
 	 * @param array                   $snapshot    Structured diagnostic payload.
 	 * @param string                  $what        Description for the shortfall log.
+	 * @param string|null             $from        State being left on the scheduled
+	 *                                             path (ADR-0015 §8.1).
 	 * @return array Structured result.
 	 */
-	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what ): array {
+	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what, ?string $from = null ): array {
 		$entries = null === $recipients ? array() : $recipients->entries();
 		$written = 0;
 
@@ -392,9 +1015,12 @@ class DeliveryLogger {
 			 * finalise the tombstone with no detail row: an identity consumed, a
 			 * merchant told nothing, and the exception recorded nowhere.
 			 */
-			$written = $this->details->insert( $delivery_id, $row ) > 0 ? 1 : 0;
+			$written   = $this->details->insert( $delivery_id, $row ) > 0 ? 1 : 0;
+			$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
 
-			return $this->verify( $delivery_id, $what, 1, $written, $this->deliveries->set_final_status( $delivery_id, 'sent' === $state ? 'sent' : 'failed' ) );
+			$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
+
+			return $this->verify( $delivery_id, $what, 1, $written, $finalized );
 		}
 
 		$expected = count( $entries );
@@ -412,9 +1038,48 @@ class DeliveryLogger {
 			}
 		}
 
-		$finalized = $this->deliveries->set_final_status( $delivery_id, 'sent' === $state ? 'sent' : 'failed' );
+		$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
+
+		$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
 
 		return $this->verify( $delivery_id, $what, $expected, $written, $finalized );
+	}
+
+	/**
+	 * Say so when an ATTEMPT's evidence outlived its claim on the tombstone
+	 * (ADR-0015 §8.9).
+	 *
+	 * ⚠ THE SILENT CASE THIS EXISTS FOR. When a concurrent finaliser — deactivation,
+	 * the §8.3 sweep — terminalises the row first, `finalize()` reports `terminal`
+	 * true, because it really is terminal and somebody really does own it. `verify()`
+	 * then computes success, logs nothing, and the delivery log is left holding a
+	 * `sent` attempt row under an `unresolved` tombstone with no explanation anywhere
+	 * of how the two can both be true. They can both be true, and the explanation is
+	 * worth one log line: the message went out, and its outcome column belongs to
+	 * whoever won the transition.
+	 *
+	 * Immediate-path callers pass `$from = null` and are skipped: that path owns its
+	 * tombstone from `claimed` to terminal inside one request, so there is no second
+	 * actor and no race to report.
+	 *
+	 * @param int         $delivery_id  Tombstone id.
+	 * @param string      $what         What was being recorded.
+	 * @param array       $finalization self::finalize()'s report.
+	 * @param string|null $from         State the caller believed it was leaving.
+	 * @return void
+	 */
+	private function note_lost_attempt_ownership( int $delivery_id, string $what, array $finalization, ?string $from ): void {
+		if ( null === $from ) {
+			return;
+		}
+
+		$write = $finalization['write'] ?? null;
+
+		if ( $write instanceof WriteResult && $write->won() ) {
+			return;
+		}
+
+		$this->record_lost_transition( $delivery_id, $what . ' (whose evidence rows are written regardless)', $write instanceof WriteResult ? $write : null );
 	}
 
 	/**
@@ -476,9 +1141,11 @@ class DeliveryLogger {
 				)
 			) > 0 ? 1 : 0;
 
+			// The IMMEDIATE path's unconditional writer: a failed claim never entered
+			// the scheduled state machine (ADR-0015 §8.1).
 			$finalized = $this->deliveries->set_final_status( $delivery_id, 'failed' );
 
-			return $this->verify( $delivery_id, 'a failed claim', 1, $written, $finalized );
+			return $this->verify( $delivery_id, 'a failed claim', 1, $written, self::finalization( $finalized ) );
 		}
 
 		$this->log_error(
@@ -637,7 +1304,7 @@ class DeliveryLogger {
 		// that as "not finalized" would log an error for correct behaviour.
 		$finalized = $recorded['status_written'] || $recorded['status_deferred'];
 
-		return $this->verify( $delivery_id, self::insert_label( $outcome, $rendered, 'resend' === (string) $recorded['type'] ), 1, $written, $finalized );
+		return $this->verify( $delivery_id, self::insert_label( $outcome, $rendered, 'resend' === (string) $recorded['type'] ), 1, $written, self::finalization( (bool) $finalized ) );
 	}
 
 	/**

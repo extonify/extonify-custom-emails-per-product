@@ -340,7 +340,19 @@ class Exporter {
 			),
 			array(
 				'name'  => __( 'Why this is kept', 'extonify-custom-emails-per-product' ),
-				'value' => __( 'This record contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries.', 'extonify-custom-emails-per-product' ),
+
+				/*
+				 * ⚠ THE SECOND SENTENCE EXISTS BECAUSE THE FIRST STOPPED BEING THE
+				 * WHOLE TRUTH (ADR-0015 §2a). A delivery that is still PENDING carries
+				 * a snapshot: the store's own unrendered templates and recipient
+				 * DEFINITIONS, which may include a literal address the merchant typed
+				 * into the rule. That is merchant configuration rather than the data
+				 * subject's data — which is why it is not added to the export — but a
+				 * privacy notice that says the row holds no message content while it
+				 * holds unsent message templates is a notice that has drifted from
+				 * the code, and a reader has no way to tell.
+				 */
+				'value' => __( 'This record contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries. While a delayed email for this order is still waiting to be sent, the record also temporarily holds the store\'s own unsent template text and recipient settings for that message; this is released as soon as the email is sent or cancelled.', 'extonify-custom-emails-per-product' ),
 			),
 		);
 

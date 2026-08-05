@@ -10,6 +10,7 @@ namespace Extonify\WCEP\Tests\Integration;
 
 use Extonify\WCEP\Delivery\DeliveryLogger;
 use Extonify\WCEP\Delivery\Orchestrator;
+use Extonify\WCEP\Delivery\ScheduledPhase;
 use Extonify\WCEP\Domain\MatchDecision;
 use Extonify\WCEP\Domain\TriggerEvent;
 
@@ -65,7 +66,19 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 	}
 
 	/**
-	 * Rules owned by Prompt 5 (insert) and Prompt 6 (delayed).
+	 * Rules the IMMEDIATE phase must not deliver.
+	 *
+	 * ⚠ THE DELAYED CASES LEFT THIS PROVIDER IN PROMPT 7 (ADR-0015 §7). They
+	 * asserted that a delayed rule produced *nothing at all* — no mail and no
+	 * tombstone — which was true only while nobody implemented delay. It now
+	 * SCHEDULES: it claims its identity, stores a snapshot and queues a job, and
+	 * `ScheduledDeliveryTest::test_immediate_and_delayed_rules_are_disjoint()`
+	 * asserts the half that still belongs here — that it does not ALSO send
+	 * inline. Leaving the old cases in place would have meant either a failing
+	 * suite or, worse, weakening them into passing against the new behaviour.
+	 *
+	 * What remains is what is still owned by nobody, plus insert mode, which is
+	 * owned by a phase this one must not touch.
 	 *
 	 * @return array<string,array{0:array,1:string}>
 	 */
@@ -79,8 +92,6 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 				),
 				'an insert-mode rule',
 			),
-			'delayed one day'     => array( array( 'delay_seconds' => 86400 ), 'a rule delayed by one day' ),
-			'delayed one second'  => array( array( 'delay_seconds' => 1 ), 'a rule delayed by one second' ),
 			/*
 			 * ⚠ ADDED PROMPT 5C, AND IT WAS A LIVE DEFECT RATHER THAN A GAP.
 			 * Prompt 5B gave `consolidation` validated storage, so `daily` became
@@ -223,6 +234,28 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 			array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' ),
 			'Only separate + delay_seconds = 0 + consolidation = none belongs to this phase.'
 		);
+
+		/*
+		 * ⚠ AND THE THREE PHASES ARE DISJOINT (ADR-0015 §7). Stated as a partition
+		 * rather than three separate assertions, because the failure being guarded
+		 * is a rule reaching TWO phases — delivered inline AND from the queue, so
+		 * the customer gets it twice. Rule 3 is the delayed one; nothing else may
+		 * join it, and no rule may appear in more than one column.
+		 */
+		$this->assertSame(
+			array( 3 ),
+			array_column( ScheduledPhase::deliverable_in_this_phase( $rules ), 'id' ),
+			'Only separate + delay_seconds > 0 + consolidation = none belongs to the scheduled phase.'
+		);
+
+		$immediate = array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' );
+		$scheduled = array_column( ScheduledPhase::deliverable_in_this_phase( $rules ), 'id' );
+
+		$this->assertSame(
+			array(),
+			array_intersect( $immediate, $scheduled ),
+			'⚠ a rule belongs to BOTH the immediate and the scheduled phase, so it would be delivered twice.'
+		);
 	}
 
 	/**
@@ -238,11 +271,32 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 	public function test_every_unimplemented_behaviour_column_is_filtered() {
 		$columns = Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS;
 
+		/*
+		 * ⚠ `delay_seconds` LEFT THIS LIST IN PROMPT 7, AND THE CHANGE IS ASSERTED
+		 * RATHER THAN ABSORBED (ADR-0015 §7). It is no longer unimplemented — it is
+		 * a PHASE DISCRIMINATOR: `0` for the immediate phase, `> 0` for
+		 * `ScheduledPhase`. Widening this assertion to "contains consolidation"
+		 * instead of updating it would be exactly the silent weakening the list
+		 * exists to prevent, and is how `consolidation` shipped deliverable in the
+		 * first place. `consolidation` is now the ONLY entry.
+		 */
 		$this->assertSame(
-			array( 'delay_seconds', 'consolidation' ),
+			array( 'consolidation' ),
 			array_keys( $columns ),
 			'The unimplemented-behaviour enumeration changed; both phases and gate 15 depend on it.'
 		);
+
+		// And the column that left is genuinely OWNED now, not merely unlisted:
+		// a delayed rule belongs to exactly one phase, and it is not this one.
+		$delayed = array(
+			'id'            => 1,
+			'delivery_mode' => 'separate',
+			'delay_seconds' => HOUR_IN_SECONDS,
+			'consolidation' => 'none',
+		);
+
+		$this->assertSame( array(), Orchestrator::deliverable_in_this_phase( array( $delayed ) ), 'a delayed rule reached the IMMEDIATE phase' );
+		$this->assertSame( array( $delayed ), ScheduledPhase::deliverable_in_this_phase( array( $delayed ) ), 'a delayed rule reached NO phase' );
 
 		foreach ( $columns as $column => $default ) {
 			$base = array(
@@ -553,15 +607,18 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 		$result = ( new DeliveryLogger( $this->deliveries, $this->details ) )
 			->record_send( (int) $claim['delivery_id'], $recipients, 'Clean subject', true );
 
+		// ⚠ THE FIFTH KEY IS THE GUARDED WRITE'S OWN OUTCOME (ADR-0015 §8.1a). An
+		// immediate send reaches it through the unconditional writer, so it reports
+		// `changed`; a delayed one carries the transition it won.
 		$this->assertSame(
-			array(
-				'success'       => true,
-				'rows_expected' => 1,
-				'rows_written'  => 1,
-				'finalized'     => true,
-			),
-			$result
+			array( 'success', 'rows_expected', 'rows_written', 'finalized', 'transition' ),
+			array_keys( $result )
 		);
+		$this->assertTrue( (bool) $result['success'] );
+		$this->assertSame( 1, (int) $result['rows_expected'] );
+		$this->assertSame( 1, (int) $result['rows_written'] );
+		$this->assertTrue( (bool) $result['finalized'] );
+		$this->assertTrue( $result['transition']->won() );
 	}
 
 	/**

@@ -367,6 +367,16 @@ class Injector {
 	 * same ordering applies to the plain-text branch, which has no escaping step
 	 * today but must not acquire one silently.
 	 *
+	 * ⚠ AND THE REGISTRATION IS PROVISIONAL: `emitted = false` GOING IN, PROMOTED
+	 * AFTER THE ECHO RETURNS (Prompt 7 C1). Reordering alone was not enough, because
+	 * `register()` defaults `$emitted` to `true` — so the ledger still claimed the
+	 * output before `echo` had run, and `echo` is not unconditionally safe either:
+	 * an output-buffer handler installed with a chunk size runs DURING the echo and
+	 * can throw. The window was one statement instead of three, but it was the same
+	 * window. Registering `false` and promoting with self::$ledger->mark_emitted()
+	 * — token-and-rule-exact — closes it, and the promotion is the LAST statement
+	 * in each branch.
+	 *
 	 * @param array                  $render     Current render record.
 	 * @param array                  $entry      Matched entry.
 	 * @param string                 $position   Position emitting.
@@ -424,11 +434,13 @@ class Injector {
 			// stops a future one being added ahead of the registration by accident.
 			$output = "\n" . $text . "\n";
 
-			$this->register( $render, $entry, $position, $values );
+			// PROVISIONAL: `emitted = false` until the echo has returned (C1).
+			$this->register( $render, $entry, $position, $values, '', false );
 
 			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- plain-text email body: to_plain_text() strips all markup and decodes entities, placeholder values are substituted as text, and HTML-context escaping would corrupt a message that is never parsed as HTML. See the comment above.
 			echo $output;
-			$emitted = true;
+
+			$emitted = $this->ledger->mark_emitted( $render['token'], (int) $entry['rule_id'] );
 			return;
 		}
 
@@ -446,11 +458,13 @@ class Injector {
 		// once `register()` has already said otherwise (ADR-0014 §10b).
 		$output = wp_kses_post( wpautop( $html ) );
 
-		$this->register( $render, $entry, $position, $values );
+		// PROVISIONAL: `emitted = false` until the echo has returned (C1).
+		$this->register( $render, $entry, $position, $values, '', false );
 
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $output is the return of wp_kses_post() two statements above; escaping is deliberately hoisted ahead of the registration so a throwing wp_kses_allowed_html callback cannot leave the ledger claiming content was emitted.
 		echo $output;
-		$emitted = true;
+
+		$emitted = $this->ledger->mark_emitted( $render['token'], (int) $entry['rule_id'] );
 	}
 
 	/**
