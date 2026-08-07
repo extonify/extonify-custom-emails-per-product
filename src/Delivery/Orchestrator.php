@@ -947,17 +947,50 @@ class Orchestrator {
 		 * filter that then threw saw the exception alone, and never learnt about the
 		 * problem they could actually fix. The object accumulates as it resolves, so
 		 * holding it here means the failure row reports whatever it had reached.
+		 *
+		 * `snapshot` IS HERE RATHER THAN CLOSED OVER (ADR-0016 §5). The diagnostic
+		 * payload a row carries is decided once the fan-out plan is known — a capped
+		 * fallback records its own count — and the plan is built inside this boundary
+		 * because it reads a filter. Keeping it in `$state` means the catch reports
+		 * the payload that was actually in force, from the one place the rest of this
+		 * method already reads.
 		 */
 		$state = array(
 			'recipients' => null,
 			'values'     => null,
 			'subject'    => '',
 			'notes'      => '',
+			'snapshot'   => $snapshot,
 			'settled'    => false,
 		);
 
 		try {
-			$this->attempt( $order, $email, $rule, $decision, $claim, $snapshot, $outcome, $state );
+			/*
+			 * ⚠ THE PLAN IS BUILT INSIDE THE BOUNDARY, AND IT HAS TO BE (ADR-0016 §7).
+			 * `Consolidation::max_messages()` applies
+			 * `extonify_wcep_consolidation_max_messages` — a PLUGIN-OWNED extension
+			 * point invoked between the claim and the send, which is the precise
+			 * situation ADR-0014 §10 widened this boundary to cover. A callback there
+			 * that throws must not break the merchant's status change.
+			 */
+			$plan = Consolidation::plan( $rule, $decision->matched_items(), Consolidation::max_messages( $rule, $order ) );
+
+			// The plan's own diagnostics — an unrecognised stored value (§1a) or a cap
+			// fallback with its count (§7) — seed the delivery's notes, so every row
+			// this delivery writes carries the reason its shape is what it is.
+			$state['notes'] = Consolidation::note_line( $plan );
+
+			if ( Consolidation::is_fan_out( $plan ) ) {
+				$this->fan_out( $order, $email, $rule, $decision, $claim, $outcome, $plan, $state );
+			} else {
+				// ONE MESSAGE: `none`, the cap fallback, and §1a all arrive here, and
+				// for a plain `none` rule the snapshot is byte-identical to what it
+				// was before this ADR — `Consolidation::snapshot_for()` returns nothing
+				// for a rule that never asked for consolidation.
+				$state['snapshot'] = self::message_snapshot( $snapshot, $plan, $plan['messages'][0] );
+
+				$this->attempt( $order, $email, $rule, $decision, $claim, $outcome, $state, $plan['messages'][0] );
+			}
 		} catch ( \Throwable $error ) {
 			if ( $state['settled'] ) {
 				// This delivery already has its row. The throw came from the
@@ -980,7 +1013,7 @@ class Orchestrator {
 						// PARTIAL NOTES INCLUDED (ADR-0014 §1c) — whatever resolution
 						// had recorded by the moment it threw.
 						self::notes_for( $state ),
-						$snapshot,
+						(array) $state['snapshot'],
 						// ADR-0015 §8.1: conditional on the lease for a delayed
 						// delivery, unconditional for an immediate one.
 						DeliveryLogger::transition_from( $claim )
@@ -1018,13 +1051,62 @@ class Orchestrator {
 	 */
 	private static function notes_for( array $state ): string {
 		$notes  = (string) ( $state['notes'] ?? '' );
-		$values = $state['values'] ?? null;
+		$merged = self::value_notes( $state['values'] ?? null );
 
-		if ( ! $values instanceof PlaceholderValues || ! $values->has_notes() ) {
+		if ( '' === $merged ) {
 			return $notes;
 		}
 
-		return '' === $notes ? $values->notes_line() : $notes . '; ' . $values->notes_line();
+		return '' === $notes ? $merged : $notes . '; ' . $merged;
+	}
+
+	/**
+	 * The notes from one value set, or merged across several (ADR-0016 §7).
+	 *
+	 * ⚠ THE SINGLE-SET PATH IS DELEGATED UNCHANGED, DELIBERATELY. Every delivery that
+	 * predates the cap fallback holds exactly one value set, and re-implementing
+	 * `notes_line()`'s assembly here would risk changing that string — including its
+	 * own overflow sentinel, which `notes()` already appends. `none` output stays
+	 * byte-identical because this branch does not touch it.
+	 *
+	 * THE MULTI-ENTRY PATH IS THE CAPPED FALLBACK, where the body is rendered once per
+	 * unit and each section has its own set (ADR-0014 §5a). Merging is
+	 * DE-DUPLICATED and RE-CAPPED by `PlaceholderValues::fold_notes()`, and both are
+	 * required rather than tidy: an unknown token is unknown in every section, so sixty
+	 * sections would otherwise repeat one authoring mistake sixty times, and sixty sets
+	 * × `MAX_NOTES` would put twelve hundred note strings in a `reason` column that
+	 * holds one sentence. The bound is therefore the SAME as a single delivery's.
+	 *
+	 * ⚠ AN ENTRY MAY BE A SET **OR** AN ALREADY-MERGED NOTE LIST, and the second shape
+	 * is what keeps retained memory linear (ADR-0016 §7a). A section's set memoises a
+	 * full-set plural string that is itself O(units), so the renderer folds each
+	 * section's notes out and releases the set; what reaches here for the completed
+	 * sections is therefore `string[]`, with the LIVE section still arriving as a set so
+	 * a throw inside it reports what it had reached.
+	 *
+	 * @param mixed $values A `PlaceholderValues`, an array of sets and/or note lists,
+	 *                      or null.
+	 * @return string
+	 */
+	private static function value_notes( $values ): string {
+		if ( $values instanceof PlaceholderValues ) {
+			return $values->has_notes() ? $values->notes_line() : '';
+		}
+
+		$accumulator = array();
+
+		foreach ( (array) $values as $entry ) {
+			if ( $entry instanceof PlaceholderValues ) {
+				$accumulator = PlaceholderValues::fold_notes( $accumulator, $entry->notes() );
+				continue;
+			}
+
+			if ( is_array( $entry ) ) {
+				$accumulator = PlaceholderValues::fold_notes( $accumulator, $entry );
+			}
+		}
+
+		return implode( '; ', PlaceholderValues::folded_notes( $accumulator ) );
 	}
 
 	/**
@@ -1039,36 +1121,19 @@ class Orchestrator {
 	 * @param array         $rule     Rule row — the SAME one the matcher used.
 	 * @param MatchDecision $decision The matched decision.
 	 * @param array         $claim    Claim result.
-	 * @param array         $snapshot Extra snapshot payload (halt record).
 	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
 	 * @param array         $state    Containment state, by reference.
+	 * @param array         $message  The plan's single message (ADR-0016 §5). For a
+	 *                                plain `none` rule its `item_id` is 0, which is
+	 *                                ADR-0014 §5's unchanged first-matched-item
+	 *                                binding.
 	 * @return void
 	 */
-	private function attempt( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, array $claim, array $snapshot, RunOutcome $outcome, array &$state ): void {
+	private function attempt( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, array $claim, RunOutcome $outcome, array &$state, array $message ): void {
 		$delivery_id = (int) $claim['delivery_id'];
+		$snapshot    = (array) $state['snapshot'];
 
-		/*
-		 * ONE VALUE SET FOR THE WHOLE DELIVERY (ADR-0014 §8). Subject, heading and
-		 * both body formats resolve against it, so each placeholder is resolved
-		 * ONCE however many times it appears and whatever format it appears in —
-		 * and the notes it accumulates are this delivery's, recorded once.
-		 */
-		$values = $this->placeholders->for_delivery( $order, $decision->matched_items() );
-
-		// HANDED TO THE BOUNDARY IMMEDIATELY, so every throw from here on reports
-		// the notes taken up to it (ADR-0014 §1c).
-		$state['values'] = $values;
-
-		$recipients          = RecipientResolver::resolve(
-			$this->recipients_value( $rule ),
-			array(
-				RecipientResolver::TOKEN_CUSTOMER => (string) $order->get_billing_email(),
-				RecipientResolver::TOKEN_ADMIN    => (string) get_option( 'admin_email', '' ),
-				// ADR-0014 §7: the second — and last — address a recipient
-				// placeholder may resolve to.
-				RecipientResolver::TOKEN_STORE    => PlaceholderValues::store_email(),
-			)
-		);
+		$recipients          = $this->resolve_recipients( $order, $rule );
 		$state['recipients'] = $recipients;
 
 		if ( ! $recipients->is_valid() || ! $recipients->is_deliverable() ) {
@@ -1090,29 +1155,14 @@ class Orchestrator {
 			return;
 		}
 
+		$state['notes'] = self::delivery_notes( $rule, $recipients, (string) $state['notes'] );
+
 		/*
 		 * PLACEHOLDERS RESOLVE HERE, AT SEND TIME, AGAINST THE LIVE ORDER
 		 * (ADR-0014 §8) — never at rule-save time, which ADR-0007 would have made
 		 * Prompt 7 undo.
-		 *
-		 * The subject and the heading resolve in the HEADER context, so every
-		 * value is `HeaderGuard`-stripped as it is substituted; the outer strip
-		 * below still catches a break the MERCHANT put in the template itself.
-		 * The body resolves twice — see PlaceholderResolver::render_body().
 		 */
-		$state['notes'] = $recipients->reason();
-
-		$subject          = HeaderGuard::strip( $values->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
-		$state['subject'] = $subject;
-
-		$heading = HeaderGuard::strip( $values->render( (string) ( $rule['heading'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
-		$body    = PlaceholderResolver::render_body( $values, (string) ( $rule['content'] ?? '' ) );
-
-		if ( HeaderGuard::has_break( (string) ( $rule['subject'] ?? '' ) ) ) {
-			$state['notes'] = '' === $state['notes']
-				? 'stripped a line break from the subject'
-				: $state['notes'] . '; stripped a line break from the subject';
-		}
+		$composed = $this->compose( $order, $rule, $decision, $message, $state );
 
 		/*
 		 * ADR-0014 §1a: an unrecognised placeholder, a refused meta key or a stripped
@@ -1135,20 +1185,8 @@ class Orchestrator {
 		 * wraps this whole method rather than this one call: ADR-0014 §10 moved it
 		 * out because resolution — not just transport — now runs third-party code.
 		 */
-		$result = $email->trigger(
-			array(
-				'recipient'     => implode( ', ', $recipients->addresses( 'to' ) ),
-				'cc'            => implode( ', ', $recipients->addresses( 'cc' ) ),
-				'bcc'           => implode( ', ', $recipients->addresses( 'bcc' ) ),
-				'subject'       => $subject,
-				'heading'       => $heading,
-				'content'       => $body['html'],
-				'content_plain' => $body['plain'],
-				'matched_items' => $decision->matched_items(),
-				'delivery_id'   => $delivery_id,
-				'object'        => $order,
-			)
-		);
+		$subject = $composed['subject'];
+		$result  = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id ) );
 
 		/*
 		 * THE PER-DELIVERY FILTER IS NOT A TRANSPORT FAILURE (ADR-0012 §5a).
@@ -1215,6 +1253,485 @@ class Orchestrator {
 		// produce one, or the tombstone is left `claimed` with nothing to explain
 		// it. Between those two is where this flag goes.
 		$state['settled'] = true;
+	}
+
+	/**
+	 * Send N messages for ONE claimed decision (ADR-0016 §3, §5).
+	 *
+	 * ⚠ ONE CLAIM, N MESSAGES, ONE AGGREGATE FINALISATION. The tombstone is the unit
+	 * of DECISION and this method expands that decision; it never claims anything, so
+	 * a re-fired trigger is suppressed before it ever gets here.
+	 *
+	 * RECIPIENTS ARE RESOLVED ONCE, NOT PER MESSAGE (ADR-0016 §6), and that is a
+	 * correctness statement as well as a cost one: ADR-0014 §7 limits recipient
+	 * placeholders to `{customer_email}` and `{store_email}`, neither of which is
+	 * product-scoped, so every message in a fan-out is addressed identically. An
+	 * unusable recipients document therefore produces ONE skip for the whole delivery
+	 * rather than N identical ones.
+	 *
+	 * ⚠ FINALISATION IS AFTER THE LOOP, AND MUST BE. Finalising per message would
+	 * leave the tombstone holding whichever outcome was written LAST, so
+	 * `{failed, sent}` would report `sent` and lose the failure entirely. The attempt
+	 * ROWS are still written as each message completes, because a row is evidence of a
+	 * side effect that has already happened (ADR-0015 §8.9).
+	 *
+	 * @param \WC_Order     $order    Order.
+	 * @param Custom_Email  $email    The live email object.
+	 * @param array         $rule     Rule row — the SAME one the matcher used.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $claim    Claim result.
+	 * @param RunOutcome    $outcome  THIS run's outcome, collected into.
+	 * @param array         $plan     Plan from `Consolidation::plan()`.
+	 * @param array         $state    Containment state, by reference.
+	 * @return void
+	 */
+	private function fan_out( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, array $claim, RunOutcome $outcome, array $plan, array &$state ): void {
+		$delivery_id = (int) $claim['delivery_id'];
+		$snapshot    = (array) $state['snapshot'];
+
+		$recipients          = $this->resolve_recipients( $order, $rule );
+		$state['recipients'] = $recipients;
+
+		if ( ! $recipients->is_valid() || ! $recipients->is_deliverable() ) {
+			$outcome->record(
+				RunOutcome::SKIPPED,
+				$decision->rule_id(),
+				$delivery_id,
+				$this->logger->record_skip(
+					$claim,
+					( $recipients->is_valid()
+						? 'no deliverable recipient resolved: ' . ( '' !== $recipients->reason() ? $recipients->reason() : 'the rule declares no "to" recipient' )
+						: 'recipients document unusable: ' . $recipients->reason() )
+						. '; no consolidated message was attempted',
+					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
+				)
+			);
+			$state['settled'] = true;
+			return;
+		}
+
+		// PER DELIVERY, COMPUTED ONCE: both halves are facts about the RULE and the
+		// recipients document, not about any one message, so appending them inside the
+		// loop would repeat them in every row.
+		$state['notes'] = self::delivery_notes( $rule, $recipients, (string) $state['notes'] );
+
+		$result = new FanOutResult();
+
+		foreach ( $plan['messages'] as $message ) {
+			$this->fan_out_message( $order, $email, $rule, $decision, $delivery_id, $plan, $message, $recipients, $result, $state );
+		}
+
+		$outcome->record(
+			$result->run_action(),
+			$decision->rule_id(),
+			$delivery_id,
+			// ADR-0015 §8.1: `executing -> …` for a delayed delivery, an unconditional
+			// write for an immediate one — unchanged by the fan-out, because there is
+			// still exactly one tombstone and exactly one terminal write.
+			$this->logger->record_fanout_outcome( $delivery_id, $result, DeliveryLogger::transition_from( $claim ) )
+		);
+
+		$state['settled'] = true;
+	}
+
+	/**
+	 * Compose and send ONE message of a fan-out, contained (ADR-0016 §5).
+	 *
+	 * ⚠ THE CONTAINMENT IS PER MESSAGE, AND THAT IS THE POINT. One message's failure
+	 * must not abort the remaining messages — the Prompt 6A boundary applied per
+	 * message rather than per delivery. Message 2 throwing while resolving a
+	 * placeholder leaves messages 1 and 3 to send, is recorded against message 2, and
+	 * never escapes into `woocommerce_order_status_changed`.
+	 *
+	 * ⚠ `values` AND `subject` ARE RESET FIRST. They are per-MESSAGE facts living on
+	 * per-DELIVERY state, so a message that throws before setting them would otherwise
+	 * have the PREVIOUS message's value-set notes and subject written onto its own
+	 * failure row — one product's diagnostics attributed to another, which is the
+	 * ADR-0012 §11 shape at message scale.
+	 *
+	 * @param \WC_Order          $order       Order.
+	 * @param Custom_Email       $email       The live email object.
+	 * @param array              $rule        Rule row.
+	 * @param MatchDecision      $decision    The matched decision.
+	 * @param int                $delivery_id Tombstone id.
+	 * @param array              $plan        Plan from `Consolidation::plan()`.
+	 * @param array              $message     This message's descriptor.
+	 * @param ResolvedRecipients $recipients  Recipients, resolved once per delivery.
+	 * @param FanOutResult       $result      The fan-out's accumulator.
+	 * @param array              $state       Containment state, by reference.
+	 * @return void
+	 */
+	private function fan_out_message( \WC_Order $order, Custom_Email $email, array $rule, MatchDecision $decision, int $delivery_id, array $plan, array $message, ResolvedRecipients $recipients, FanOutResult $result, array &$state ): void {
+		$state['values']  = null;
+		$state['subject'] = '';
+
+		$snapshot = self::message_snapshot( (array) $state['snapshot'], $plan, $message );
+
+		try {
+			$composed = $this->compose( $order, $rule, $decision, $message, $state );
+			$sent     = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id ) );
+
+			$this->logger->record_fanout_message(
+				$delivery_id,
+				$result,
+				$message,
+				$recipients,
+				$composed['subject'],
+				self::message_outcome( $sent ),
+				self::message_reason( $sent, self::notes_for( $state ) ),
+				Custom_Email::NOT_SENT === $sent ? 'the mailer reported the message as not sent' : null,
+				$snapshot
+			);
+		} catch ( \Throwable $error ) {
+			$this->record_message_failure( (int) $order->get_id(), $delivery_id, $result, $message, $recipients, $error, $snapshot, $state );
+		}
+	}
+
+	/**
+	 * Record one fan-out message that threw, without letting the throw escape.
+	 *
+	 * ⚠ THE TALLY IS UPDATED EVEN WHEN THE RECORDING ITSELF THROWS. `$result->record()`
+	 * is the LAST thing `record_fanout_message()` does, so a throw from writing the
+	 * rows means the message is not in the tally at all — and a missing FAILED entry
+	 * would let the aggregate report `sent` for a fan-out one of whose messages did
+	 * not go out. That is the outcome-truthfulness failure this whole ADR turns on, so
+	 * the inner catch records the message directly.
+	 *
+	 * @param int                $order_id    Order id, for the last-resort log line.
+	 * @param int                $delivery_id Tombstone id.
+	 * @param FanOutResult       $result      The fan-out's accumulator.
+	 * @param array              $message     This message's descriptor.
+	 * @param ResolvedRecipients $recipients  Recipients for this delivery.
+	 * @param \Throwable         $error       What was thrown.
+	 * @param array              $snapshot    This message's snapshot payload.
+	 * @param array              $state       Containment state, by reference.
+	 * @return void
+	 */
+	private function record_message_failure( int $order_id, int $delivery_id, FanOutResult $result, array $message, ResolvedRecipients $recipients, \Throwable $error, array $snapshot, array &$state ): void {
+		$described = get_class( $error ) . ': ' . $error->getMessage();
+
+		try {
+			$this->logger->record_fanout_message(
+				$delivery_id,
+				$result,
+				$message,
+				$recipients,
+				(string) $state['subject'],
+				FanOutResult::FAILED,
+				// PARTIAL NOTES INCLUDED (ADR-0014 §1c) — whatever THIS message's value
+				// set had recorded by the moment it threw.
+				self::notes_for( $state ),
+				$described,
+				$snapshot
+			);
+		} catch ( \Throwable $while_recording ) {
+			/*
+			 * ⚠ THE TALLY FIRST, THE LOG LINE SECOND. `record_inert()` reaches
+			 * `wc_get_logger()` and can itself throw, and if it did before the tally was
+			 * updated the aggregate would be computed from a set that is missing this
+			 * message — reporting `sent` for a fan-out one of whose messages did not go
+			 * out. The tally is the load-bearing fact; the log line is the diagnostic.
+			 */
+			$result->record( $message, FanOutResult::FAILED, 1, 0, $described );
+
+			$this->logger->record_inert(
+				$order_id,
+				'delivery #' . $delivery_id . ' message ' . (int) $message['index'],
+				'recording a contained consolidated-message failure ALSO threw: '
+					. get_class( $while_recording ) . ': ' . $while_recording->getMessage()
+					. ' (original: ' . $described . ')'
+			);
+		}
+	}
+
+	/**
+	 * One message's `trigger()` outcome, as a `FanOutResult` code.
+	 *
+	 * ⚠ A FILTER REFUSAL AND AN EMPTY RECIPIENT ARE SKIPS, NOT FAILURES
+	 * (ADR-0012 §5a). `woocommerce_email_enabled_{id}` runs with the order, the
+	 * content and the recipients attached, so a third party returning false there made
+	 * a DECISION; recording it as `failed` would blame the mailer for something the
+	 * mailer never saw, and would drag the whole fan-out's aggregate to `failed` with
+	 * it.
+	 *
+	 * @param string $sent A `Custom_Email::trigger()` outcome.
+	 * @return string
+	 */
+	private static function message_outcome( string $sent ): string {
+		if ( Custom_Email::SENT === $sent ) {
+			return FanOutResult::SENT;
+		}
+
+		if ( Custom_Email::DISABLED_BY_FILTER === $sent || Custom_Email::NO_RECIPIENT === $sent ) {
+			return FanOutResult::SKIPPED;
+		}
+
+		return FanOutResult::FAILED;
+	}
+
+	/**
+	 * One message's stored `reason`, naming WHY when it is not a plain send.
+	 *
+	 * @param string $sent  A `Custom_Email::trigger()` outcome.
+	 * @param string $notes This message's accumulated notes.
+	 * @return string
+	 */
+	private static function message_reason( string $sent, string $notes ): string {
+		if ( Custom_Email::DISABLED_BY_FILTER === $sent ) {
+			$notes = self::join_notes(
+				'disabled_by_filter: the ' . Custom_Email::enabled_filter() . ' filter returned false for this message',
+				$notes
+			);
+		}
+
+		if ( Custom_Email::NO_RECIPIENT === $sent ) {
+			$notes = self::join_notes( 'no recipient survived header sanitisation, so nothing was sent', $notes );
+		}
+
+		return $notes;
+	}
+
+	/**
+	 * Resolve ONE message's content against ITS OWN value set (ADR-0016 §6).
+	 *
+	 * ⚠ ONE VALUE SET PER MESSAGE, NEVER ONE REUSED ACROSS MESSAGES. The set memoises
+	 * by `name:parameter`, so a shared set would answer message 2 with message 1's
+	 * memoised `{product_name}` — the ADR-0014 §5a defect reintroduced through the
+	 * cache. This is the single most likely way to get consolidation subtly wrong, and
+	 * `for_delivery()` returning a NEW object per call is what prevents it.
+	 *
+	 * The binding itself is ADR-0014 §5a's, on a different axis: `item_id` is the
+	 * unit's representative line item for a `per_product` message and 0 for a combined
+	 * one, and at 0 the singular item placeholders resolve against the first matched
+	 * item exactly as they always have.
+	 *
+	 * The subject and the heading resolve in the HEADER context, so every value is
+	 * `HeaderGuard`-stripped as it is substituted; the outer strip still catches a
+	 * break the MERCHANT put in the template itself. The body resolves twice — see
+	 * `PlaceholderResolver::render_body()`.
+	 *
+	 * @param \WC_Order     $order    Order.
+	 * @param array         $rule     Rule row.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $message  This message's descriptor.
+	 * @param array         $state    Containment state, by reference.
+	 * @return array{subject:string,heading:string,body:array{html:string,plain:string}}
+	 */
+	private function compose( \WC_Order $order, array $rule, MatchDecision $decision, array $message, array &$state ): array {
+		$sections = (array) ( $message['sections'] ?? array() );
+
+		if ( array() !== $sections ) {
+			// THE CAP FALLBACK ONLY (ADR-0016 §7). Empty for `none` and for every real
+			// fan-out message, so both take the unchanged path below.
+			return $this->compose_sectioned( $order, $rule, $decision, $message, $sections, $state );
+		}
+
+		/*
+		 * ⚠ THE FULL MATCHED SET, PLUS THIS MESSAGE'S BINDING. The plural forms —
+		 * `{product_names}`, `{matched_product_list}` — deliberately list ALL matched
+		 * products in every message (ADR-0016 §6): a merchant writing them asked for
+		 * the whole set, and narrowing them would make `{product_names}` a duplicate of
+		 * `{product_name}` under a misleading name. Only the singular forms move, and
+		 * the binding is what moves them.
+		 */
+		$values = $this->placeholders->for_delivery( $order, $decision->matched_items(), (int) $message['item_id'] );
+
+		// HANDED TO THE BOUNDARY AS SOON AS IT EXISTS, so every throw from here on
+		// reports the notes taken up to it (ADR-0014 §1c).
+		$state['values'] = $values;
+
+		$subject          = HeaderGuard::strip( $values->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$state['subject'] = $subject;
+
+		return array(
+			'subject' => $subject,
+			'heading' => HeaderGuard::strip( $values->render( (string) ( $rule['heading'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) ),
+			'body'    => PlaceholderResolver::render_body( $values, (string) ( $rule['content'] ?? '' ) ),
+		);
+	}
+
+	/**
+	 * Compose the CAP FALLBACK: one message whose body covers every unit
+	 * (ADR-0016 §7).
+	 *
+	 * ⚠ WHY THIS EXISTS. The fallback used to reuse self::compose() with
+	 * `item_id = 0`, which is ADR-0014 §5's first-matched-item binding — so a rule
+	 * whose template reads `Care guide for {product_name}` produced ONE message naming
+	 * PRODUCT ONE, and products 2–60 appeared nowhere the customer could see. The
+	 * fallback's own ADR clause claimed it "contained all matched products"; it
+	 * contained them only if the merchant had pre-emptively added a plural placeholder
+	 * to a template written for a single product.
+	 *
+	 * THE SUBJECT AND THE HEADING BIND THROUGH `item_id`, EXACTLY AS `none` DOES, and
+	 * that is the whole reason this method does not touch them: they can carry one
+	 * value, so they carry the first unit's — which is what `none` has always done, so
+	 * the fallback introduces no new header semantics. The per-unit completeness lives
+	 * entirely in the body.
+	 *
+	 * ⚠ THE BOUNDARY IS UPDATED AS EACH SECTION STARTS, NOT ONCE THE LOOP RETURNS, and
+	 * that is a correction to what this method used to do. It handed over the HEADER's
+	 * set, then the section sets only after EVERY section had completed — so a throw in
+	 * section 5 discarded sections 1–4's notes entirely while the comment claimed they
+	 * were reported. The renderer now calls back before each section with the live set
+	 * and the completed sections' merged notes, so what the failure row reports is what
+	 * resolution had actually reached (ADR-0014 §1a, §1c).
+	 *
+	 * ⚠ AND THE COMPLETED SECTIONS ARRIVE AS NOTES RATHER THAN AS SETS (ADR-0016 §7a).
+	 * Each section's set memoises a full-set plural that is itself O(units); retaining
+	 * one per unit would be quadratic memory. `self::value_notes()` therefore accepts
+	 * both shapes.
+	 *
+	 * @param \WC_Order     $order    Order.
+	 * @param array         $rule     Rule row.
+	 * @param MatchDecision $decision The matched decision.
+	 * @param array         $message  This message's descriptor.
+	 * @param array[]       $sections Section descriptors from the plan.
+	 * @param array         $state    Containment state, by reference.
+	 * @return array{subject:string,heading:string,body:array{html:string,plain:string}}
+	 */
+	private function compose_sectioned( \WC_Order $order, array $rule, MatchDecision $decision, array $message, array $sections, array &$state ): array {
+		$header = $this->placeholders->for_delivery( $order, $decision->matched_items(), (int) $message['item_id'] );
+
+		// HANDED OVER BEFORE THE BODY RENDERS, so a throw inside the sections still
+		// reports the header's notes (ADR-0014 §1c).
+		$state['values'] = array( $header );
+
+		$body = $this->placeholders->render_sectioned_body(
+			$order,
+			$decision->matched_items(),
+			$sections,
+			(string) ( $rule['content'] ?? '' ),
+			static function ( PlaceholderValues $live, array $so_far ) use ( &$state, $header ): void {
+				$state['values'] = array( $header, $so_far, $live );
+			}
+		);
+
+		$state['values'] = array( $header, $body['notes'] );
+
+		$subject          = HeaderGuard::strip( $header->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$state['subject'] = $subject;
+
+		return array(
+			'subject' => $subject,
+			'heading' => HeaderGuard::strip( $header->render( (string) ( $rule['heading'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) ),
+			'body'    => array(
+				'html'  => $body['html'],
+				'plain' => $body['plain'],
+			),
+		);
+	}
+
+	/**
+	 * The argument set one message hands `Custom_Email::trigger()`.
+	 *
+	 * ⚠ `matched_items` IS THE WHOLE DECISION'S, NOT THE MESSAGE'S UNIT (ADR-0016 §6).
+	 * That property describes the DECISION — one per rule per trigger — and a
+	 * per-message variant would give one field two meanings for the sake of something
+	 * nothing currently renders. A message's own scope is carried by the placeholder
+	 * binding in self::compose(), which is the one place it belongs.
+	 *
+	 * @param \WC_Order          $order       Order.
+	 * @param MatchDecision      $decision    The matched decision.
+	 * @param ResolvedRecipients $recipients  Resolved recipients.
+	 * @param array              $composed    Output of self::compose().
+	 * @param int                $delivery_id Tombstone id.
+	 * @return array
+	 */
+	private function send_args( \WC_Order $order, MatchDecision $decision, ResolvedRecipients $recipients, array $composed, int $delivery_id ): array {
+		return array(
+			'recipient'     => implode( ', ', $recipients->addresses( 'to' ) ),
+			'cc'            => implode( ', ', $recipients->addresses( 'cc' ) ),
+			'bcc'           => implode( ', ', $recipients->addresses( 'bcc' ) ),
+			'subject'       => $composed['subject'],
+			'heading'       => $composed['heading'],
+			'content'       => $composed['body']['html'],
+			'content_plain' => $composed['body']['plain'],
+			'matched_items' => $decision->matched_items(),
+			'delivery_id'   => $delivery_id,
+			'object'        => $order,
+		);
+	}
+
+	/**
+	 * Resolve this delivery's recipients.
+	 *
+	 * ONCE PER DELIVERY, WHATEVER THE MESSAGE COUNT (ADR-0016 §6). ADR-0014 §7 permits
+	 * no product-scoped recipient placeholder, so a fan-out's messages are addressed
+	 * identically and resolving per message would be N answers to one question.
+	 *
+	 * @param \WC_Order $order Order.
+	 * @param array     $rule  Rule row.
+	 * @return ResolvedRecipients
+	 */
+	private function resolve_recipients( \WC_Order $order, array $rule ): ResolvedRecipients {
+		return RecipientResolver::resolve(
+			$this->recipients_value( $rule ),
+			array(
+				RecipientResolver::TOKEN_CUSTOMER => (string) $order->get_billing_email(),
+				RecipientResolver::TOKEN_ADMIN    => (string) get_option( 'admin_email', '' ),
+				// ADR-0014 §7: the second — and last — address a recipient
+				// placeholder may resolve to.
+				RecipientResolver::TOKEN_STORE    => PlaceholderValues::store_email(),
+			)
+		);
+	}
+
+	/**
+	 * The notes that belong to the DELIVERY rather than to any one message.
+	 *
+	 * Both are facts about the rule and the recipients document, so a fan-out computes
+	 * them once: appending them per message would repeat one sentence in N rows and
+	 * push the message's own diagnostics out of the `reason` column.
+	 *
+	 * The line-break check reads the stored SUBJECT TEMPLATE, so its answer does not
+	 * depend on rendering and it is computed before it rather than after — which also
+	 * means a delivery that throws mid-render now reports it, where before the note
+	 * was lost.
+	 *
+	 * @param array              $rule       Rule row.
+	 * @param ResolvedRecipients $recipients Resolved recipients.
+	 * @param string             $existing   Notes already accumulated (the plan's).
+	 * @return string
+	 */
+	private static function delivery_notes( array $rule, ResolvedRecipients $recipients, string $existing ): string {
+		$notes = self::join_notes( $existing, $recipients->reason() );
+
+		if ( HeaderGuard::has_break( (string) ( $rule['subject'] ?? '' ) ) ) {
+			$notes = self::join_notes( $notes, 'stripped a line break from the subject' );
+		}
+
+		return $notes;
+	}
+
+	/**
+	 * Join two note fragments with the separator the rest of the plugin uses.
+	 *
+	 * @param string $existing Notes so far.
+	 * @param string $addition Note to append.
+	 * @return string
+	 */
+	private static function join_notes( string $existing, string $addition ): string {
+		if ( '' === $addition ) {
+			return $existing;
+		}
+
+		return '' === $existing ? $addition : $existing . '; ' . $addition;
+	}
+
+	/**
+	 * One message's snapshot payload: the delivery's, plus its place in the fan-out.
+	 *
+	 * ⚠ FOR A PLAIN `none` RULE THIS RETURNS THE PAYLOAD UNCHANGED.
+	 * `Consolidation::snapshot_for()` yields nothing for a rule that never asked for
+	 * consolidation, so a delivery that predates this ADR writes byte-identical rows.
+	 *
+	 * @param array $snapshot The delivery's payload (halt record, scheduled audit).
+	 * @param array $plan     Plan from `Consolidation::plan()`.
+	 * @param array $message  One of its messages.
+	 * @return array
+	 */
+	private static function message_snapshot( array $snapshot, array $plan, array $message ): array {
+		return array_merge( $snapshot, Consolidation::snapshot_for( $plan, $message ) );
 	}
 
 	/**
@@ -1317,12 +1834,19 @@ class Orchestrator {
 	 *
 	 * THE UNIMPLEMENTED-BEHAVIOUR LIST COVERS WHAT IS STILL UNOWNED, and is
 	 * maintained as a list rather than grown one incident at a time
-	 * (self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS). ⚠ `consolidation` was missing until
-	 * Prompt 5C: Prompt 5B gave it validated storage, so a merchant could store
-	 * `daily` and have the rule delivered **immediately, once per trigger**, which is
-	 * the behaviour of `none` under another name. Out of scope silently meant
-	 * "handled by whatever path exists" — the same defect as insert rules being sent
-	 * separately, arriving through DATA rather than through code.
+	 * (self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS). ⚠ IT IS NOW **EMPTY**
+	 * (ADR-0016 §9): `consolidation` was its last entry and Prompt 8 implements it, so
+	 * this phase delivers `per_product` rules as well as `none` ones and the fan-out
+	 * happens BELOW the claim (ADR-0016 §3). The list and its test stay, so a future
+	 * column re-arms the gate the moment somebody adds it.
+	 *
+	 * ⚠ `consolidation` IS NO LONGER FILTERED HERE, AND IT DOES NOT NEED TO BE. Its
+	 * vocabulary is now an ENUMERATION at the write boundary (ADR-0016 §1), so a value
+	 * outside `Consolidation::MODES` cannot be stored at all — which is strictly
+	 * stronger than a phase filter that had to remember it. That filter existed
+	 * because Prompt 5B gave the column validated STORAGE with no vocabulary, so a
+	 * merchant could store `daily` and have the rule delivered immediately, once per
+	 * trigger: `none`'s behaviour under another name.
 	 *
 	 * @param array[] $rules Candidate rule rows.
 	 * @return array[] Rows this phase may deliver.
@@ -1342,6 +1866,26 @@ class Orchestrator {
 				continue;
 			}
 
+			/*
+			 * ⚠ THE READ BOUNDARY, AND IT IS A SEPARATE MECHANISM FROM THE ONE BELOW
+			 * (ADR-0016 §1a). A rule whose `consolidation` is outside the vocabulary is
+			 * CORRUPT DATA and is not deliverable: no claim, no send, no record.
+			 *
+			 * IT IS CHECKED HERE, BEFORE EVALUATION, BECAUSE OF `stop_processing`. This
+			 * used to be missing entirely, and `behaviour_is_implemented()` returns true
+			 * for everything now that §9 emptied its enumeration — so an invalid rule
+			 * ENTERED `RuleMatcher`, and a matching invalid rule carrying the stop flag
+			 * HALTED every lower-priority rule behind it. The customer received an email
+			 * the merchant never configured AND lost the one they did.
+			 *
+			 * ⚠ AND IT IS NOT AN EXOTIC CASE. `daily`, `weekly` and `per_order` were
+			 * LEGITIMATELY STORABLE from Prompt 5B to Prompt 8, so this is the upgrade
+			 * path for any store that used one — no direct SQL involved.
+			 */
+			if ( ! Consolidation::has_valid_value( $rule ) ) {
+				continue;
+			}
+
 			if ( ! self::behaviour_is_implemented( $rule ) ) {
 				continue;
 			}
@@ -1354,33 +1898,44 @@ class Orchestrator {
 
 	/**
 	 * Columns carrying behaviour no phase implements yet, with the ONLY value each
-	 * may hold to be deliverable (ADR-0012 §9, ADR-0013 §8a, ADR-0015 §7).
+	 * may hold to be deliverable (ADR-0012 §9, ADR-0013 §8a, ADR-0015 §7,
+	 * ADR-0016 §9).
 	 *
-	 * | Column | Deliverable value | Owner |
-	 * |---|---|---|
-	 * | `consolidation` | `none` | a later prompt — ADR-0005 consolidation |
+	 * ⚠ **IT IS EMPTY, AND IT IS DELIBERATELY NOT DELETED.**
 	 *
-	 * A rule holding anything else is left ENTIRELY untouched by EVERY phase: no
-	 * claim, no send, no schedule, no record, and — because the filter runs BEFORE
-	 * evaluation — no halt of a supported rule through its `stop_processing` flag.
+	 * Every column that ever lived here has been implemented: `delay_seconds` left in
+	 * Prompt 7 to become a phase discriminator, and `consolidation` — its last entry
+	 * — leaves in Prompt 8 because ADR-0016 gives it behaviour. There is nothing left
+	 * to hold.
 	 *
-	 * ⚠ `delay_seconds` WAS REMOVED FROM THIS LIST IN PROMPT 7, and the removal is
-	 * an explicit, asserted change rather than a silently weakened check
-	 * (ADR-0015 §7). It is now a PHASE DISCRIMINATOR — `0` for the immediate
-	 * phase, `> 0` for `ScheduledPhase` — which is a different kind of fact from
-	 * "no code implements this yet". The enumeration test asserts this list
-	 * exactly, so a future addition or removal has to be written down by whoever
-	 * makes it; that discipline is what caught `consolidation`.
+	 * The MECHANISM stays anyway, and `DeliveryPhaseTest` asserts the emptiness rather
+	 * than dropping the assertion, because this is the discipline that caught
+	 * `consolidation` in the first place: Prompt 5B gave the column validated storage
+	 * and no filter, so a stored `daily` rule was delivered immediately and once per
+	 * trigger — `none`'s behaviour under another name, out-of-scope behaviour reachable
+	 * through DATA rather than through code. A future column carrying behaviour nobody
+	 * has built yet gets added HERE, both phases inherit the filtering with no new
+	 * plumbing, and **adding it without a filter is a failing test rather than a defect
+	 * somebody has to notice**.
+	 *
+	 * A rule holding a non-default value for any listed column is left ENTIRELY
+	 * untouched by EVERY phase: no claim, no send, no schedule, no record, and —
+	 * because the filter runs BEFORE evaluation — no halt of a supported rule through
+	 * its `stop_processing` flag.
+	 *
+	 * @var array<string,string>
 	 */
-	const UNIMPLEMENTED_BEHAVIOUR_DEFAULTS = array(
-		'consolidation' => 'none',
-	);
+	const UNIMPLEMENTED_BEHAVIOUR_DEFAULTS = array();
 
 	/**
 	 * Whether every unimplemented-behaviour column on a rule holds its default.
 	 *
-	 * SHARED BY BOTH PHASES so they cannot drift: insert mode applies the same list
-	 * in its indexed fetch, and this is the assertion that the two agree.
+	 * SHARED BY BOTH PHASES so they cannot drift, and KEPT ALIVE WITH AN EMPTY LIST
+	 * (ADR-0016 §9). It returns `true` for every rule today, which is correct — there
+	 * is no unimplemented behaviour left — and it keeps both call sites, so a future
+	 * entry in `self::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` takes effect in both phases
+	 * with no new plumbing. Removing the call sites because the list is empty is how
+	 * the next column would ship deliverable.
 	 *
 	 * @param array $rule Rule row.
 	 * @return bool

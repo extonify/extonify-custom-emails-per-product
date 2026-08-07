@@ -48,6 +48,12 @@ defined( 'ABSPATH' ) || exit;
  *   - ⚠ **shipping line items** — **+2, once per delivery**, and only for a body
  *     that writes `{shipping_method}`. `WC_Order::get_shipping_method()` loads a
  *     line-item TYPE nothing else in the delivery path reads.
+ *   - ⚠ **variation attribute TERMS** — 0 for a custom attribute, and for a global
+ *     (`pa_`) one the `get_term_by()` lookups WordPress caches for the rest of the
+ *     request. Read by `{variation_attributes}` and, since ADR-0016 §7a, by
+ *     `unit_label()` — so a capped fallback reads it once per VARIATION unit rather
+ *     than once per delivery. It does not scale with placeholder count, occurrence
+ *     count or template size, and siblings of one parent share their terms.
  *
  * Every one of those is measured by `PlaceholderTest`, not asserted in a comment.
  */
@@ -75,6 +81,19 @@ final class PlaceholderValues {
 	 * The filter a site owner uses to permit one protected meta key.
 	 */
 	const META_FILTER = 'extonify_wcep_meta_placeholder_allowed';
+
+	/**
+	 * What joins a unit label's name to the attributes that identify it
+	 * (ADR-0016 §7a).
+	 *
+	 * ⚠ AN EN DASH RATHER THAN WooCommerce's OWN ` - `, and the difference is
+	 * legibility rather than taste: a variation title frequently ALREADY contains
+	 * ` - ` — WooCommerce builds `Parent - Red` with it — so reusing it would produce
+	 * `T-Shirt - Red - Colour: Red, Size: Large` with no visible boundary between what
+	 * WooCommerce named and what this plugin appended. It is punctuation, not prose:
+	 * nothing here needs translating.
+	 */
+	const LABEL_SEPARATOR = ' – ';
 
 	/**
 	 * How many distinct notes one delivery will record.
@@ -148,6 +167,18 @@ final class PlaceholderValues {
 	 * @var array<int,\WC_Order_Item_Product>|null
 	 */
 	private $line_items = null;
+
+	/**
+	 * The attributes this set's bound item needs in order to be identifiable, or
+	 * `''` when it needs none — computed at most once (ADR-0016 §7a).
+	 *
+	 * NOT A MEMBER OF self::$values, DELIBERATELY. That map is keyed by
+	 * `name:parameter` and every key in it is reachable from a merchant's template;
+	 * this is not a placeholder and must not become one by accident.
+	 *
+	 * @var string|null
+	 */
+	private $variation_details = null;
 
 	/**
 	 * The line item this value set is BOUND to, or 0 (ADR-0014 §5a).
@@ -489,6 +520,99 @@ final class PlaceholderValues {
 	}
 
 	/**
+	 * THE LABEL FOR ONE FAN-OUT UNIT — a name that identifies it (ADR-0016 §7a).
+	 *
+	 * ⚠ THIS IS NOT `{product_name}`, AND THE DIFFERENCE IS A TIER 1 DEFECT. In a
+	 * capped fallback the units past the bound carry their label and NOTHING ELSE —
+	 * no merchant body, no placeholders — so the label is the whole of what the
+	 * customer receives about that unit. An order item's name does not distinguish
+	 * sibling variations, because WooCommerce generates a variation's title WITHOUT
+	 * its attributes in two ordinary cases (verified in WC 10.9.4,
+	 * `WC_Product_Variation_Data_Store_CPT::generate_product_title()`):
+	 *
+	 *   1. the variation has **3 or more** attributes — `count( $attributes ) < 3`;
+	 *   2. it has **2 or more** and any attribute KEY contains a hyphen, which is what
+	 *      a multi-word attribute name (`Shirt Size` → `shirt-size`) produces;
+	 *
+	 *   (and a third, degenerate one: every attribute is left "Any", so there is no
+	 *   value to put in the title at all.)
+	 *
+	 * In each case both siblings are titled with the bare parent name, so two units
+	 * ADR-0016 §4 defines as DISTINCT — `variation:101` and `variation:102` — arrive as
+	 * two identical lines and either could be either. That the plugin has a separate
+	 * `{variation_attributes}` placeholder is itself the evidence that the name was
+	 * never expected to carry them.
+	 *
+	 * ⚠ ONLY WHAT THE NAME DOES NOT ALREADY SAY. The fourth argument to
+	 * `wc_get_formatted_variation()` is WooCommerce's own "do not list attributes
+	 * already part of the variation name", so a one-attribute variation whose title IS
+	 * `T-Shirt - Red` keeps exactly that label and gains nothing. Appending
+	 * unconditionally would render `T-Shirt - Red – Colour: Red`.
+	 *
+	 * ⚠ A SIMPLE PRODUCT'S LABEL IS BYTE-IDENTICAL to `{product_name}`: there is no
+	 * variation, so there are no details, so nothing is appended. No churn where there
+	 * is no problem.
+	 *
+	 * ⚠ AND A PARTIALLY RESOLVED VARIATION KEEPS THE PARENT LABEL, which is the same
+	 * rule `{variation_attributes}` already follows for the same reason (ADR-0011 §4):
+	 * the variation's own facts are gone, ADR-0016 §4 collapses it onto the parent
+	 * unit, and there is nothing left to identify. Inventing detail there would be
+	 * worse than admitting none.
+	 *
+	 * @return string
+	 */
+	public function unit_label(): string {
+		$name    = $this->value( 'product_name' );
+		$details = $this->variation_details();
+
+		if ( '' === $details ) {
+			return $name;
+		}
+
+		return '' === $name ? $details : $name . self::LABEL_SEPARATOR . $details;
+	}
+
+	/**
+	 * The attributes the bound item's NAME does not already carry (ADR-0016 §7a).
+	 *
+	 * COST: zero queries for a custom attribute, and for a global (`pa_`) one the term
+	 * lookups WordPress caches for the rest of the request — the same data class
+	 * `{variation_attributes}` already reads, and siblings of one parent share their
+	 * terms. Memoised here because a set may be asked for its label more than once.
+	 *
+	 * @return string
+	 */
+	private function variation_details(): string {
+		if ( null !== $this->variation_details ) {
+			return $this->variation_details;
+		}
+
+		$this->variation_details = '';
+
+		$matched      = $this->scoped_item();
+		$variation_id = null === $matched ? 0 : (int) ( $matched['variation_id'] ?? 0 );
+
+		if ( $variation_id <= 0 ) {
+			// A simple product. Nothing to add, and adding nothing is the point.
+			return $this->variation_details;
+		}
+
+		$variation = $this->items->product_for( $variation_id );
+
+		if ( ! $variation instanceof \WC_Product ) {
+			// PARTIALLY RESOLVED (ADR-0011 §4): the id survives, the facts do not.
+			return $this->variation_details;
+		}
+
+		// ⚠ THE FOURTH ARGUMENT IS THE ONE THAT MATTERS: skip attributes already part
+		// of the variation name. WC 10.9.4,
+		// `wc_get_formatted_variation( $variation, $flat, $include_names, $skip_attributes_in_name )`.
+		$this->variation_details = self::flatten( wc_get_formatted_variation( $variation, true, true, true ) );
+
+		return $this->variation_details;
+	}
+
+	/**
 	 * A parameterised meta placeholder (ADR-0014 §6).
 	 *
 	 * FOUR CONSTRAINTS, EACH CLOSING A SPECIFIC HOLE, and every refusal is
@@ -777,7 +901,83 @@ final class PlaceholderValues {
 		$notes = array_values( $this->notes );
 
 		if ( $this->dropped_notes > 0 ) {
-			$notes[] = 'and ' . $this->dropped_notes . ' further placeholder notes not recorded';
+			$notes[] = self::overflow_note( $this->dropped_notes );
+		}
+
+		return $notes;
+	}
+
+	/**
+	 * The sentinel that replaces the notes a cap dropped.
+	 *
+	 * ⚠ ONE SPELLING, THREE CALLERS. This set's own overflow, the SECTIONED body's
+	 * merged overflow (ADR-0016 §7) and the containment boundary's merge all produce
+	 * it, and a merchant reading two different sentences for one fact would reasonably
+	 * conclude they were two different facts.
+	 *
+	 * @param int $dropped How many notes were not recorded.
+	 * @return string
+	 */
+	public static function overflow_note( int $dropped ): string {
+		return 'and ' . $dropped . ' further placeholder notes not recorded';
+	}
+
+	/**
+	 * Fold one note list into an accumulating, de-duplicated, CAPPED set.
+	 *
+	 * ⚠ THIS IS WHAT KEEPS A MULTI-SET DELIVERY'S DIAGNOSTICS THE SAME SIZE AS A
+	 * SINGLE-SET ONE (ADR-0016 §7). The cap fallback renders the merchant's body once
+	 * per unit, and an unknown token is unknown in EVERY unit — so sixty sets would
+	 * otherwise repeat one authoring mistake sixty times, and sixty sets ×
+	 * self::MAX_NOTES would put twelve hundred note strings in a `reason` column that
+	 * holds one sentence. De-duplication and the cap are both required, and the bound
+	 * is deliberately the SAME constant a single delivery is held to.
+	 *
+	 * The accumulator is an opaque `{seen, dropped}` pair rather than a plain array so
+	 * the dropped COUNT survives the fold — a cap that silently discards is the failure
+	 * this project records rather than hides.
+	 *
+	 * @param array    $accumulator Accumulator, or `array()` to start one.
+	 * @param string[] $notes       Notes to fold in.
+	 * @return array{seen:array<string,bool>,dropped:int}
+	 */
+	public static function fold_notes( array $accumulator, array $notes ): array {
+		$seen    = (array) ( $accumulator['seen'] ?? array() );
+		$dropped = (int) ( $accumulator['dropped'] ?? 0 );
+
+		foreach ( $notes as $note ) {
+			$note = (string) $note;
+
+			if ( isset( $seen[ $note ] ) ) {
+				continue;
+			}
+
+			if ( count( $seen ) >= self::MAX_NOTES ) {
+				++$dropped;
+				continue;
+			}
+
+			$seen[ $note ] = true;
+		}
+
+		return array(
+			'seen'    => $seen,
+			'dropped' => $dropped,
+		);
+	}
+
+	/**
+	 * An accumulator's notes, in first-occurrence order, with its overflow sentinel.
+	 *
+	 * @param array $accumulator Accumulator from self::fold_notes().
+	 * @return string[]
+	 */
+	public static function folded_notes( array $accumulator ): array {
+		$notes   = array_map( 'strval', array_keys( (array) ( $accumulator['seen'] ?? array() ) ) );
+		$dropped = (int) ( $accumulator['dropped'] ?? 0 );
+
+		if ( $dropped > 0 ) {
+			$notes[] = self::overflow_note( $dropped );
 		}
 
 		return $notes;

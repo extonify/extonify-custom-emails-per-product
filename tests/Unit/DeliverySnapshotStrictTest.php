@@ -22,17 +22,28 @@ use Extonify\WCEP\Domain\DeliverySnapshot;
  * A UNIT TEST, because `Domain\DeliverySnapshot` is framework-free by design and
  * this is the boundary between a rule as it was and a message a customer receives
  * hours later.
+ *
+ * ⚠ THE FORMAT IS **v2** SINCE ADR-0016 §8, and these fixtures moved with it rather
+ * than being loosened to accept both. v2 carries `consolidation`, which
+ * `ScheduledDelivery::still_in_phase()` compares against the live rule; a v1
+ * document has no such key and is refused **as a version this build does not
+ * understand**, which is what the bump is for. Widening the fixture to pass under
+ * either version would be exactly the silent weakening the strictness exists to
+ * prevent.
  */
 final class DeliverySnapshotStrictTest extends UnitTestCase {
 
 	/**
-	 * A complete, valid v1 snapshot.
+	 * A complete, valid CURRENT-VERSION snapshot.
+	 *
+	 * Built from `DeliverySnapshot::VERSION` rather than a literal, so a future bump
+	 * cannot leave this fixture asserting against a format nothing writes.
 	 *
 	 * @return array
 	 */
 	private function valid(): array {
 		return array(
-			'version'          => 1,
+			'version'          => DeliverySnapshot::VERSION,
 			'revision'         => 4,
 			'subject'          => 'Care guide for {customer_first_name}',
 			'heading'          => 'Your order',
@@ -40,6 +51,7 @@ final class DeliverySnapshotStrictTest extends UnitTestCase {
 			'recipients'       => array( 'to' => array( 'customer' ) ),
 			'matched_items'    => array( 11, 12 ),
 			'mode'             => 'separate',
+			'consolidation'    => 'none',
 			'trigger_identity' => 'status:processing',
 			'delay_seconds'    => 3600,
 			'scheduled_for'    => 1893456000,
@@ -117,8 +129,12 @@ final class DeliverySnapshotStrictTest extends UnitTestCase {
 	 */
 	public function test_every_wrongly_typed_field_is_refused() {
 		$cases = array(
-			'version not an int'          => array( 'version', '1' ),
-			'version from the future'     => array( 'version', 2 ),
+			'version not an int'          => array( 'version', '2' ),
+			// ⚠ BOTH DIRECTIONS. `1` is the format this build REPLACED (ADR-0016 §8)
+			// and `3` is one it has never seen; a reader that half-understood either
+			// would send a message assembled from fields that mean something else now.
+			'version from the past'       => array( 'version', 1 ),
+			'version from the future'     => array( 'version', 3 ),
 			'revision as a string'        => array( 'revision', '4' ),
 			'revision negative'           => array( 'revision', -1 ),
 			'subject as an array'         => array( 'subject', array( 'x' ) ),
@@ -135,6 +151,20 @@ final class DeliverySnapshotStrictTest extends UnitTestCase {
 			'mode insert'                 => array( 'mode', 'insert' ),
 			'mode empty'                  => array( 'mode', '' ),
 			'mode unrecognised'           => array( 'mode', 'digest' ),
+			/*
+			 * ⚠ THE CONSOLIDATION VOCABULARY IS REFUSED, NOT DEFAULTED (ADR-0016 §1, §8).
+			 * This is the value the phase check compares the live rule against, so
+			 * defaulting a corrupted column to `none` would make a `per_product` delivery
+			 * look as though the merchant had asked for one message — and it would then
+			 * PASS the equality check against a live `none` rule and send the wrong SHAPE
+			 * of delivery rather than refusing.
+			 */
+			'consolidation daily'         => array( 'consolidation', 'daily' ),
+			'consolidation per_order'     => array( 'consolidation', 'per_order' ),
+			'consolidation empty'         => array( 'consolidation', '' ),
+			'consolidation cased'         => array( 'consolidation', 'PER_PRODUCT' ),
+			'consolidation as an int'     => array( 'consolidation', 0 ),
+			'consolidation as an array'   => array( 'consolidation', array( 'none' ) ),
 			'trigger identity empty'      => array( 'trigger_identity', '' ),
 			'trigger identity bad prefix' => array( 'trigger_identity', 'invented:1' ),
 			'delay as a string'           => array( 'delay_seconds', '3600' ),
@@ -171,6 +201,52 @@ final class DeliverySnapshotStrictTest extends UnitTestCase {
 			DeliverySnapshot::MODE,
 			'the snapshot mode literal drifted from the delivery phase constant'
 		);
+	}
+
+	/**
+	 * The consolidation literals held here agree with the ones `Delivery` owns.
+	 *
+	 * `Domain\DeliverySnapshot` is framework-free by design and `Domain` does not
+	 * depend on `Delivery`, so the vocabulary is duplicated as literals — which makes
+	 * DRIFT the risk, and this is the assertion that catches it. Adding a member to
+	 * `Consolidation::MODES` without adding it here would make the snapshot reader
+	 * refuse a shape the write side happily produces, cancelling every queued delivery
+	 * of that kind with `snapshot_unreadable`.
+	 *
+	 * @return void
+	 */
+	public function test_the_snapshot_consolidation_vocabulary_matches_the_delivery_one() {
+		$this->assertSame(
+			\Extonify\WCEP\Delivery\Consolidation::MODES,
+			DeliverySnapshot::CONSOLIDATIONS,
+			'the snapshot consolidation vocabulary drifted from Consolidation::MODES'
+		);
+
+		$this->assertSame(
+			\Extonify\WCEP\Delivery\Consolidation::NONE,
+			DeliverySnapshot::CONSOLIDATION_NONE,
+			'the snapshot default consolidation literal drifted from Consolidation::NONE'
+		);
+	}
+
+	/**
+	 * A `per_product` snapshot is a valid one, so the refusals above are about the
+	 * VALUE and not about the field existing.
+	 *
+	 * @return void
+	 */
+	public function test_a_per_product_snapshot_reads() {
+		$snapshot                  = $this->valid();
+		$snapshot['consolidation'] = 'per_product';
+
+		$read = DeliverySnapshot::read( $snapshot );
+
+		$this->assertIsArray( $read );
+		$this->assertSame( 'per_product', $read['consolidation'] );
+
+		// AND IT REACHES THE SEND (ADR-0016 §8). Omitting it from the rule row would
+		// fan the delivery out as `none` however the merchant configured it.
+		$this->assertSame( 'per_product', DeliverySnapshot::as_rule_row( $read, 7 )['consolidation'] );
 	}
 
 	/**

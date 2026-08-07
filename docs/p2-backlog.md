@@ -615,18 +615,152 @@ ADR-0011 §5 violation filed as deferred work; it still holds.
   longer an unused status. `delay_seconds` has left
   `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` and become a phase discriminator, leaving
   `consolidation` as the only entry.
-- **`consolidation` beyond `none`.** One email per rule per trigger. The engine
-  returns both `matched_item_ids` and `matched_product_ids` so a later prompt can
-  choose per-order or per-item without the engine having pre-judged it.
+- ~~**`consolidation` beyond `none`.**~~ **DONE — Prompt 8**, see
+  [ADR-0016](adr/ADR-0016.md). `per_product` fans one delivery DECISION into N
+  messages under ONE claim: the tombstone stays the unit of decision
+  (`order | rule | mode | trigger_identity` untouched), N attempt rows sit beneath it
+  with their own true outcomes, and the tombstone's `final_status` is the aggregate.
+  The vocabulary became an exhaustive enumeration, so `daily`, `weekly` and
+  `per_order` are now invalid values rather than unimplemented ones;
+  `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` is **empty** and its test asserts emptiness.
 
-  **⚠ NOTE (Prompt 5C):** between Prompt 5B and Prompt 5C this was **not** deferred
-  in practice. 5B gave the column validated storage without giving either phase a
-  filter for it, so a stored `daily` rule was **delivered immediately, once per
-  trigger** — `none`'s behaviour under another name — and could halt supported rules
-  through `stop_processing`. Both phases now filter it before evaluation from
-  `Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS` (ADR-0013 §8a). **The lesson is
-  general: adding validated storage for a column is what makes its values reachable,
-  so storage and phase filtering must land in the same prompt.**
+  **⚠ NOTE (Prompt 5C), kept because the lesson outlived the entry:** between Prompt
+  5B and Prompt 5C this was **not** deferred in practice. 5B gave the column validated
+  storage without giving either phase a filter for it, so a stored `daily` rule was
+  **delivered immediately, once per trigger** — `none`'s behaviour under another name
+  — and could halt supported rules through `stop_processing`. **The lesson is general:
+  adding validated storage for a column is what makes its values reachable, so storage
+  and phase filtering must land in the same prompt.** Prompt 8 closes the underlying
+  hole a level deeper: the value cannot be stored at all, so no filter has to remember
+  it.
+
+- **Cross-rule merging (`per_order`) — deliberately NOT v1.0**
+  ([ADR-0016](adr/ADR-0016.md) §1). It is not a third value of the `consolidation`
+  column; it is a different feature, and adding it as an enumeration member would
+  design it by accident. It merges across **different delivery identities** with
+  different subjects, recipients, priorities and revisions, so it has to answer: whose
+  subject does the merged message carry, which tombstone owns it, what happens when
+  one of the merged rules is disabled between the trigger and the send, and what a
+  per-identity `final_status` means for a message with no single identity. **Adding it
+  needs a superseding ADR.** The locked v1.0 requirement — smart mixed-cart merging —
+  is what `none` already provides.
+
+- **The fan-out cap is per DELIVERY, not per ORDER** (ADR-0016 §7, accepted
+  residual — **confirmed and re-affirmed in Prompt 8A**). Three `per_product` rules
+  each matching ten products send thirty messages, none of which exceeds the cap of
+  ten. **Each rule is doing exactly what it was configured to do**, and a per-order
+  ceiling would have to arbitrate between rules — spanning delivery identities the way
+  `per_order` merging does — so it is the same superseding-ADR question rather than a
+  tweak to the cap, and a second cap would be the wrong shape of answer.
+
+  **Where it should surface instead: a warning in the RULE EDITOR (Prompt 9)** — at
+  configuration time, where the merchant can see that three `per_product` rules on
+  overlapping targeting can add up, rather than at send time where the only remaining
+  options are all bad. Recorded here so Prompt 9 inherits it as a requirement and not
+  as a rediscovery.
+
+- ~~**The cap fallback's body is O(units × template)**~~ — **WRONG, AND FIXED IN PROMPT
+  8B** (ADR-0016 §7a). Both halves of this entry were false. The body was
+  **O(units²)**, not O(units × template), for any template containing a full-set plural:
+  `{product_names}` and `{matched_product_list}` resolve to all N matched products
+  (§6), and 8A rendered the body once per unit, so N sections × N products = N² list
+  entries — ~3,600 entries and ~100KB for a sixty-line wholesale order, past the size at
+  which mail clients clip. And "capping the section count would drop products" was false
+  too: a capped section still carries its **label**, which is exactly what makes an empty
+  or placeholder-less template safe. The second claim is what kept the first from being
+  fixed. The fallback now renders the body for the first `cap` units and labels the rest;
+  output and retained memory are **O(C·N + N)** — linear in the unit count for a fixed
+  configured cap — with the bound stated and measured in ADR-0016 §7a and gate 27. ⚠ The
+  qualification matters: `Consolidation::max_messages()` is filterable and receives the
+  order, so a site returning a cap derived from the order's size makes `C = f(N)` and
+  restores the quadratic term. That is a deliberate act on a safety limit, and the
+  filter's docblock now says so (corrected in Prompt 8C).
+
+  **Residual, deliberately:** the body is still `cap × ( template + plurals × units ×
+  entry )` bytes, so a raised cap and a large template can still produce a large message.
+  That is the merchant's own configuration expressed in one message instead of `cap`
+  messages, and it is bounded by the control they already have. The rule-editor warning
+  above is where it should surface.
+
+- **Two fan-out units can still share a label when WooCommerce's own data does not
+  distinguish them** (Tier 3, accepted residual, Prompt 8C — ADR-0016 §7a). The unit
+  label now appends a live variation's missing attributes, which closes the reachable
+  case (sibling variations sharing a generated title). Two collisions remain:
+
+  1. **two different SIMPLE products with the same post title.** WordPress permits
+     duplicate titles, so two units `product:11` and `product:12` can both label as
+     `Care Kit`. **Not fixed deliberately:** the only disambiguators available — SKU,
+     product id — would appear on *every* simple product's label, and keeping simple
+     labels byte-identical is a hard constraint on this change. A merchant who names two
+     products identically has made them indistinguishable in their own catalogue, order
+     table and every WooCommerce email; this plugin inventing a distinction it alone
+     shows would be worse.
+  2. **two variations of one parent whose attribute data is identical** (both left
+     "Any"). Nothing honest distinguishes them, because nothing in the data does.
+
+  Both are Tier 3: the customer sees two lines that name the same thing, which is
+  confusing rather than wrong — no product is absent, no email is duplicated, nothing is
+  misattributed. The rule editor (Prompt 9) is the right place to warn about (1).
+
+- **A cap-fallback delivery can record TWO overflow sentinels** (Tier 3, accepted
+  residual, Prompt 8B). The sectioned renderer folds its sections' notes and appends
+  `PlaceholderValues::overflow_note()` if the `MAX_NOTES` cap dropped any;
+  `Orchestrator::value_notes()` then folds the header's set together with those strings
+  and may append its own. So a rule with a token problem in its subject **and** more
+  than twenty distinct problems in its body reports *"…and 3 further placeholder notes
+  not recorded; and 1 further placeholder notes not recorded"*. Both counts are true and
+  the collection is still bounded by one `MAX_NOTES`; it is two sentences for one fact.
+  Not fixed because the alternative — passing the raw `{seen, dropped}` accumulator
+  across the boundary instead of note strings — puts an internal shape in the
+  containment state to tidy a string that appears only when a merchant has twenty-one
+  distinct authoring mistakes in one rule.
+
+- **WooCommerce hard-wraps every plain-text body at 70 columns, splitting product
+  names across lines** (Tier 3, accepted residual, found in Prompt 8B).
+  `WC_Email::get_content()` runs the plain body through
+  `wordwrap( …, 70 )` (WC 10.9.4, `class-wc-email.php:872`), and a comma-joined
+  `{product_names}` line is far longer than that — so a product called `Merino Wool
+  Scarf` is delivered as `Merino Wool\nScarf` wherever the break lands. It applies to
+  **every** plain-text delivery this plugin sends, not only the cap fallback, and it is
+  WooCommerce's own formatting for its own emails. Not fixed: pre-wrapping our own
+  values would not stop WooCommerce wrapping the result again, and suppressing the wrap
+  would mean overriding a WooCommerce-wide plain-text convention for one plugin's
+  messages. Recorded because it cost a test-fixture debugging pass —
+  `ConsolidationTest::padded_products()` uses hyphenated names for exactly this reason,
+  and any future test counting name occurrences in a plain body must do the same.
+
+- **A fan-out is not atomic** (ADR-0016 §5, accepted residual). If the process dies
+  between message 2 and message 3, messages 1 and 2 have gone out and been recorded,
+  message 3 never happens, and the tombstone is left `claimed` with the identity
+  consumed. This is the exposure a single delivery already has between its send and
+  its record, widened by the loop; it is not fixable without making the fan-out
+  transactional with respect to an external mail transport, and a sent email cannot be
+  rolled back.
+
+- **The SCHEDULED path's matched-item records are less faithful than the immediate
+  path's, and the two agree only by coincidence.** `ItemResolver` RECOVERS a deleted
+  variation's id from `_variation_id` item meta and marks the record
+  `partially_resolved` (ADR-0011 §4); `ScheduledDelivery::surviving_items()` rebuilds
+  records from `WC_Order_Item_Product::get_variation_id()`, which returns **0** for
+  that same item, and sets no `resolution` key at all. Both therefore land on the
+  PARENT as the fan-out unit (ADR-0016 §4) — by opposite routes — and both render
+  `{variation_name}` and `{variation_attributes}` empty and `{product_sku}` from the
+  parent, so **the customer-visible output is identical today**. It is recorded because
+  the agreement is not structural: adding the meta fallback to `surviving_items()`
+  without also setting `resolution` would present a dead variation as a live one and
+  fan out `variation:{id}` for something nobody can identify. The trap is flagged
+  inline on that method. The fix is to have the scheduled path derive `resolution` the
+  same way the immediate one does, which costs a product load per distinct variation.
+
+- **A `per_product` fan-out of N leaves N WooCommerce order notes**, and each costs a
+  handful of uncached `get_post( $order_id )` lookups. Traced (Prompt 8, gate 6) to
+  WooCommerce's own `Automattic\WooCommerce\Internal\Email\EmailLogger` hooking
+  `woocommerce_email_sent` → `WC_Order::add_order_note()` →
+  `wp_update_comment_count()` → `get_post()`, which MISSES under HPOS because an
+  order is not a post, and WordPress does not cache misses. **Not this plugin's
+  resolution work** — measured at 1 rules fetch and 4 order-item reads for both N=1
+  and N=4 — and identical to what N separate rules would cost. Recorded so nobody
+  reads the per-message query count as a matching or resolution regression.
 
 ### Findings recorded, deliberately not fixed
 
@@ -1085,10 +1219,11 @@ were corrected rather than the rule being weakened:
   kill switch was off. Neither is wrong; they answer different questions. Any
   future admin UI must not present one as the other.
 
-- **`consolidation` is validated by SHAPE, not by vocabulary** (ADR-0009). The
-  storage contract refuses what `sanitize_key()` would have repaired, without
-  inventing an enumeration for behaviour that does not exist yet. When
-  consolidation lands it must become an enumerated column like `delivery_mode`.
+- ~~**`consolidation` is validated by SHAPE, not by vocabulary** (ADR-0009).~~
+  **RESOLVED — Prompt 8.** It is now an exhaustive enumeration validated on the raw
+  value ([ADR-0016](adr/ADR-0016.md) §1), with the shape rules kept as the first test
+  so the `varchar(20)` width stays impossible to exceed. `daily`, `weekly` and
+  `per_order` are invalid values rather than unimplemented ones.
 
 ## Prompt 5C — insert correlation and phase isolation
 

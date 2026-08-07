@@ -96,6 +96,19 @@ class ScheduledDelivery {
 	const REASON_NO_SNAPSHOT     = 'snapshot_unreadable';
 
 	/**
+	 * The live rule's `consolidation` is outside the vocabulary (ADR-0016 §1a,
+	 * ADR-0015 §4 check 3a).
+	 *
+	 * ⚠ ITS OWN REASON, NOT `rule_left_phase`, BECAUSE THE REMEDIES DIFFER. Check 3
+	 * compares the live value against the snapshot and catches a merchant CHANGING the
+	 * rule; this catches CORRUPT DATA — a row from the vocabulary that was open before
+	 * Prompt 8, most likely `daily`. Telling that merchant they "changed the rule"
+	 * would send them looking for an edit they never made, when what they need to do is
+	 * choose `none` or `per_product`.
+	 */
+	const REASON_CONSOLIDATION_INVALID = 'consolidation_invalid';
+
+	/**
 	 * Reasons a run ended without reaching §4 at all (ADR-0015 §8.4).
 	 *
 	 * ⚠ EACH ONE REPLACES A BARE `return;` THAT LEFT THE JOB CONSUMED AND THE
@@ -244,26 +257,27 @@ class ScheduledDelivery {
 	 * column and "items_refunded" is not an explanation.
 	 */
 	const REASON_TEXT = array(
-		self::REASON_RULE_DELETED       => 'the rule was deleted during the delay, so there is nothing left to send',
-		self::REASON_RULE_DISABLED      => 'the rule was disabled during the delay',
-		self::REASON_RULE_LEFT_PHASE    => 'the rule no longer belongs to the delayed separate-mode phase (its mode, delay or consolidation changed during the delay)',
-		self::REASON_ORDER_DELETED      => 'the order no longer exists, or was moved to the trash, during the delay',
-		self::REASON_ORDER_STATE        => 'the order was cancelled, failed or fully refunded during the delay',
-		self::REASON_ITEMS_REFUNDED     => 'every matched line item was removed or fully refunded during the delay',
-		self::REASON_NO_SNAPSHOT        => 'the stored snapshot could not be read, so the message this delivery would send is unknown',
+		self::REASON_RULE_DELETED          => 'the rule was deleted during the delay, so there is nothing left to send',
+		self::REASON_RULE_DISABLED         => 'the rule was disabled during the delay',
+		self::REASON_RULE_LEFT_PHASE       => 'the rule no longer belongs to the delayed separate-mode phase (its mode, delay or consolidation changed during the delay)',
+		self::REASON_ORDER_DELETED         => 'the order no longer exists, or was moved to the trash, during the delay',
+		self::REASON_ORDER_STATE           => 'the order was cancelled, failed or fully refunded during the delay',
+		self::REASON_ITEMS_REFUNDED        => 'every matched line item was removed or fully refunded during the delay',
+		self::REASON_NO_SNAPSHOT           => 'the stored snapshot could not be read, so the message this delivery would send is unknown',
+		self::REASON_CONSOLIDATION_INVALID => 'the rule\'s consolidation setting is not one this plugin recognises, so it was not delivered; set it to "none" or "per_product"',
 
-		self::REASON_SCHEMA_UNAVAILABLE => 'this plugin\'s database tables were unavailable when the delayed delivery came due, and it could not be re-queued',
-		self::REASON_ARGS_MISMATCH      => 'the queued job named a different order from the delivery record it points at, so neither was trusted',
-		self::REASON_EMAIL_UNAVAILABLE  => 'the custom email class was not registered with WooCommerce when the delayed delivery came due',
-		self::REASON_INOPERATIVE        => 'delivery was not operational when the delayed delivery came due',
+		self::REASON_SCHEMA_UNAVAILABLE    => 'this plugin\'s database tables were unavailable when the delayed delivery came due, and it could not be re-queued',
+		self::REASON_ARGS_MISMATCH         => 'the queued job named a different order from the delivery record it points at, so neither was trusted',
+		self::REASON_EMAIL_UNAVAILABLE     => 'the custom email class was not registered with WooCommerce when the delayed delivery came due',
+		self::REASON_INOPERATIVE           => 'delivery was not operational when the delayed delivery came due',
 
-		self::REASON_ARM_FAILED         => 'this delayed delivery could not be armed for sending, so nothing was queued',
-		self::REASON_LEASE_UNWRITABLE   => 'the execution lease for this delayed delivery could not be written and it could not be re-queued, so no worker was able to take it',
+		self::REASON_ARM_FAILED            => 'this delayed delivery could not be armed for sending, so nothing was queued',
+		self::REASON_LEASE_UNWRITABLE      => 'the execution lease for this delayed delivery could not be written and it could not be re-queued, so no worker was able to take it',
 
-		self::REASON_LEASE_EXPIRED      => 'the worker running this delayed delivery never reported back, so whether the message was sent is not known',
-		self::REASON_ORPHANED           => 'the queued job for this delayed delivery no longer exists and it could not be re-queued',
-		self::REASON_PLUGIN_DEACTIVATED => 'the plugin was deactivated while this delayed delivery was still queued',
-		self::REASON_SHUTDOWN_INTERRUPT => 'the plugin was shut down while a worker was running this delayed delivery, so whether the message was sent is not known',
+		self::REASON_LEASE_EXPIRED         => 'the worker running this delayed delivery never reported back, so whether the message was sent is not known',
+		self::REASON_ORPHANED              => 'the queued job for this delayed delivery no longer exists and it could not be re-queued',
+		self::REASON_PLUGIN_DEACTIVATED    => 'the plugin was deactivated while this delayed delivery was still queued',
+		self::REASON_SHUTDOWN_INTERRUPT    => 'the plugin was shut down while a worker was running this delayed delivery, so whether the message was sent is not known',
 	);
 
 	/*
@@ -649,6 +663,22 @@ class ScheduledDelivery {
 			return;
 		}
 
+		if ( ! Consolidation::has_valid_value( $rule ) ) {
+			/*
+			 * BRANCH 8a — rule 2. ⚠ THE READ BOUNDARY, AT EXECUTION (ADR-0015 §4 check
+			 * 3a, ADR-0016 §1a). A rule can become invalid DURING the delay — a database
+			 * restore, a migration, or simply a `daily` row that was legitimately
+			 * storable when this job was queued — and it must no more deliver here than
+			 * at trigger time.
+			 *
+			 * CHECKED BEFORE check 3 so the DISTINCT reason wins. Check 3 would also
+			 * refuse it, as a snapshot/live mismatch, but `rule_left_phase` would tell
+			 * the merchant they had edited something when what they have is corrupt data.
+			 */
+			self::cancel( $delivery_id, self::REASON_CONSOLIDATION_INVALID, DeliveryRepository::EXECUTING );
+			return;
+		}
+
 		if ( ! self::still_in_phase( $rule, $snapshot ) ) {
 			// BRANCH 9 — rule 2.
 			self::cancel( $delivery_id, self::REASON_RULE_LEFT_PHASE, DeliveryRepository::EXECUTING );
@@ -927,6 +957,20 @@ class ScheduledDelivery {
 	 * be non-zero: a rule re-timed from one hour to one week has a queued job
 	 * whose scheduled time no longer means anything the merchant asked for.
 	 *
+	 * ⚠ SO IS `consolidation`, SINCE ADR-0016 §8, AND THE CHANGE IS FROM ONE TEST TO A
+	 * DIFFERENT ONE RATHER THAN A WEAKENING. It used to require the value to be
+	 * unimplemented-behaviour default — correct only while no phase implemented
+	 * consolidation, which is why a rule that acquired `daily` mid-delay left the
+	 * phase. Prompt 8 implements it, so a delayed `per_product` rule is a rule this
+	 * phase OWNS, and what matters now is whether the merchant changed it: switching
+	 * between `none` and `per_product` during the delay changes HOW MANY MESSAGES the
+	 * queued delivery would send, which is exactly the class of change the delay
+	 * comparison above exists for. A mismatch is `rule_left_phase`.
+	 *
+	 * BOTH VALUES MUST ALSO BE IN THE VOCABULARY. Equality alone would let two
+	 * identically-corrupted values agree with each other, and this predicate is what
+	 * `as_rule_row()` relies on when it carries the snapshotted value into the send.
+	 *
 	 * @param array $rule     Live rule row.
 	 * @param array $snapshot Stored snapshot.
 	 * @return bool
@@ -944,10 +988,32 @@ class ScheduledDelivery {
 			return false;
 		}
 
-		// `consolidation` is still unimplemented behaviour (ADR-0015 §7), so a
-		// rule that acquired one during the delay leaves this phase exactly as it
-		// would have been excluded from it at scheduling time.
-		return Orchestrator::behaviour_is_implemented( array( 'consolidation' => (string) ( $rule['consolidation'] ?? 'none' ) ) );
+		/*
+		 * ⚠ THE LIVE VALUE'S VALIDITY IS NO LONGER DECIDED HERE (ADR-0016 §1a).
+		 * `run()` checks it one branch earlier so the distinct `consolidation_invalid`
+		 * reason wins; deciding it in two places would let whichever ran first name the
+		 * cause, which is the two-sources-of-truth shape ADR-0011 §7a exists to prevent.
+		 * What remains here is the CHANGE check, which is this predicate's own job.
+		 *
+		 * The SNAPSHOTTED value is still validated, as depth. It is unreachable —
+		 * `DeliverySnapshot::read()` refuses a snapshot outside the vocabulary, so the
+		 * caller has already cancelled `snapshot_unreadable` — and it stays because this
+		 * predicate must not depend on that ordering to be correct.
+		 */
+		$snapshotted = (string) ( $snapshot['consolidation'] ?? Consolidation::NONE );
+
+		if ( ! Consolidation::is_valid( $snapshotted ) ) {
+			return false;
+		}
+
+		if ( (string) ( $rule['consolidation'] ?? Consolidation::NONE ) !== $snapshotted ) {
+			return false;
+		}
+
+		// KEPT WITH AN EMPTY LIST (ADR-0016 §9). It answers `true` for every rule
+		// today, and it is the call site a future unimplemented-behaviour column
+		// inherits without new plumbing.
+		return Orchestrator::behaviour_is_implemented( $rule );
 	}
 
 	/**
@@ -962,6 +1028,21 @@ class ScheduledDelivery {
 	 * Refund quantities are negative in WooCommerce's own accounting
 	 * (`WC_Order::get_qty_refunded_for_item()` returns a negative number), so a
 	 * fully refunded item is one whose refunded quantity offsets its own.
+	 *
+	 * ⚠ **THESE RECORDS CARRY NO `resolution` KEY, AND THE FAN-OUT PLANNER DEPENDS ON
+	 * THAT STAYING TRUE TOGETHER WITH THE LINE BELOW** (ADR-0016 §4). `get_variation_id()`
+	 * returns **0** for a deleted variation on WC 10.9.4 — the behaviour ADR-0011 §4
+	 * flags, where `set_props()` swallows the setter's exception while `_variation_id`
+	 * survives in item meta — so a dead variation lands on `product_id` here, which is
+	 * exactly the parent unit ADR-0016 §4 requires for a `partially_resolved` item. The
+	 * immediate path reaches the same unit by the opposite route: `ItemResolver`
+	 * RECOVERS the id from meta and marks the record `partially_resolved`, and the
+	 * planner maps that to the parent.
+	 *
+	 * **So if a future change adds the meta fallback here, it MUST also set
+	 * `resolution`.** Recovering the id without it would present a dead variation as a
+	 * live one, and the planner would fan out `variation:{id}` for something nobody can
+	 * identify.
 	 *
 	 * @param \WC_Order $order    Live order.
 	 * @param int[]     $item_ids Snapshotted line-item ids.

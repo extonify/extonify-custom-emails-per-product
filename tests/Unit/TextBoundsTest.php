@@ -7,6 +7,7 @@
 
 namespace Extonify\WCEP\Tests\Unit;
 
+use Extonify\WCEP\Delivery\PlaceholderValues;
 use Extonify\WCEP\Domain\Text;
 
 /**
@@ -135,6 +136,60 @@ final class TextBoundsTest extends UnitTestCase {
 
 		// And storage bounds it again.
 		$this->assertLessThanOrEqual( Text::MAX_LOG_LENGTH, strlen( Text::log_value( $joined ) ) );
+	}
+
+	/**
+	 * 8B / gate 27. MERGING MANY SECTIONS' NOTES IS BOUNDED BY THE SAME CONSTANT AS
+	 *               ONE DELIVERY'S (ADR-0016 §7a).
+	 *
+	 * ⚠ THE COLLECTION THE CAP FALLBACK CREATES. The fallback renders the merchant's
+	 * body once per unit against its own value set, and an unknown token is unknown in
+	 * EVERY unit — so sixty sets would repeat one authoring mistake sixty times, and
+	 * sixty × `MAX_NOTES` would put twelve hundred note strings in a `reason` column
+	 * that holds one sentence. `fold_notes()` de-duplicates AND caps, and the overflow
+	 * is COUNTED rather than silently dropped.
+	 *
+	 * ⚠ ONE IMPLEMENTATION, TWO CALLERS. The renderer folds as it goes and the
+	 * containment boundary folds what reaches it; a second copy of this logic would be
+	 * a second sentinel wording for one fact.
+	 *
+	 * @return void
+	 */
+	public function test_folding_many_note_sets_stays_inside_one_deliverys_bound() {
+		$accumulator = array();
+
+		// Sixty sections, each recording the SAME authoring mistake plus one of its own.
+		for ( $section = 1; $section <= 60; $section++ ) {
+			$accumulator = PlaceholderValues::fold_notes(
+				$accumulator,
+				array( 'unknown placeholder {typo}', 'refused a protected meta key {_secret_' . $section . '}' )
+			);
+		}
+
+		$notes = PlaceholderValues::folded_notes( $accumulator );
+
+		// DE-DUPLICATED: one authoring mistake, recorded once.
+		$this->assertSame( 1, count( array_keys( $notes, 'unknown placeholder {typo}', true ) ) );
+
+		// CAPPED at the same constant a single delivery is held to, plus the sentinel.
+		$this->assertCount( PlaceholderValues::MAX_NOTES + 1, $notes );
+
+		/*
+		 * ⚠ AND A REPEAT IS NOT A DROPPED NOTE. 61 DISTINCT notes arrived — one shared
+		 * typo and sixty per-section keys — so the count reports 61 − MAX_NOTES, not
+		 * 120 − MAX_NOTES. De-duplication happens BEFORE the cap, which is what makes
+		 * the sentinel mean "diagnostics you are not seeing" rather than "sections that
+		 * repeated themselves".
+		 */
+		$this->assertSame(
+			PlaceholderValues::overflow_note( 61 - PlaceholderValues::MAX_NOTES ),
+			end( $notes ),
+			'the dropped notes were not counted'
+		);
+
+		// An empty fold is empty — no sentinel, nothing invented.
+		$this->assertSame( array(), PlaceholderValues::folded_notes( array() ) );
+		$this->assertSame( array(), PlaceholderValues::folded_notes( PlaceholderValues::fold_notes( array(), array() ) ) );
 	}
 
 	/**

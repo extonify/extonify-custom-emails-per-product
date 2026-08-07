@@ -11,6 +11,7 @@ use Extonify\WCEP\Domain\EvaluationResult;
 use Extonify\WCEP\Domain\MatchDecision;
 use Extonify\WCEP\Domain\PreparedRule;
 use Extonify\WCEP\Domain\Specificity;
+use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
 use Extonify\WCEP\Repository\RuleRepository;
 
@@ -273,6 +274,25 @@ class RuleMatcher {
 					'item_id'      => (int) $item['item_id'],
 					'product_id'   => (int) $item['product_id'],
 					'variation_id' => (int) $item['variation_id'],
+
+					/*
+					 * ⚠ CARRIED SINCE PROMPT 8, AND ITS ABSENCE WAS A DEFECT (ADR-0011 §4,
+					 * ADR-0016 §4). The item DESCRIPTOR has always known its resolution
+					 * state; this record dropped it, so every consumer downstream had to
+					 * treat a `partially_resolved` item as fully resolved.
+					 *
+					 * That was invisible until consolidation, which reads it to decide a
+					 * fan-out UNIT: a deleted variation whose parent survives still carries
+					 * its recovered `variation_id`, so without this key two dead siblings of
+					 * one parent became TWO units and the customer received two
+					 * near-identical emails about a variation nobody can identify — each
+					 * rendering `{variation_name}` empty, because the variation's own facts
+					 * are exactly what is gone.
+					 *
+					 * Absent means resolved (`Domain\Targeting`'s own contract), so a
+					 * consumer handed a record from another source still reads correctly.
+					 */
+					'resolution'   => (string) ( $item['resolution'] ?? Targeting::RESOLVED ),
 					'level'        => (int) $outcome['level'],
 					'kind'         => (string) $outcome['kind'],
 				);

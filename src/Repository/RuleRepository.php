@@ -7,7 +7,7 @@
 
 namespace Extonify\WCEP\Repository;
 
-use Extonify\WCEP\Delivery\Orchestrator;
+use Extonify\WCEP\Delivery\Consolidation;
 use Extonify\WCEP\Delivery\ScheduledCancellation;
 use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\RecipientsDocument;
@@ -71,6 +71,12 @@ class RuleRepository {
 
 	/**
 	 * Longest storable `consolidation` — the `varchar(20)` column's own width.
+	 *
+	 * ⚠ NO LONGER THE ONLY CONTRACT ON THE COLUMN. Since ADR-0016 §1 the value must
+	 * also be a member of `Consolidation::MODES`; this bound is kept as the first test
+	 * so the column width stays impossible to exceed even if that vocabulary is grown
+	 * carelessly, and so the length assertion against `information_schema` still has
+	 * something to compare.
 	 */
 	const MAX_CONSOLIDATION_LENGTH = 20;
 
@@ -324,16 +330,23 @@ class RuleRepository {
 	 *
 	 * `delay_seconds = 0` AND `consolidation = 'none'` are part of the WHERE clause
 	 * rather than a later filter, for the same reason ADR-0012 §9 filters before
-	 * evaluation: a rule whose behaviour no phase implements must be left entirely
+	 * evaluation: a rule that does not belong to this phase must be left entirely
 	 * untouched, not fetched and then discarded somewhere a future edit could
 	 * forget. Filtering in the fetch also means such a rule can never HALT a
 	 * supported one through `stop_processing`, because it never enters the ordered
 	 * evaluation at all.
 	 *
-	 * ⚠ `consolidation` was missing until Prompt 5C. Prompt 5B gave the column
-	 * validated storage, so `daily` became storable — and a `daily` rule was then
-	 * inserted into every matching email immediately, which is `none`'s behaviour
-	 * under another name (ADR-0013 §8a).
+	 * ⚠ BOTH LITERALS ARE NOW INSERT MODE'S OWN REQUIREMENTS (ADR-0013 §2,
+	 * ADR-0016 §2) — the read side refusing exactly what the write side refuses —
+	 * rather than reads of the unimplemented-behaviour list. `delay_seconds` made that
+	 * move in Prompt 7 and `consolidation` makes it here: `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS`
+	 * is empty now (ADR-0016 §9), so reading a value out of it would be reading a
+	 * constant that has come to mean something else.
+	 *
+	 * ⚠ `consolidation` was missing from this clause until Prompt 5C. Prompt 5B gave
+	 * the column validated storage with no vocabulary, so `daily` became storable — and
+	 * a `daily` rule was then inserted into every matching email immediately, which is
+	 * `none`'s behaviour under another name (ADR-0013 §8a).
 	 *
 	 * @param string $native_email_id WooCommerce email id currently rendering.
 	 * @return array[] Rows in ADR-0011 fetch order.
@@ -356,15 +369,17 @@ class RuleRepository {
 		}
 
 		/*
-		 * ⚠ THE ZERO DELAY BELOW IS A PHASE DISCRIMINATOR, NOT AN
-		 * UNIMPLEMENTED-BEHAVIOUR DEFAULT (ADR-0015 §7). It used to read
-		 * `delay_seconds` out of `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS`, which was true
-		 * only while no phase implemented delay. Prompt 7 implements it, so that
-		 * constant no longer carries the key — and insert mode's zero is now its OWN
-		 * requirement: ADR-0013 §2 refuses a delayed insert rule at the write
-		 * boundary, and this is the read side refusing exactly what the write side
-		 * refuses. Stated literally so the two cannot drift apart through a constant
-		 * that has come to mean something else.
+		 * ⚠ NEITHER LITERAL BELOW IS AN UNIMPLEMENTED-BEHAVIOUR DEFAULT ANY MORE — both
+		 * are INSERT MODE'S OWN REQUIREMENTS (ADR-0015 §7, ADR-0016 §2, §9).
+		 *
+		 * `delay_seconds` used to be read out of `UNIMPLEMENTED_BEHAVIOUR_DEFAULTS`,
+		 * which was true only while no phase implemented delay; Prompt 7 implements it
+		 * and Prompt 8 implements consolidation, so that constant is now EMPTY and
+		 * reading either value out of it would be reading a constant that has come to
+		 * mean something else. ADR-0013 §2 refuses a delayed insert rule and ADR-0016 §2
+		 * refuses a consolidated one, both at the write boundary; this is the read side
+		 * refusing exactly what the write side refuses. Stated literally so the two
+		 * cannot drift apart.
 		 */
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned rules table.
@@ -380,7 +395,7 @@ class RuleRepository {
 				$native_email_id,
 				// The literal 0 is INSERT MODE'S OWN phase requirement — see above.
 				0,
-				Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS['consolidation']
+				Consolidation::NONE
 			),
 			ARRAY_A
 		);
@@ -407,17 +422,21 @@ class RuleRepository {
 	 * | `status` | exactly `active` or `inactive` |
 	 * | `delivery_mode` | exactly `insert` or `separate` |
 	 * | `native_email_id` | `[a-z0-9_-]+`, at most MAX_NATIVE_EMAIL_ID_LENGTH (empty allowed on a non-insert rule) |
-	 * | `consolidation` | `[a-z0-9_-]+`, at most MAX_CONSOLIDATION_LENGTH |
+	 * | `consolidation` | exactly `none` or `per_product` — `Consolidation::MODES` (ADR-0016 §1) |
 	 * | `trigger_type` / `trigger_value` | see self::normalize_trigger() |
 	 *
-	 * The remaining insert-mode rules are ADR-0013 §2's:
+	 * The remaining insert-mode rules are ADR-0013 §2's and ADR-0016 §2's:
 	 *
 	 *   - an insert rule with an EMPTY `native_email_id` targets no email, can
 	 *     never fire, and can never say why;
 	 *   - an insert rule with a NON-ZERO `delay_seconds` is incoherent: there is
 	 *     no way to insert content into an email that is already sending, seven
 	 *     days from now. Coercing it to zero would leave the merchant with a rule
-	 *     whose editor says seven days and whose behaviour says none.
+	 *     whose editor says seven days and whose behaviour says none;
+	 *   - an insert rule with a NON-`none` `consolidation` is incoherent for the
+	 *     same reason in a different direction: `per_product` chooses HOW MANY
+	 *     messages to send, and insert mode does not choose that — WooCommerce
+	 *     already did, once, before any rule was consulted.
 	 *
 	 * The mode itself is read from the write when supplied and from the stored
 	 * row otherwise, so a partial update that only changes `delay_seconds` is
@@ -443,15 +462,54 @@ class RuleRepository {
 		}
 
 		/*
-		 * `consolidation` IS VALIDATED BY SHAPE, NOT BY VOCABULARY, AND THAT IS
-		 * DELIBERATE. Consolidation BEHAVIOUR is out of scope — only `none` does
-		 * anything today — so enumerating the values here would be designing that
-		 * behaviour in the storage layer. What the storage contract can say now is
-		 * that it does not REPAIR: `NONE`, `" none "`, `none!` and a 30-character
-		 * value are all refused rather than quietly rewritten or truncated by MySQL.
-		 * When consolidation lands, this becomes an enumeration like the two above.
+		 * ⚠ `consolidation` IS NOW AN EXHAUSTIVE ENUMERATION (ADR-0016 §1), validated
+		 * on the RAW value exactly as `status` and `delivery_mode` are.
+		 *
+		 * It used to be validated by SHAPE and not by vocabulary, on the reasoning that
+		 * consolidation behaviour was out of scope and enumerating the values would be
+		 * designing that behaviour in the storage layer. Prompt 8 designs it, so
+		 * `daily`, `weekly` and `per_order` become INVALID VALUES rather than merely
+		 * unimplemented ones — and that is a real strengthening. Under shape validation
+		 * `daily` was storable and the PHASE FILTER was the only thing stopping it from
+		 * being delivered as `none` under another name; one missing filter turned a
+		 * merchant's digest request into an email per order. A value that cannot exist
+		 * needs no filter to remember it.
+		 *
+		 * THE SHAPE CHECK STAYS AS THE FIRST TEST, not as the only one. A member of the
+		 * vocabulary necessarily passes it, so it costs nothing — and it keeps the
+		 * `varchar(20)` column's own width impossible to exceed even if the enumeration
+		 * is ever grown carelessly. `NONE`, `" none "`, `none!`, `PER_PRODUCT`,
+		 * `per_product!` and a 30-character value are all refused rather than quietly
+		 * rewritten or truncated by MySQL.
 		 */
-		if ( array_key_exists( 'consolidation', $data ) && ! self::is_well_formed_key( self::raw_value( $data, 'consolidation' ), self::MAX_CONSOLIDATION_LENGTH ) ) {
+
+		/*
+		 * ⚠ THE **EFFECTIVE** VALUE, ON EVERY WRITE — NOT ONLY WHEN THE FIELD IS
+		 * SUPPLIED (ADR-0016 §1a). This used to be guarded by
+		 * `array_key_exists( 'consolidation', $data )`, so an unrelated partial update to
+		 * a LEGACY INVALID ROW — one holding `daily`, which was legitimately storable
+		 * from Prompt 5B to Prompt 8 — sailed through and re-saved the row, bumping its
+		 * revision and leaving it exactly as undeliverable as before while looking to the
+		 * merchant like a successful save.
+		 *
+		 * Reading the effective value follows `self::effective_mode()`'s precedent
+		 * (Prompt 5A item 3a) for the same reason: a partial update must be judged
+		 * against the row it RESULTS IN, not against the keys the caller happened to
+		 * name.
+		 *
+		 * SO A LEGACY INVALID ROW IS CORRECTABLE, AND ONLY CORRECTABLE: supplying `none`
+		 * or `per_product` explicitly is accepted, and any other write is refused with
+		 * the row left byte-identical. The plugin will not guess which behaviour the
+		 * merchant meant, and it will not deliver until they say — ADR-0009's
+		 * refuse-never-repair contract applied to data that predates the contract.
+		 */
+		$consolidation = self::effective_consolidation( $data, $existing );
+
+		if ( ! self::is_well_formed_key( $consolidation, self::MAX_CONSOLIDATION_LENGTH ) ) {
+			return false;
+		}
+
+		if ( ! Consolidation::is_valid( $consolidation ) ) {
 			return false;
 		}
 
@@ -497,6 +555,27 @@ class RuleRepository {
 			: (int) ( $existing['delay_seconds'] ?? 0 );
 
 		if ( 0 !== $delay ) {
+			return false;
+		}
+
+		/*
+		 * ⚠ AN INSERT RULE MAY NOT CONSOLIDATE (ADR-0016 §2), and the refusal is the
+		 * `delay_seconds` precedent applied to a second column rather than a new
+		 * mechanism.
+		 *
+		 * `per_product` means "one email per product". INSERT MODE CONTRIBUTES CONTENT
+		 * TO AN EMAIL WOOCOMMERCE IS SENDING, so the number of messages is not this
+		 * plugin's to choose — WooCommerce decided it, once, before any rule was
+		 * consulted. An insert rule asking for `per_product` is asking for something
+		 * that does not exist.
+		 *
+		 * READ FROM THE EFFECTIVE VALUE, so converting a stored `separate` +
+		 * `per_product` rule to `insert` in one `update()` is REFUSED rather than
+		 * having its consolidation quietly reset. A merchant whose editor says "one
+		 * email per product" and whose behaviour says otherwise is exactly the silent
+		 * coercion ADR-0009's write boundary exists to prevent.
+		 */
+		if ( Consolidation::NONE !== self::effective_consolidation( $data, $existing ) ) {
 			return false;
 		}
 
@@ -724,7 +803,7 @@ class RuleRepository {
 		// safe markup and strips scripts. Escaped again on output by the caller.
 		$put( 'content', wp_kses_post( (string) ( $data['content'] ?? '' ) ) );
 		$put( 'delay_seconds', max( 0, (int) ( $data['delay_seconds'] ?? 0 ) ) );
-		$put( 'consolidation', array_key_exists( 'consolidation', $data ) ? self::raw_value( $data, 'consolidation' ) : 'none' );
+		$put( 'consolidation', array_key_exists( 'consolidation', $data ) ? self::raw_value( $data, 'consolidation' ) : Consolidation::NONE );
 		$put( 'stop_processing', ! empty( $data['stop_processing'] ) ? 1 : 0 );
 
 		/*
@@ -740,18 +819,48 @@ class RuleRepository {
 		 * mode being written is the RESULTING mode, so a partial update that only
 		 * changes `delay_seconds` is still judged against the rule's real mode.
 		 *
-		 * `delay_seconds` is here for completeness rather than repair: a non-zero
-		 * delay on an insert rule is REFUSED upstream by
-		 * self::write_is_valid(), so this only ever writes the zero that was
-		 * already true.
+		 * `delay_seconds` and `consolidation` are here for completeness rather than
+		 * repair: a non-zero delay and a non-`none` consolidation on an insert rule are
+		 * both REFUSED upstream by self::write_is_valid() (ADR-0013 §2, ADR-0016 §2),
+		 * so these only ever write the values that were already true.
 		 */
 		if ( 'insert' === $mode ) {
 			$out['trigger_type']  = $trigger['type'];
 			$out['trigger_value'] = $trigger['value'];
 			$out['delay_seconds'] = 0;
+			$out['consolidation'] = Consolidation::NONE;
 		}
 
 		return $out;
+	}
+
+	/**
+	 * The `consolidation` a write RESULTS IN — from the input when it says so, from
+	 * the stored row otherwise (ADR-0016 §1a).
+	 *
+	 * ⚠ THE COMPANION TO self::effective_mode(), AND IT EXISTS FOR THE SAME REASON A
+	 * PARTIAL UPDATE MUST BE JUDGED BY ITS RESULT. Without it, an unrelated edit to a
+	 * legacy row holding `daily` was accepted — the row stayed undeliverable while the
+	 * merchant's save appeared to succeed.
+	 *
+	 * THE RAW VALUE, NEVER A SANITISED ONE: an enumeration has no correct repair, and
+	 * self::write_is_valid() refuses anything outside `Consolidation::MODES` before
+	 * anything reads this, so by the time a value is stored it is already one of two
+	 * literals.
+	 *
+	 * The default is `none` on both sides — the column's own documented default, so an
+	 * insert that never mentions consolidation is valid rather than refused.
+	 *
+	 * @param array $data     Raw input.
+	 * @param array $existing Stored row, or empty for an insert.
+	 * @return string
+	 */
+	private static function effective_consolidation( array $data, array $existing ): string {
+		if ( array_key_exists( 'consolidation', $data ) ) {
+			return self::raw_value( $data, 'consolidation' );
+		}
+
+		return (string) ( $existing['consolidation'] ?? Consolidation::NONE );
 	}
 
 	/**

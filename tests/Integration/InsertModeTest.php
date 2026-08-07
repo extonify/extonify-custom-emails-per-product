@@ -7,6 +7,7 @@
 
 namespace Extonify\WCEP\Tests\Integration;
 
+use Extonify\WCEP\Delivery\Consolidation;
 use Extonify\WCEP\Render\Injector;
 use Extonify\WCEP\Render\RenderEvents;
 
@@ -585,129 +586,152 @@ final class InsertModeTest extends InsertModeTestCase {
 	}
 
 	/**
-	 * 5C-2 / gate 15. AN INSERT RULE CARRYING UNIMPLEMENTED CONSOLIDATION IS LEFT
-	 *                ENTIRELY UNTOUCHED (ADR-0013 §8a).
+	 * 8-11 / gate 25. AN INSERT RULE CANNOT CONSOLIDATE AT ALL (ADR-0016 §2).
 	 *
-	 * ⚠ A LIVE DEFECT, NOT A GAP. Prompt 5B gave `consolidation` validated storage
-	 * without giving either phase a filter for it, so a merchant could store `daily`
-	 * and the rule was inserted into EVERY matching email immediately — which is
-	 * `none`'s behaviour under another name. Out of scope silently meant "handled by
-	 * whatever path exists", which is the Prompt 4 defect repeating.
+	 * ⚠ THIS REPLACES TWO PHASE-FILTER TESTS WITH A STRICTLY STRONGER GUARANTEE, and
+	 * the history is worth keeping. Prompt 5B gave `consolidation` validated storage
+	 * with no vocabulary and no phase filter, so an insert rule carrying `daily` was
+	 * inserted into EVERY matching email immediately — `none`'s behaviour under another
+	 * name. Prompt 5C added the filter and asserted that such a rule was left
+	 * untouched: no insertion, no slot, no render record, no tombstone.
 	 *
-	 * @dataProvider unsupported_consolidation_provider
+	 * ADR-0016 §2 moves the refusal to the REPOSITORY, exactly as ADR-0013 §2 already
+	 * does for a non-zero `delay_seconds`. `per_product` means "one email per product",
+	 * and insert mode contributes content to an email WOOCOMMERCE is sending — so the
+	 * message count is not ours to choose. A rule that cannot be stored cannot be
+	 * inserted, cannot reach a slot, and cannot consume an identity, so the older
+	 * assertions are subsumed rather than dropped.
 	 *
-	 * @param string $consolidation Stored consolidation value.
+	 * BOTH DIRECTIONS ARE TESTED: on insert, and on a PARTIAL UPDATE, which is the
+	 * route a stored rule takes to become an illegal one.
+	 *
+	 * @dataProvider refused_insert_consolidation_provider
+	 *
+	 * @param string $consolidation Consolidation value.
+	 * @param bool   $in_vocabulary Whether the value is a member of the vocabulary at
+	 *                              all, so the test says WHICH rule refused it.
 	 * @return void
 	 */
-	public function test_an_insert_rule_with_unsupported_consolidation_is_left_untouched( string $consolidation ) {
+	public function test_an_insert_rule_cannot_consolidate( string $consolidation, bool $in_vocabulary ) {
 		$product_id = $this->make_simple_product( 'WCEP Consolidation ' . $consolidation );
-		$order      = $this->make_order_with( array( $product_id ) );
-		$order_id   = (int) $order->get_id();
 
-		$rule_id = $this->make_insert_rule(
-			$product_id,
+		$this->assertSame(
+			$in_vocabulary,
+			Consolidation::is_valid( $consolidation ),
+			'the fixture disagrees with the vocabulary about ' . $consolidation
+		);
+
+		// --- ON INSERT ---------------------------------------------------------
+		$refused = $this->rules->insert(
 			array(
-				'consolidation' => $consolidation,
-				'content'       => '<p>CONSOLIDATED BLOCK.</p>',
+				'name'            => 'insert and consolidated',
+				'status'          => 'active',
+				'delivery_mode'   => 'insert',
+				'native_email_id' => 'customer_processing_order',
+				'insert_position' => 'after_order_table',
+				'targeting'       => array( 'include' => array( 'products' => array( $product_id ) ) ),
+				'consolidation'   => $consolidation,
 			)
 		);
 
-		$this->assertGreaterThan( 0, $rule_id, 'The fixture rule was not storable, so the test proves nothing.' );
+		$this->assertSame( 0, $refused, "An insert rule with consolidation={$consolidation} was stored." );
 
-		$mail = $this->send_native( $order_id );
+		// --- ON A PARTIAL UPDATE OF A LEGAL INSERT RULE ------------------------
+		$legal = $this->make_insert_rule( $product_id );
+		$before = $this->rules->find( $legal );
 
-		// --- NOTHING OF OURS WENT INTO THE MESSAGE. ---------------------------
-		$this->assertBody( $mail, 'CONSOLIDATED BLOCK.', false, 'An unsupported consolidation rule was inserted.' );
+		$this->assertFalse(
+			$this->rules->update( $legal, array( 'consolidation' => $consolidation ) ),
+			"A stored insert rule accepted consolidation={$consolidation} on update."
+		);
 
-		// --- NO SLOT AND NO RENDER RECORD CARRIED IT. -------------------------
-		foreach ( RenderEvents::ledger()->slots() as $slot ) {
-			$this->assertSame( array(), $slot['rules'], 'An unsupported consolidation rule reached a ledger slot.' );
+		// A REFUSED WRITE LEAVES THE ROW BYTE-IDENTICAL (ADR-0009), revision included:
+		// half-writing a refused rule is worse than either outcome.
+		$this->assertSame( $before, $this->rules->find( $legal ), 'The refused update changed the stored row.' );
+
+		// --- AND THE REVERSE CONVERSION IS REFUSED TOO -------------------------
+		// A separate-mode rule that DOES consolidate cannot become an insert rule in one
+		// update. Coercing its consolidation to `none` instead would leave the merchant
+		// with a rule whose editor says one email per product and whose behaviour says
+		// otherwise (ADR-0016 §2).
+		if ( $in_vocabulary ) {
+			$separate = $this->make_rule(
+				array(
+					'name'          => 'separate and consolidated',
+					'delivery_mode' => 'separate',
+					'targeting'     => array( 'include' => array( 'products' => array( $product_id ) ) ),
+					'consolidation' => $consolidation,
+				)
+			);
+
+			$this->assertFalse(
+				$this->rules->update( $separate, array( 'delivery_mode' => 'insert', 'native_email_id' => 'customer_processing_order' ) ),
+				'A consolidated separate rule was converted to insert mode.'
+			);
+			$this->assertSame( 'separate', $this->rules->find( $separate )['delivery_mode'] );
+			$this->assertSame( $consolidation, $this->rules->find( $separate )['consolidation'] );
 		}
-
-		foreach ( RenderEvents::context()->renders() as $render ) {
-			$this->assertSame( array(), $render['rules'], 'An unsupported consolidation rule reached a render record.' );
-		}
-
-		// --- AND NO AUDIT AT ALL, UNDER EITHER MODE. --------------------------
-		$this->run_shutdown_sweep();
-
-		$this->assertNull( $this->insert_tombstone( $order_id, $rule_id ), 'It consumed an insert identity.' );
-		$this->assertSame( array(), $this->tombstones_for( $order_id ), 'It wrote a delivery record.' );
 
 		fwrite(
 			STDERR,
-			"\n[5C item 2 / gate 15] insert + consolidation={$consolidation}: 0 insertions, 0 slots carrying rules,"
-			. " 0 render records carrying rules, 0 tombstones\n"
+			"\n[8 item 11 / gate 25] insert + consolidation={$consolidation}: refused on insert, on partial update"
+			. ( $in_vocabulary ? ', and on conversion from separate mode' : '' ) . "\n"
 		);
 	}
 
 	/**
-	 * Consolidation values whose behaviour no phase implements.
+	 * Consolidation values an insert rule may not carry.
 	 *
-	 * @return array<string,array{0:string}>
+	 * `per_product` is REFUSED BY ADR-0016 §2 despite being a valid value; the other
+	 * three are refused by the vocabulary itself (§1). Both refusals matter and they
+	 * are different rules, so the provider says which is which.
+	 *
+	 * @return array<string,array{0:string,1:bool}>
 	 */
-	public static function unsupported_consolidation_provider(): array {
+	public static function refused_insert_consolidation_provider(): array {
 		return array(
-			'daily'     => array( 'daily' ),
-			'weekly'    => array( 'weekly' ),
-			'per_order' => array( 'per_order' ),
+			'per_product' => array( 'per_product', true ),
+			'daily'       => array( 'daily', false ),
+			'weekly'      => array( 'weekly', false ),
+			'per_order'   => array( 'per_order', false ),
 		);
 	}
 
 	/**
-	 * 5C-2 / gate 15. AN UNSUPPORTED-CONSOLIDATION RULE CANNOT HALT A SUPPORTED
-	 *                ONE, because it is filtered BEFORE evaluation.
+	 * 8-11. AND INSERT MODE FORCES THE COLUMN, so a legal insert rule always stores
+	 *       `none` (ADR-0016 §2).
 	 *
-	 * A filter applied after evaluation could not undo a halt that had already
-	 * changed every later decision — the same ordering argument ADR-0012 §9 makes
-	 * for insert-mode rules reaching the separate phase.
+	 * Completeness rather than repair: the refusal above means this only ever writes the
+	 * value that was already true. It is asserted because the `delay_seconds` half of
+	 * the same block WAS once the only thing standing between a partial update and a
+	 * row that claimed a trigger the engine does not consult (ADR-0013 §2).
 	 *
 	 * @return void
 	 */
-	public function test_an_unsupported_consolidation_rule_does_not_halt_a_supported_one() {
-		$product_id = $this->make_simple_product( 'WCEP Consolidation Halt' );
-		$order      = $this->make_order_with( array( $product_id ) );
-		$order_id   = (int) $order->get_id();
+	public function test_insert_mode_forces_consolidation_none() {
+		$product_id = $this->make_simple_product( 'WCEP Consolidation Forced' );
 
-		// Lower priority, so it would be evaluated FIRST and halt everything after.
-		$halter = $this->make_insert_rule(
-			$product_id,
+		$rule_id = $this->make_insert_rule( $product_id );
+
+		$this->assertSame( 'none', $this->rules->find( $rule_id )['consolidation'] );
+
+		// Converting a plain separate rule to insert mode writes the forced value even
+		// though the caller never mentioned the column.
+		$separate = $this->make_rule(
 			array(
-				'name'            => 'daily rule that would halt',
-				'priority'        => 1,
-				'consolidation'   => 'daily',
-				'stop_processing' => 1,
-				'content'         => '<p>HALTER BLOCK.</p>',
+				'delivery_mode' => 'separate',
+				'targeting'     => array( 'include' => array( 'products' => array( $product_id ) ) ),
 			)
 		);
 
-		$supported = $this->make_insert_rule(
-			$product_id,
-			array(
-				'name'     => 'supported rule that must still insert',
-				'priority' => 10,
-				'content'  => '<p>SUPPORTED BLOCK.</p>',
-			)
+		$this->assertTrue(
+			$this->rules->update( $separate, array( 'delivery_mode' => 'insert', 'native_email_id' => 'customer_processing_order' ) )
 		);
 
-		$mail = $this->send_native( $order_id );
-
-		$this->assertBody( $mail, 'HALTER BLOCK.', false, 'The unsupported rule inserted its content.' );
-		$this->assertBody(
-			$mail,
-			'SUPPORTED BLOCK.',
-			true,
-			'An out-of-phase rule halted a supported one — the filter ran after evaluation.'
-		);
-
-		$this->assertNotNull( $this->insert_tombstone( $order_id, $supported ), 'The supported rule recorded nothing.' );
-		$this->assertNull( $this->insert_tombstone( $order_id, $halter ), 'The unsupported rule consumed an identity.' );
-
-		fwrite(
-			STDERR,
-			"\n[5C item 2 / gate 15] stop_processing on a consolidation=daily rule: supported rule still inserted and recorded;"
-			. " the halter was never evaluated\n"
-		);
+		$converted = $this->rules->find( $separate );
+		$this->assertSame( 'insert', $converted['delivery_mode'] );
+		$this->assertSame( 'none', $converted['consolidation'] );
+		$this->assertSame( 0, (int) $converted['delay_seconds'] );
 	}
 
 	/**

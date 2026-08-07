@@ -173,18 +173,32 @@ final class ScheduledRevalidationTest extends ScheduledDeliveryTestCase {
 	}
 
 	/**
-	 * §4 check 3 again — the rule acquired a CONSOLIDATION, which is still
-	 * unimplemented behaviour and takes it out of every phase (ADR-0015 §7).
+	 * §4 check 3 again — the rule's CONSOLIDATION CHANGED during the delay
+	 * (ADR-0016 §8).
+	 *
+	 * ⚠ THE REASON THIS CANCELS HAS CHANGED, AND THE TEST CHANGED WITH IT RATHER THAN
+	 * BEING WEAKENED. It used to store `daily` and assert that acquiring an
+	 * UNIMPLEMENTED consolidation took the rule out of every phase. Prompt 8 implements
+	 * consolidation, so `daily` cannot be stored at all and a `per_product` rule is one
+	 * this phase OWNS — what cancels now is the MISMATCH against the snapshot, exactly
+	 * as a re-timed delay does: a merchant who switched a queued delivery from one
+	 * message to one-per-product changed HOW MANY EMAILS it would send, and delivering
+	 * the old shape would deliver a rule that no longer exists in that form.
 	 *
 	 * @return void
 	 */
-	public function test_check_3_rule_gained_an_unimplemented_consolidation() {
+	public function test_check_3_rule_changed_its_consolidation() {
 		$fixture = $this->schedule_one();
 
 		remove_action( ScheduledCancellation::ACTION_UPDATED, array( ScheduledCancellation::class, 'on_rule_updated' ), 10 );
 
 		try {
-			$this->rules->update( $fixture['rule_id'], array( 'consolidation' => 'daily' ) );
+			$this->rules->update( $fixture['rule_id'], array( 'consolidation' => 'per_product' ) );
+
+			// The write must have LANDED, or this test would pass because the rule never
+			// changed rather than because the phase check caught it.
+			$this->assertSame( 'per_product', (string) $this->rules->find( $fixture['rule_id'] )['consolidation'] );
+
 			$this->run_job( $fixture['delivery_id'], $fixture['order_id'] );
 		} finally {
 			add_action( ScheduledCancellation::ACTION_UPDATED, array( ScheduledCancellation::class, 'on_rule_updated' ), 10, 1 );

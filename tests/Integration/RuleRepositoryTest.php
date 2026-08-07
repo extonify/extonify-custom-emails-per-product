@@ -118,7 +118,30 @@ final class RuleRepositoryTest extends IntegrationTestCase {
 			'status'          => array( 'wide-open', 'ACTIVE', ' active ', 'active!', 'act<b>ive</b>', '', 'activé' ),
 			'delivery_mode'   => array( 'broadcast', 'unknown', 'INSERT', 'insert!', ' insert ', '', 'sep arate' ),
 			'native_email_id' => array( 'Customer_Completed_Order', ' customer_completed_order ', 'customer_completed_order!', str_repeat( 'a', 101 ) ),
-			'consolidation'   => array( 'NONE', ' none ', 'none!', '<b>none</b>', '', str_repeat( 'n', 21 ) ),
+			/*
+			 * ⚠ SHAPE **AND** VOCABULARY SINCE PROMPT 8 (ADR-0016 §1). The first six are
+			 * the shape refusals that were always here — values `sanitize_key()` would
+			 * have repaired or MySQL would have truncated. The rest are the enumeration:
+			 * `daily`, `weekly` and `per_order` used to be STORABLE and were merely
+			 * filtered out of every phase, so one missing filter turned a merchant's
+			 * digest request into an email per order. They are invalid values now, not
+			 * unimplemented ones.
+			 */
+			'consolidation'   => array(
+				'NONE',
+				' none ',
+				'none!',
+				'<b>none</b>',
+				'',
+				str_repeat( 'n', 21 ),
+				'daily',
+				'weekly',
+				'per_order',
+				'PER_PRODUCT',
+				'per_product!',
+				' per_product ',
+				'per product',
+			),
 			'trigger_type'    => array( 'statuz', 'STATUS', 'status!', ' status ', '' ),
 			'trigger_value'   => array( '<b>completed</b>', 'completed%20', '', '   ', 'com pleted' ),
 		);
@@ -176,6 +199,13 @@ final class RuleRepositoryTest extends IntegrationTestCase {
 		$this->assertSame( 'separate', $rule['delivery_mode'] );
 		$this->assertSame( 'customer_completed_order', $rule['native_email_id'] );
 		$this->assertSame( 'none', $rule['consolidation'] );
+
+		// ⚠ AND THE OTHER MEMBER OF THE VOCABULARY WRITES TOO (ADR-0016 §1). Without
+		// this, the consolidation refusals above would be satisfied by a column that
+		// only ever accepts its default.
+		$per_product = $this->track_rule( $this->repo->insert( array_merge( $this->payload(), array( 'consolidation' => 'per_product' ) ) ) );
+		$this->assertGreaterThan( 0, $per_product, 'per_product is a member of the vocabulary and was refused.' );
+		$this->assertSame( 'per_product', $this->repo->find( $per_product )['consolidation'] );
 
 		$lines = '';
 		foreach ( $reported as $column => $values ) {

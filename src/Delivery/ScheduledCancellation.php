@@ -101,8 +101,12 @@ class ScheduledCancellation {
 		}
 
 		// STILL ACTIVE BUT NO LONGER SCHEDULABLE means the merchant changed the
-		// rule's mode, delay or consolidation — a different fact from disabling it,
-		// and it gets its own reason (ADR-0015 §4).
+		// rule's mode or delay — a different fact from disabling it, and it gets its
+		// own reason (ADR-0015 §4). ⚠ Consolidation left this list in Prompt 8: a
+		// delayed `per_product` rule is schedulable (ADR-0016 §8), so a CHANGE to it is
+		// caught per delivery by `ScheduledDelivery::still_in_phase()`, which can
+		// compare against that delivery's snapshot as this predicate deliberately
+		// cannot.
 		$active = 'active' === (string) ( $rule['status'] ?? '' );
 
 		return self::cancel_pending(

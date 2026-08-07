@@ -121,7 +121,10 @@ final class RuleRevisionTest extends IntegrationTestCase {
 			'trigger_type (NEW)'    => array( 'trigger_type', 'refund' ),
 			'trigger_value (NEW)'   => array( 'trigger_value', 'processing' ),
 			'delay_seconds (NEW)'   => array( 'delay_seconds', 604800 ),
-			'consolidation (NEW)'   => array( 'consolidation', 'daily' ),
+			// ⚠ `per_product` SINCE PROMPT 8. `daily` is no longer a storable value
+			// (ADR-0016 §1), and the point of this case is that CHANGING consolidation
+			// bumps the revision — which needs a change the repository accepts.
+			'consolidation (NEW)'   => array( 'consolidation', 'per_product' ),
 			'stop_processing (NEW)' => array( 'stop_processing', 1 ),
 		);
 	}
@@ -280,7 +283,10 @@ final class RuleRevisionTest extends IntegrationTestCase {
 			array(
 				'subject'       => 'New subject',
 				'delay_seconds' => 3600,
-				'consolidation' => 'weekly',
+				// `per_product` since Prompt 8: `weekly` is refused outright now
+				// (ADR-0016 §1), and a REFUSED write would leave the revision at 1 and
+				// make this test pass for the wrong reason.
+				'consolidation' => 'per_product',
 			)
 		);
 

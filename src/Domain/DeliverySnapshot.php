@@ -43,8 +43,17 @@ final class DeliverySnapshot {
 	 * half-reading it. A queued delivery written by one version and executed
 	 * after an upgrade is the ordinary case, not the exotic one — the delay is
 	 * exactly the window in which an upgrade happens.
+	 *
+	 * ⚠ **2 SINCE ADR-0016 §8**, because the shape really did change: v2 carries
+	 * `consolidation`, which `ScheduledDelivery::still_in_phase()` compares against the
+	 * live rule. Bumping is the honest use of this field rather than a formality — a v1
+	 * document has no such key, so `read()`'s presence check would have refused it as a
+	 * HALF-WRITTEN ROW without ever saying the format had changed. Under the bump an
+	 * old queued row refuses as *a version this build does not understand*,
+	 * `snapshot_unreadable`, cancelled with a reason (ADR-0015 §4). Schema v1 is
+	 * unreleased, so no merchant has a queued v1 delivery to lose.
 	 */
-	const VERSION = 1;
+	const VERSION = 2;
 
 	/**
 	 * The only delivery mode a snapshot can describe.
@@ -75,10 +84,28 @@ final class DeliverySnapshot {
 		'recipients',
 		'matched_items',
 		'mode',
+		'consolidation',
 		'trigger_identity',
 		'delay_seconds',
 		'scheduled_for',
 	);
+
+	/**
+	 * The consolidation a v1 document could only have meant.
+	 *
+	 * Held as a literal for the reason self::MODE is: this class is framework-free by
+	 * design and `Domain` does not depend on `Delivery`. A unit test asserts it agrees
+	 * with `Delivery\Consolidation::NONE`.
+	 */
+	const CONSOLIDATION_NONE = 'none';
+
+	/**
+	 * Every consolidation a snapshot may describe (ADR-0016 §1).
+	 *
+	 * The same closed vocabulary as `Delivery\Consolidation::MODES`, asserted equal by
+	 * a unit test rather than imported, for the reason above.
+	 */
+	const CONSOLIDATIONS = array( self::CONSOLIDATION_NONE, 'per_product' );
 
 	/**
 	 * Build a snapshot from the rule row the matcher decided on.
@@ -106,6 +133,20 @@ final class DeliverySnapshot {
 			'recipients'       => self::recipients_of( $rule ),
 			'matched_items'    => self::item_ids( $matched_items ),
 			'mode'             => (string) ( $rule['delivery_mode'] ?? '' ),
+
+			/*
+			 * ⚠ STORED SO THE PHASE CHECK HAS SOMETHING TO COMPARE (ADR-0016 §8). A
+			 * merchant who switches a delayed rule between `none` and `per_product`
+			 * during the delay has changed HOW MANY MESSAGES the queued delivery would
+			 * send, which is the same class of change as re-timing it — so
+			 * `ScheduledDelivery::still_in_phase()` requires the live value to equal
+			 * this one, and a mismatch is `rule_left_phase`.
+			 *
+			 * It is a RULE SETTING, like `mode` and `delay_seconds`, so it does not
+			 * touch the §2a invariant: no rendered personal data on the durable,
+			 * never-erased row.
+			 */
+			'consolidation'    => (string) ( $rule['consolidation'] ?? self::CONSOLIDATION_NONE ),
 			'trigger_identity' => $trigger_identity,
 			'delay_seconds'    => (int) ( $rule['delay_seconds'] ?? 0 ),
 			'scheduled_for'    => $scheduled_for,
@@ -249,6 +290,19 @@ final class DeliverySnapshot {
 			return null;
 		}
 
+		if ( ! in_array( $decoded['consolidation'], self::CONSOLIDATIONS, true ) ) {
+			/*
+			 * ⚠ THE CLOSED VOCABULARY, REFUSED NOT DEFAULTED (ADR-0016 §1, §8). This is
+			 * the value the phase check compares the live rule against, so defaulting it
+			 * to `none` would make a `per_product` delivery whose column had been
+			 * corrupted look as though the merchant had asked for one message — and it
+			 * would pass the equality check against a live `none` rule, sending the wrong
+			 * SHAPE of delivery rather than refusing. Half a snapshot is not half a
+			 * message; it is a different message.
+			 */
+			return null;
+		}
+
 		if ( ! DeliveryIdentity::is_valid_trigger_identity( $decoded['trigger_identity'] ) ) {
 			// ADR-0004: the identity the executing job claims and sends under. An
 			// unrecognised form could never be matched back to its tombstone.
@@ -317,6 +371,13 @@ final class DeliverySnapshot {
 	 * the caller re-fetched, never from here — this supplies content, not
 	 * permission (ADR-0015 §3).
 	 *
+	 * ⚠ `consolidation` IS CARRIED, AND IT IS THE SAME VALUE EITHER WAY (ADR-0016 §8).
+	 * `ScheduledDelivery::still_in_phase()` runs BEFORE this and requires the live rule
+	 * to equal the snapshot, so there is exactly one place the question is decided and
+	 * this row cannot disagree with the rule. Omitting it would be worse than either
+	 * source: the delivery would fan out as `none` however the merchant configured it,
+	 * silently sending one message where they asked for one per product.
+	 *
 	 * @param array $snapshot Snapshot from self::read().
 	 * @param int   $rule_id  Live rule id.
 	 * @return array
@@ -330,6 +391,7 @@ final class DeliverySnapshot {
 			'content'       => (string) ( $snapshot['content'] ?? '' ),
 			'recipients'    => (array) ( $snapshot['recipients'] ?? array() ),
 			'delivery_mode' => (string) ( $snapshot['mode'] ?? '' ),
+			'consolidation' => (string) ( $snapshot['consolidation'] ?? self::CONSOLIDATION_NONE ),
 		);
 	}
 

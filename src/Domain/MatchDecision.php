@@ -123,7 +123,14 @@ final class MatchDecision {
 
 	/**
 	 * Matched items, in line-item order. Each entry is
-	 * `{item_id, product_id, variation_id, level, kind}`.
+	 * `{item_id, product_id, variation_id, resolution, level, kind}`.
+	 *
+	 * ⚠ `resolution` JOINED THE RECORD IN PROMPT 8 (ADR-0011 §4, ADR-0016 §4), and
+	 * its absence was a defect rather than a simplification: the item descriptor has
+	 * always known whether a variation still resolves, and dropping it here made every
+	 * consumer treat a `partially_resolved` item as fully resolved. An ABSENT key means
+	 * resolved, matching `Domain\Targeting`'s own contract, so a record built by another
+	 * caller still reads correctly.
 	 *
 	 * @var array[]
 	 */

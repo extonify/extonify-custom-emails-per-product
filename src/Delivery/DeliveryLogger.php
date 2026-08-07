@@ -991,9 +991,36 @@ class DeliveryLogger {
 	 * @return array Structured result.
 	 */
 	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what, ?string $from = null ): array {
-		$entries = null === $recipients ? array() : $recipients->entries();
-		$written = 0;
+		$rows = $this->insert_attempt_rows(
+			$delivery_id,
+			$recipients,
+			self::attempt_row( $state, $subject, $reason, $failure, $snapshot )
+		);
 
+		$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
+
+		$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
+
+		return $this->verify( $delivery_id, $what, $rows['expected'], $rows['written'], $finalized );
+	}
+
+	/**
+	 * Build one attempt row's shared fields.
+	 *
+	 * EXTRACTED SO THE ROW SHAPE HAS ONE DEFINITION (ADR-0016 §5). Consolidation
+	 * writes attempt rows per MESSAGE and finalises once at the end, so the row
+	 * building and the finalisation had to come apart — and a second copy of the row
+	 * shape would be a second place for the two to disagree about what an attempt
+	 * looks like.
+	 *
+	 * @param string      $state    Attempt state.
+	 * @param string      $subject  Subject as sent.
+	 * @param string      $reason   Resolution notes.
+	 * @param string|null $failure  Failure message, or null.
+	 * @param array       $snapshot Structured diagnostic payload.
+	 * @return array
+	 */
+	private static function attempt_row( string $state, string $subject, string $reason, ?string $failure, array $snapshot ): array {
 		$row = array(
 			'type'            => 'auto',
 			'state'           => $state,
@@ -1006,24 +1033,37 @@ class DeliveryLogger {
 			$row['snapshot'] = $snapshot;
 		}
 
+		return $row;
+	}
+
+	/**
+	 * Write one attempt's detail rows — one per resolved recipient — WITHOUT
+	 * finalising.
+	 *
+	 * @param int                     $delivery_id Tombstone id.
+	 * @param ResolvedRecipients|null $recipients  Resolved recipients, or null.
+	 * @param array                   $row         Row from self::attempt_row().
+	 * @return array{expected:int,written:int}
+	 */
+	private function insert_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, array $row ): array {
+		$entries = null === $recipients ? array() : $recipients->entries();
+
 		if ( array() === $entries ) {
 			/*
 			 * ⚠ ONE RECIPIENT-LESS ROW RATHER THAN NONE (ADR-0014 §10). Reachable
-			 * only on a failure path — a send is refused above unless there is a
-			 * deliverable recipient — and it is the path where a third party threw
+			 * only on a failure or skip path — a send is refused above unless there is
+			 * a deliverable recipient — and it is the path where a third party threw
 			 * before resolution produced an address. Writing nothing here would
 			 * finalise the tombstone with no detail row: an identity consumed, a
 			 * merchant told nothing, and the exception recorded nowhere.
 			 */
-			$written   = $this->details->insert( $delivery_id, $row ) > 0 ? 1 : 0;
-			$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
-
-			$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
-
-			return $this->verify( $delivery_id, $what, 1, $written, $finalized );
+			return array(
+				'expected' => 1,
+				'written'  => $this->details->insert( $delivery_id, $row ) > 0 ? 1 : 0,
+			);
 		}
 
-		$expected = count( $entries );
+		$written = 0;
 
 		// ONE ROW PER RESOLVED RECIPIENT (ADR-0009, ADR-0012 §4). Never a
 		// comma-joined list: the privacy eraser finds rows with
@@ -1038,11 +1078,91 @@ class DeliveryLogger {
 			}
 		}
 
-		$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
+		return array(
+			'expected' => count( $entries ),
+			'written'  => $written,
+		);
+	}
 
-		$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
+	/**
+	 * Record ONE message of a consolidated fan-out (ADR-0016 §5).
+	 *
+	 * ⚠ IT WRITES ROWS AND DOES NOT FINALISE, AND THAT SPLIT IS THE WHOLE POINT.
+	 * Finalising per message would leave the tombstone holding whichever outcome was
+	 * written LAST, so `{failed, sent}` would report `sent` and lose the failure
+	 * entirely. The rows are still written AS EACH MESSAGE COMPLETES, because a row
+	 * is evidence of a side effect that has already happened — the mailer has been
+	 * called and a message either is or is not in a customer's inbox — and
+	 * suppressing it would delete the only record of a real email (ADR-0015 §8.9).
+	 *
+	 * ⚠ A SKIPPED MESSAGE WRITES ONE RECIPIENT-LESS ROW, not one per address. Nothing
+	 * was sent to anybody, so a row per recipient would record N attempts against
+	 * addresses no message ever reached — the same reasoning `record_skip()` already
+	 * applies to a whole delivery.
+	 *
+	 * @param int                     $delivery_id Tombstone id.
+	 * @param FanOutResult            $result      This fan-out's accumulator.
+	 * @param array                   $message     The plan's message descriptor.
+	 * @param ResolvedRecipients|null $recipients  Resolved recipients, or null when
+	 *                                             resolution never returned.
+	 * @param string                  $subject     Subject as attempted — THIS
+	 *                                             message's, which for a
+	 *                                             `{product_name}` subject differs
+	 *                                             per message.
+	 * @param string                  $outcome     One of the `FanOutResult` outcomes.
+	 * @param string                  $reason      Diagnostics for this message.
+	 * @param string|null             $failure     Failure message, or null.
+	 * @param array                   $snapshot    Structured diagnostic payload,
+	 *                                             including `consolidation`.
+	 * @return void
+	 */
+	public function record_fanout_message( int $delivery_id, FanOutResult $result, array $message, ?ResolvedRecipients $recipients, string $subject, string $outcome, string $reason = '', ?string $failure = null, array $snapshot = array() ): void {
+		if ( FanOutResult::SENT === $outcome ) {
+			$state = self::OUTCOME_SENT;
+		} elseif ( FanOutResult::SKIPPED === $outcome ) {
+			$state = 'skipped';
+		} else {
+			$state = self::OUTCOME_FAILED;
+		}
 
-		return $this->verify( $delivery_id, $what, $expected, $written, $finalized );
+		if ( null !== $failure ) {
+			$this->log_error(
+				'delivery #' . $delivery_id . ' message ' . (int) ( $message['index'] ?? 0 ) . ' of '
+					. (int) ( $message['count'] ?? 0 ) . ' (' . (string) ( $message['unit'] ?? '' ) . ') failed — ' . $failure
+			);
+		}
+
+		$rows = $this->insert_attempt_rows(
+			$delivery_id,
+			FanOutResult::SKIPPED === $outcome ? null : $recipients,
+			self::attempt_row( $state, $subject, $reason, $failure, $snapshot )
+		);
+
+		$result->record( $message, $outcome, $rows['expected'], $rows['written'], $reason );
+	}
+
+	/**
+	 * Finalise a consolidated delivery ONCE, with the aggregate (ADR-0016 §5).
+	 *
+	 * NO DETAIL ROW OF ITS OWN. The per-message rows ARE the evidence, and each one
+	 * carries `snapshot.consolidation.count`, so an aggregate row would duplicate
+	 * facts already recorded N times. The aggregate's job is the tombstone's
+	 * `final_status` — *did this delivery work* — and the per-message rows answer
+	 * *which message*.
+	 *
+	 * @param int          $delivery_id Tombstone id.
+	 * @param FanOutResult $result      The fan-out's accumulated outcomes.
+	 * @param string|null  $from        State being left on the scheduled path
+	 *                                  (ADR-0015 §8.1); null for the immediate one.
+	 * @return array Structured result.
+	 */
+	public function record_fanout_outcome( int $delivery_id, FanOutResult $result, ?string $from = null ): array {
+		$what  = 'a consolidated delivery — ' . $result->describe();
+		$final = $this->finalize( $delivery_id, $result->aggregate_status(), $from );
+
+		$this->note_lost_attempt_ownership( $delivery_id, $what, $final, $from );
+
+		return $this->verify( $delivery_id, $what, $result->rows_expected(), $result->rows_written(), $final );
 	}
 
 	/**

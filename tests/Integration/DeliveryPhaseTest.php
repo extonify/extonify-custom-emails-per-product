@@ -77,14 +77,24 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 	 * inline. Leaving the old cases in place would have meant either a failing
 	 * suite or, worse, weakening them into passing against the new behaviour.
 	 *
-	 * What remains is what is still owned by nobody, plus insert mode, which is
-	 * owned by a phase this one must not touch.
+	 * ⚠ THE CONSOLIDATION CASES LEFT THIS PROVIDER IN PROMPT 8, AND THEY LEFT FOR A
+	 * STRICTLY STRONGER REASON THAN THE DELAYED ONES DID (ADR-0016 §1). They asserted
+	 * that a rule carrying `daily` produced nothing at all, which was true only while
+	 * `consolidation` was validated by SHAPE and filtered out of every phase. It is now
+	 * an EXHAUSTIVE ENUMERATION at the repository boundary, so `daily`, `weekly` and
+	 * `per_order` cannot be STORED — which is stronger than a phase filter that had to
+	 * remember them, and is asserted in
+	 * self::test_an_unrecognised_consolidation_cannot_be_stored_at_all(). Leaving the
+	 * old cases here would have meant a failing suite, because the fixture itself can no
+	 * longer be created.
+	 *
+	 * What remains is insert mode, which is owned by a phase this one must not touch.
 	 *
 	 * @return array<string,array{0:array,1:string}>
 	 */
 	public static function out_of_phase_rule_provider(): array {
 		return array(
-			'insert mode'         => array(
+			'insert mode' => array(
 				array(
 					'delivery_mode'   => 'insert',
 					'native_email_id' => 'customer_completed_order',
@@ -92,18 +102,53 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 				),
 				'an insert-mode rule',
 			),
-			/*
-			 * ⚠ ADDED PROMPT 5C, AND IT WAS A LIVE DEFECT RATHER THAN A GAP.
-			 * Prompt 5B gave `consolidation` validated storage, so `daily` became
-			 * storable — and nothing filtered it, so the rule was delivered with
-			 * ordinary IMMEDIATE, once-per-trigger behaviour. That is `none`'s
-			 * behaviour under another name: the merchant asked for a daily digest and
-			 * got an email per order. The Prompt 4 shape exactly — out-of-scope
-			 * behaviour reachable through DATA rather than through code.
-			 */
-			'consolidation daily' => array( array( 'consolidation' => 'daily' ), 'a rule consolidated daily' ),
-			'consolidation weekly' => array( array( 'consolidation' => 'weekly' ), 'a rule consolidated weekly' ),
-			'consolidation per_order' => array( array( 'consolidation' => 'per_order' ), 'a rule consolidated per order' ),
+		);
+	}
+
+	/**
+	 * 1a-ii / gate 13. The consolidation values that used to be FILTERED can no
+	 *                  longer be STORED (ADR-0016 §1).
+	 *
+	 * ⚠ WHY THIS REPLACES A PHASE-FILTER ASSERTION RATHER THAN JOINING IT. Under shape
+	 * validation `daily` was storable and the phase filter was the ONLY thing keeping
+	 * it from being delivered with ordinary immediate, once-per-trigger behaviour —
+	 * `none`'s behaviour under another name, out-of-scope behaviour reachable through
+	 * DATA rather than through code. One missing filter turned a merchant's digest
+	 * request into an email per order. A value that cannot exist needs no filter.
+	 *
+	 * @dataProvider refused_consolidation_provider
+	 *
+	 * @param string $value Raw consolidation value.
+	 * @return void
+	 */
+	public function test_an_unrecognised_consolidation_cannot_be_stored_at_all( string $value ) {
+		$refused = $this->rules->insert(
+			array(
+				'name'          => 'consolidation ' . $value,
+				'status'        => 'active',
+				'delivery_mode' => 'separate',
+				'trigger_type'  => 'status',
+				'trigger_value' => 'completed',
+				'consolidation' => $value,
+			)
+		);
+
+		$this->assertSame( 0, $refused, sprintf( 'consolidation "%s" was stored.', $value ) );
+	}
+
+	/**
+	 * Every consolidation value outside the closed vocabulary.
+	 *
+	 * @return array<string,array{0:string}>
+	 */
+	public static function refused_consolidation_provider(): array {
+		return array(
+			'daily'     => array( 'daily' ),
+			'weekly'    => array( 'weekly' ),
+			// ⚠ CROSS-RULE MERGING IS NOT A VALUE OF THIS COLUMN (ADR-0016 §1). It
+			// merges across different delivery identities and needs a superseding ADR,
+			// not an extra enumeration member.
+			'per_order' => array( 'per_order' ),
 		);
 	}
 
@@ -221,31 +266,74 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 			array( 'id' => 4, 'delivery_mode' => 'insert', 'delay_seconds' => 86400, 'consolidation' => 'none' ),
 			array( 'id' => 5, 'delivery_mode' => '', 'delay_seconds' => 0, 'consolidation' => 'none' ),
 			array( 'id' => 6 ),
-			array( 'id' => 7, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'daily' ),
-			array( 'id' => 8, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'weekly' ),
-			array( 'id' => 9, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => '' ),
+			/*
+			 * ⚠ CONSOLIDATION NOW COMPOSES WITH THE PHASES RATHER THAN EXCLUDING A RULE
+			 * FROM ALL OF THEM (ADR-0016 §8). 7 and 8 used to be filtered out of every
+			 * phase because `consolidation` was unimplemented behaviour; Prompt 8
+			 * implements it, so a `per_product` rule belongs to the phase its MODE and
+			 * DELAY put it in, and the fan-out happens BELOW the claim.
+			 */
+			array( 'id' => 7, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'per_product' ),
+			array( 'id' => 8, 'delivery_mode' => 'separate', 'delay_seconds' => 1, 'consolidation' => 'per_product' ),
+			/*
+			 * ⚠ AN INVALID VALUE REACHES **NO** PHASE — gate 26, and this ROW CHANGED IN
+			 * PROMPT 8A (ADR-0016 §1a, superseding its own first draft).
+			 *
+			 * Row 9 used to assert that the immediate phase DELIVERED it, on the reasoning
+			 * that "one explained email beats a rule that is silently invisible". That was
+			 * wrong twice over: sending a delivery the merchant never configured is not
+			 * defence in depth, and — because ADR-0016 §9 emptied the enumeration that
+			 * `behaviour_is_implemented()` reads — the invalid rule ENTERED `RuleMatcher`,
+			 * where `stop_processing` could halt a valid rule behind it. The customer got
+			 * an unintended email AND lost the correct one.
+			 *
+			 * ⚠ AND THESE ROWS ARE NOT HAND-EDITED-DATABASE EXOTICA. `daily` was
+			 * LEGITIMATELY STORABLE from Prompt 5B to Prompt 8, so this is the upgrade path
+			 * for any store that used one.
+			 */
+			array( 'id' => 9, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'daily' ),
+			array( 'id' => 10, 'delivery_mode' => 'separate', 'delay_seconds' => 1, 'consolidation' => 'daily' ),
+			array( 'id' => 12, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'per_order' ),
+			array( 'id' => 13, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => '' ),
 			// A row with the column absent keeps the default, so it is deliverable —
 			// the filter must not reject a rule for a column it never carried.
-			array( 'id' => 10, 'delivery_mode' => 'separate', 'delay_seconds' => 0 ),
+			array( 'id' => 11, 'delivery_mode' => 'separate', 'delay_seconds' => 0 ),
 		);
 
 		$this->assertSame(
-			array( 1, 10 ),
+			array( 1, 7, 11 ),
 			array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' ),
-			'Only separate + delay_seconds = 0 + consolidation = none belongs to this phase.'
+			'The immediate phase is separate + delay_seconds = 0 + a consolidation INSIDE the vocabulary.'
 		);
 
 		/*
 		 * ⚠ AND THE THREE PHASES ARE DISJOINT (ADR-0015 §7). Stated as a partition
 		 * rather than three separate assertions, because the failure being guarded
 		 * is a rule reaching TWO phases — delivered inline AND from the queue, so
-		 * the customer gets it twice. Rule 3 is the delayed one; nothing else may
-		 * join it, and no rule may appear in more than one column.
+		 * the customer gets it twice. Rules 3 and 8 are the delayed ones; nothing else
+		 * may join them, and no rule may appear in more than one column.
+		 */
+		/*
+		 * ⚠ GATE 26, THE OTHER HALF: an invalid value reaches NEITHER phase, so rows 9,
+		 * 10, 12 and 13 appear in no column at all. A rule that reaches no phase cannot
+		 * be evaluated, and a rule that is never evaluated cannot halt another one.
 		 */
 		$this->assertSame(
-			array( 3 ),
+			array(),
+			array_intersect(
+				array( 9, 10, 12, 13 ),
+				array_merge(
+					array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' ),
+					array_column( ScheduledPhase::deliverable_in_this_phase( $rules ), 'id' )
+				)
+			),
+			'⚠ a rule whose consolidation is outside the vocabulary reached a delivery phase.'
+		);
+
+		$this->assertSame(
+			array( 3, 8 ),
 			array_column( ScheduledPhase::deliverable_in_this_phase( $rules ), 'id' ),
-			'Only separate + delay_seconds > 0 + consolidation = none belongs to the scheduled phase.'
+			'The scheduled phase is separate + delay_seconds > 0 + a consolidation in the vocabulary.'
 		);
 
 		$immediate = array_column( Orchestrator::deliverable_in_this_phase( $rules ), 'id' );
@@ -259,35 +347,47 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 	}
 
 	/**
-	 * 1e / gate 15. EVERY UNIMPLEMENTED-BEHAVIOUR COLUMN IS ENUMERATED, and each
-	 *               one's non-default value is filtered out.
+	 * 1e / gate 15. THE UNIMPLEMENTED-BEHAVIOUR ENUMERATION IS **EMPTY**, and the
+	 *               mechanism that reads it is still wired to both phases.
 	 *
-	 * The enumeration is the contract: a future column carrying behaviour nobody
-	 * has built yet is added HERE, and both phases inherit the filtering. Growing
-	 * the list one incident at a time is what let `consolidation` ship deliverable.
+	 * ⚠ THE ASSERTION IS EMPTINESS, NOT ABSENCE, AND THE TEST IS DELIBERATELY NOT
+	 * DELETED (ADR-0016 §9). Every column that ever lived in this list has been
+	 * implemented — `delay_seconds` left in Prompt 7 to become a phase discriminator,
+	 * `consolidation` leaves in Prompt 8 because ADR-0016 gives it behaviour — so there
+	 * is nothing left to hold. Deleting the list because it is empty would remove the
+	 * discipline that caught `consolidation` in the first place: Prompt 5B gave that
+	 * column validated storage and no filter, and a stored `daily` rule was delivered
+	 * immediately and once per trigger, which is `none`'s behaviour under another name.
+	 *
+	 * Asserting emptiness makes a future column **re-arm the gate automatically**: add
+	 * one to the constant and this assertion fails until the addition is written down,
+	 * and both phases inherit the filtering with no new plumbing.
 	 *
 	 * @return void
 	 */
 	public function test_every_unimplemented_behaviour_column_is_filtered() {
 		$columns = Orchestrator::UNIMPLEMENTED_BEHAVIOUR_DEFAULTS;
 
-		/*
-		 * ⚠ `delay_seconds` LEFT THIS LIST IN PROMPT 7, AND THE CHANGE IS ASSERTED
-		 * RATHER THAN ABSORBED (ADR-0015 §7). It is no longer unimplemented — it is
-		 * a PHASE DISCRIMINATOR: `0` for the immediate phase, `> 0` for
-		 * `ScheduledPhase`. Widening this assertion to "contains consolidation"
-		 * instead of updating it would be exactly the silent weakening the list
-		 * exists to prevent, and is how `consolidation` shipped deliverable in the
-		 * first place. `consolidation` is now the ONLY entry.
-		 */
 		$this->assertSame(
-			array( 'consolidation' ),
-			array_keys( $columns ),
-			'The unimplemented-behaviour enumeration changed; both phases and gate 15 depend on it.'
+			array(),
+			$columns,
+			'⚠ The unimplemented-behaviour enumeration gained an entry. Add its filtering to BOTH phases '
+				. '(Orchestrator::deliverable_in_this_phase and ScheduledPhase::owns already read this list), '
+				. 'then update this assertion deliberately — gate 15 depends on it.'
 		);
 
-		// And the column that left is genuinely OWNED now, not merely unlisted:
-		// a delayed rule belongs to exactly one phase, and it is not this one.
+		// THE MECHANISM IS STILL LIVE. With an empty list it answers `true` for every
+		// rule, which is correct, and that is exactly the call site a future entry
+		// inherits — so the two facts are asserted together rather than one being taken
+		// on trust.
+		$this->assertTrue(
+			Orchestrator::behaviour_is_implemented(
+				array( 'id' => 1, 'delivery_mode' => 'separate', 'delay_seconds' => 0, 'consolidation' => 'none' )
+			),
+			'The all-defaults rule is not deliverable.'
+		);
+
+		// And the columns that LEFT are genuinely owned now, not merely unlisted.
 		$delayed = array(
 			'id'            => 1,
 			'delivery_mode' => 'separate',
@@ -298,45 +398,32 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 		$this->assertSame( array(), Orchestrator::deliverable_in_this_phase( array( $delayed ) ), 'a delayed rule reached the IMMEDIATE phase' );
 		$this->assertSame( array( $delayed ), ScheduledPhase::deliverable_in_this_phase( array( $delayed ) ), 'a delayed rule reached NO phase' );
 
-		foreach ( $columns as $column => $default ) {
-			$base = array(
-				'id'            => 1,
-				'delivery_mode' => 'separate',
-				'delay_seconds' => 0,
-				'consolidation' => 'none',
+		$consolidated = array(
+			'id'            => 2,
+			'delivery_mode' => 'separate',
+			'delay_seconds' => 0,
+			'consolidation' => 'per_product',
+		);
+
+		$this->assertSame(
+			array( $consolidated ),
+			Orchestrator::deliverable_in_this_phase( array( $consolidated ) ),
+			'a per_product rule reached NO phase, so its fan-out would never happen'
+		);
+
+		// ⚠ AND THE VOCABULARY THAT USED TO BE FILTERED IS NOW REFUSED ONE LAYER
+		// EARLIER, which is what makes the empty list safe (ADR-0016 §1).
+		foreach ( array( 'daily', 'weekly', 'per_order', 'anything', '' ) as $value ) {
+			$this->assertFalse(
+				\Extonify\WCEP\Delivery\Consolidation::is_valid( $value ),
+				sprintf( 'consolidation "%s" is inside the closed vocabulary.', $value )
 			);
-
-			$this->assertTrue(
-				Orchestrator::behaviour_is_implemented( $base ),
-				'The all-defaults rule is not deliverable.'
-			);
-
-			foreach ( array( 'daily', '1', '86400', 'per_order', 'anything' ) as $value ) {
-				if ( (string) $value === (string) $default ) {
-					continue;
-				}
-
-				$candidate            = $base;
-				$candidate[ $column ] = $value;
-
-				$this->assertFalse(
-					Orchestrator::behaviour_is_implemented( $candidate ),
-					sprintf( '%s = "%s" was treated as implemented behaviour.', $column, $value )
-				);
-				$this->assertSame(
-					array(),
-					Orchestrator::deliverable_in_this_phase( array( $candidate ) ),
-					sprintf( '%s = "%s" reached the separate phase.', $column, $value )
-				);
-			}
 		}
 
 		fwrite(
 			STDERR,
-			"\n[5C item 2 / gate 15] unimplemented-behaviour columns filtered by BOTH phases: "
-			. implode( ', ', array_map( static function ( $c, $d ) {
-				return $c . ' (only "' . $d . '")';
-			}, array_keys( $columns ), $columns ) ) . "\n"
+			"\n[8 item 9 / gate 15] UNIMPLEMENTED_BEHAVIOUR_DEFAULTS is EMPTY; the mechanism stays wired to "
+			. "both phases, and consolidation is now refused by vocabulary at the write boundary\n"
 		);
 	}
 

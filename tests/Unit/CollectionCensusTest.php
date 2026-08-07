@@ -7,6 +7,9 @@
 
 namespace Extonify\WCEP\Tests\Unit;
 
+use Extonify\WCEP\Delivery\Consolidation;
+use Extonify\WCEP\Delivery\FanOutResult;
+use Extonify\WCEP\Delivery\RunOutcome;
 use Extonify\WCEP\Render\RenderContext;
 use Extonify\WCEP\Render\RenderLedger;
 
@@ -37,10 +40,18 @@ use Extonify\WCEP\Render\RenderLedger;
 final class CollectionCensusTest extends UnitTestCase {
 
 	/**
-	 * Every array property of the two render collaborators, classified.
+	 * Every array property of the audited collaborators, classified.
 	 *
 	 * ⚠ ADD A PROPERTY, ADD A LINE. A missing entry fails
 	 * self::test_every_collection_is_classified().
+	 *
+	 * ⚠ THE SCOPE GREW IN PROMPT 8. It was the two RENDER collaborators, because that
+	 * is where the unbounded collections had been found; `Delivery\FanOutResult` and
+	 * `Delivery\RunOutcome` join them because consolidation introduced the first
+	 * per-delivery collection whose SIZE A MERCHANT CONTROLS — one entry per message,
+	 * with the message count coming from the order's contents and a filterable cap.
+	 * Auditing by inspection catches what was there when the audit ran; this catches
+	 * what is added afterwards, and only if its scope covers the classes that grow.
 	 *
 	 * @var array<string,array<string,string>>
 	 */
@@ -54,6 +65,12 @@ final class CollectionCensusTest extends UnitTestCase {
 			'reservation_log' => 'cap: MAX_DIAGNOSTIC_ENTRIES, overflow counted in $dropped',
 			'finalizations'   => 'cap: MAX_DIAGNOSTIC_ENTRIES, overflow counted in $dropped',
 			'dropped'         => 'lifecycle: fixed-size counter map, one key per capped array',
+		),
+		FanOutResult::class   => array(
+			'messages' => 'cap: one entry per PLANNED message, and the plan is bounded by Consolidation::max_messages() — a larger matched-unit count falls back to a single message carrying one section per unit (ADR-0016 §7) rather than truncating, so the collection can never exceed the cap in force',
+		),
+		RunOutcome::class     => array(
+			'records' => 'lifecycle: one entry per rule this run ACTED on, so it is bounded by the number of active rules matching one trigger; a fan-out adds ONE record however many messages it sends (ADR-0016 §3), and the object is per-run and discarded with it',
 		),
 		RenderContext::class  => array(
 			'frames'               => 'depth: MAX_RENDER_DEPTH, enforced at push',
@@ -83,6 +100,7 @@ final class CollectionCensusTest extends UnitTestCase {
 		'RenderLedger::$slots[*][rules]'         => 'lifecycle: a SET keyed by rule id, so it is bounded by the number of active rules that matched this render',
 		'RenderLedger::$slots[*][rules][*][notes]' => 'cap: MAX_RULE_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in the entry\'s dropped_notes',
 		'PlaceholderValues::$notes'               => 'cap: MAX_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in $dropped_notes',
+		'PlaceholderResolver::render_sectioned_body() merged notes' => 'cap: PlaceholderValues::MAX_NOTES entries via fold_notes(), de-duplicated across the cap fallback\'s sections so one authoring mistake is one note however many units met it; overflow counted and reported by folded_notes() (ADR-0016 §7a)',
 	);
 
 	/**
@@ -192,5 +210,43 @@ final class CollectionCensusTest extends UnitTestCase {
 			'a single note may not be allowed to fill the whole log column'
 		);
 		$this->assertSame( RenderLedger::MAX_DIAGNOSTIC_ENTRIES, RenderContext::MAX_DIAGNOSTIC_ENTRIES );
+	}
+
+	/**
+	 * ⚠ THE FAN-OUT COLLECTION'S CAP IS REAL, AND IT IS A CAP ON WHAT A CUSTOMER
+	 * RECEIVES (ADR-0016 §7).
+	 *
+	 * Every other bounded collection here holds diagnostics: exceeding its cap costs a
+	 * log entry. This one holds MESSAGES, so exceeding it would cost a customer sixty
+	 * emails from one order — which is why the overflow behaviour is a FALLBACK to one
+	 * message carrying one section per unit rather than a dropped-and-counted tail. A
+	 * truncating cap would silently lose products the merchant asked to have mentioned.
+	 *
+	 * @return void
+	 */
+	public function test_the_fan_out_collection_is_capped_by_a_real_message_limit() {
+		$this->assertGreaterThan( 0, Consolidation::MAX_MESSAGES );
+
+		// The plan is what bounds the collection, so the bound is asserted THERE rather
+		// than on the accumulator: `FanOutResult` records one entry per planned message.
+		$rule  = array( 'consolidation' => Consolidation::PER_PRODUCT );
+		$items = array();
+
+		for ( $i = 1; $i <= Consolidation::MAX_MESSAGES + 1; $i++ ) {
+			$items[] = array( 'item_id' => $i, 'product_id' => 100 + $i, 'variation_id' => 0 );
+		}
+
+		$over = Consolidation::plan( $rule, $items, Consolidation::MAX_MESSAGES );
+
+		$this->assertCount( 1, $over['messages'], 'a plan over the cap did not fall back to one message' );
+		$this->assertTrue( $over['capped'] );
+		$this->assertSame( Consolidation::MAX_MESSAGES + 1, $over['units'], 'the fallback lost the unit count' );
+
+		// AT the cap it fans out fully, so the assertion above is about the boundary and
+		// not about the planner refusing everything.
+		$at = Consolidation::plan( $rule, array_slice( $items, 0, Consolidation::MAX_MESSAGES ), Consolidation::MAX_MESSAGES );
+
+		$this->assertCount( Consolidation::MAX_MESSAGES, $at['messages'] );
+		$this->assertFalse( $at['capped'] );
 	}
 }

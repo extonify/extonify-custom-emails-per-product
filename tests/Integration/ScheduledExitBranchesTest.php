@@ -420,9 +420,25 @@ final class ScheduledExitBranchesTest extends ScheduledDeliveryTestCase {
 			);
 		}
 
-		// 14 through Prompt 7A; Prompt 7B added `arm_failed`, `lease_write_failed`
-		// and `lease_interrupted_by_shutdown` — one per fact a boolean used to hide.
-		$this->assertCount( 17, $codes, 'the reason-code set changed without this assertion being updated' );
+		/*
+		 * 14 through Prompt 7A; Prompt 7B added `arm_failed`, `lease_write_failed`
+		 * and `lease_interrupted_by_shutdown` — one per fact a boolean used to hide.
+		 *
+		 * ⚠ 18 SINCE PROMPT 8A: `consolidation_invalid` (ADR-0015 §4 check 3a,
+		 * ADR-0016 §1a). A rule can become undeliverable DURING a delay — most likely a
+		 * `daily` row, legitimately storable from Prompt 5B to Prompt 8 — and it needs
+		 * its OWN reason rather than `rule_left_phase`, because the remedies differ:
+		 * check 3 catches a merchant CHANGING the rule, this catches corrupt data, and
+		 * telling that merchant they "changed the rule" would send them looking for an
+		 * edit they never made.
+		 *
+		 * ⚠ AND THIS ASSERTION FAILING IS THIS TEST WORKING. It caught the addition on
+		 * the first full 8A run and required it to be written down here — which is
+		 * exactly the same discipline as gate 15's enumeration and the collection
+		 * census. Widening it to `assertGreaterThan` would remove the only thing that
+		 * makes a new reason code impossible to add silently.
+		 */
+		$this->assertCount( 18, $codes, 'the reason-code set changed without this assertion being updated' );
 
 		fwrite(
 			STDERR,
