@@ -607,9 +607,58 @@ final class PlaceholderValues {
 		// ⚠ THE FOURTH ARGUMENT IS THE ONE THAT MATTERS: skip attributes already part
 		// of the variation name. WC 10.9.4,
 		// `wc_get_formatted_variation( $variation, $flat, $include_names, $skip_attributes_in_name )`.
-		$this->variation_details = self::flatten( wc_get_formatted_variation( $variation, true, true, true ) );
+		// It is asked ONLY when the name can answer — see self::title_collapsed().
+		$parent_id = (int) ( $matched['product_id'] ?? 0 );
+
+		$this->variation_details = self::flatten(
+			wc_get_formatted_variation( $variation, true, true, ! $this->title_collapsed( $variation, $parent_id ) )
+		);
 
 		return $this->variation_details;
+	}
+
+	/**
+	 * Whether this variation's generated title COLLAPSED to the bare parent name
+	 * (ADR-0016 §7a, ADR-0017; carried from Prompt 8C).
+	 *
+	 * ⚠ WHY THE SKIP ARGUMENT CANNOT BE ASKED WHEN IT HAS. `skip_attributes_in_name`
+	 * means "do not list attributes already part of the variation name", and
+	 * WooCommerce answers it with `wc_is_attribute_in_product_name()`, which is a
+	 * SUBSTRING TEST over the title:
+	 *
+	 *     stristr( $name, ' ' . $value . ',' ) || 0 === stripos( strrev( $name ), strrev( ' ' . $value ) )
+	 *
+	 * When the title collapsed, it contains NO attributes at all — it is exactly the
+	 * parent's name — so every match that test reports is a FALSE POSITIVE BY
+	 * CONSTRUCTION: it found the value in text the parent's author wrote, not in a
+	 * suffix WooCommerce appended. A parent named `T-Shirt Red, Blue` makes
+	 * ` Red,` and a trailing ` Blue` both hit, so two three-attribute siblings
+	 * differing ONLY in colour have their colour skipped and render the SAME LABEL —
+	 * and a label-only fallback section is the whole of what the customer receives
+	 * about that unit (ADR-0016 §7a). Two distinct units, one indistinguishable line.
+	 *
+	 * ⚠ AND WHY IT IS STILL ASKED OTHERWISE. Where the title did NOT collapse it
+	 * genuinely carries the values WooCommerce put there, the test is answering the
+	 * question it was written for, and honouring it is what keeps `T-Shirt - Red`
+	 * from rendering as `T-Shirt - Red – Colour: Red`. The fix is to stop asking a
+	 * heuristic a question it cannot answer, not to stop trusting it.
+	 *
+	 * COST: zero queries. The parent is already in `ItemResolver`'s cache — the
+	 * matching engine loaded it to resolve this very item — and a miss returns null,
+	 * which reads as "not collapsed" and keeps the previous behaviour.
+	 *
+	 * @param \WC_Product $variation The variation.
+	 * @param int         $parent_id The line item's parent product id.
+	 * @return bool
+	 */
+	private function title_collapsed( \WC_Product $variation, int $parent_id ): bool {
+		$parent = $this->items->product_for( $parent_id );
+
+		if ( ! $parent instanceof \WC_Product ) {
+			return false;
+		}
+
+		return (string) $variation->get_name() === (string) $parent->get_name();
 	}
 
 	/**

@@ -166,6 +166,14 @@ final class Plugin {
 		// reactivation, arming the maintenance sweep on an install that upgraded
 		// rather than activated, privacy-policy suggestion, degraded-mode notice.
 		if ( is_admin() ) {
+			// ADR-0017: the rules admin. Registration is hooks only — the menu entry,
+			// the screen's own `load-` handler, the asset enqueue and one AJAX endpoint
+			// — so nothing here queries, outputs or loads an asset until WordPress is
+			// actually rendering this plugin's screen. The whole branch is inside
+			// `is_admin()`, which is the front-end isolation guarantee (gate 32) stated
+			// once rather than re-checked in every class.
+			Admin\Menu::register();
+
 			add_action( 'admin_init', array( Migrator::class, 'maybe_upgrade' ) );
 
 			// KEPT, AND NOW THE CACHED FORM. It is no longer the only self-heal —

@@ -674,10 +674,18 @@ final class Targeting {
 	/**
 	 * Filter a raw list to unique positive integers, DROPPING junk entries.
 	 *
+	 * ⚠ PUBLIC SINCE PROMPT 9, AND THAT IS THE EDITOR–VALIDATOR CONTRACT ITSELF
+	 * (ADR-0017 §2). The rules editor builds its targeting document from form fields
+	 * server-side, and it builds every id list with THIS function rather than with one
+	 * of its own. The guarantee is therefore not "the editor's parser produces what
+	 * the validator accepts" — which is a claim needing a test to stay true — but "the
+	 * editor's parser IS the validator's parser", which cannot drift because there is
+	 * only one of it.
+	 *
 	 * @param mixed $values Raw list.
 	 * @return int[]
 	 */
-	private static function int_list( $values ): array {
+	public static function int_list( $values ): array {
 		if ( ! is_array( $values ) ) {
 			return array();
 		}
@@ -760,10 +768,14 @@ final class Targeting {
 	/**
 	 * Normalise a raw `types` list to unique, ASCII-lowercased strings.
 	 *
+	 * ⚠ PUBLIC SINCE PROMPT 9, for the reason given on self::int_list(): the editor
+	 * normalises its type entries with the validator's own function, so the two cannot
+	 * disagree about what a type entry is (ADR-0017 §2).
+	 *
 	 * @param mixed $values Raw list.
 	 * @return string[]
 	 */
-	private static function type_list( $values ): array {
+	public static function type_list( $values ): array {
 		if ( ! is_array( $values ) ) {
 			return array();
 		}

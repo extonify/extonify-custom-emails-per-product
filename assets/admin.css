@@ -1,0 +1,213 @@
+/**
+ * Extonify Custom Emails Per Product — admin styles.
+ *
+ * Hand-written, no build step (ADR-0017 §6). Loaded only on this plugin's own
+ * screen, by hook-suffix equality (gate 32).
+ */
+
+.extonify-wcep-section {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	margin: 0 0 20px;
+	padding: 4px 20px 16px;
+}
+
+.extonify-wcep-section > h2 {
+	border-bottom: 1px solid #f0f0f1;
+	font-size: 15px;
+	margin: 0 -20px 12px;
+	padding: 12px 20px;
+}
+
+.extonify-wcep-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px 20px;
+	margin: 0 0 16px;
+}
+
+.extonify-wcep-label {
+	flex: 0 0 200px;
+	font-weight: 600;
+	padding-top: 4px;
+}
+
+.extonify-wcep-field {
+	flex: 1 1 420px;
+	min-width: 0;
+}
+
+.extonify-wcep-field .description {
+	margin: 6px 0 0;
+}
+
+.extonify-wcep-row--invalid .extonify-wcep-field > input,
+.extonify-wcep-row--invalid .extonify-wcep-field > select {
+	border-color: #d63638;
+	box-shadow: 0 0 0 1px #d63638;
+}
+
+.extonify-wcep-row--invalid .extonify-wcep-label {
+	color: #d63638;
+}
+
+.extonify-wcep-note {
+	color: #646970;
+	margin: 0 0 14px;
+}
+
+/* Disabled-by-mode controls (ADR-0017 §5, W4). */
+.extonify-wcep-field :disabled {
+	cursor: not-allowed;
+	opacity: 0.6;
+}
+
+/* Targeting ------------------------------------------------------------- */
+
+.extonify-wcep-side {
+	border-top: 1px solid #f0f0f1;
+	margin-top: 12px;
+	padding-top: 8px;
+}
+
+.extonify-wcep-side > h3 {
+	font-size: 13px;
+	margin: 6px 0 10px;
+	text-transform: uppercase;
+}
+
+.extonify-wcep-picker {
+	border: 1px solid #dcdcde;
+	border-radius: 3px;
+	margin: 0 0 10px;
+	padding: 8px 12px 12px;
+	position: relative;
+}
+
+.extonify-wcep-picker > legend {
+	font-weight: 600;
+	padding: 0 4px;
+}
+
+.extonify-wcep-chips,
+.extonify-wcep-types {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 14px;
+	list-style: none;
+	margin: 0 0 8px;
+	padding: 0;
+}
+
+.extonify-wcep-chips:empty {
+	margin: 0;
+}
+
+.extonify-wcep-chip,
+.extonify-wcep-types > li {
+	align-items: center;
+	display: flex;
+	gap: 4px;
+}
+
+.extonify-wcep-chip--missing label,
+.extonify-wcep-missing {
+	color: #d63638;
+}
+
+.extonify-wcep-results {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 3px;
+	box-shadow: 0 2px 6px rgba( 0, 0, 0, 0.12 );
+	list-style: none;
+	margin: 2px 0 0;
+	max-height: 240px;
+	overflow-y: auto;
+	padding: 0;
+	position: absolute;
+	width: 24em;
+	z-index: 20;
+}
+
+.extonify-wcep-results > li {
+	cursor: pointer;
+	margin: 0;
+	padding: 6px 10px;
+}
+
+.extonify-wcep-results > li[aria-selected="true"],
+.extonify-wcep-results > li:hover {
+	background: #f0f6fc;
+}
+
+.extonify-wcep-results > li[aria-disabled="true"] {
+	color: #646970;
+	cursor: default;
+}
+
+/* Placeholders ---------------------------------------------------------- */
+
+.extonify-wcep-placeholders {
+	border-top: 1px solid #f0f0f1;
+	margin-top: 16px;
+	padding-top: 8px;
+}
+
+.extonify-wcep-placeholder-group > ul {
+	list-style: none;
+	margin: 0 0 12px;
+	padding: 0;
+}
+
+.extonify-wcep-placeholder-group > ul > li {
+	align-items: baseline;
+	display: flex;
+	gap: 8px;
+	margin: 0 0 4px;
+}
+
+.extonify-wcep-placeholder-note {
+	color: #646970;
+}
+
+/* List ------------------------------------------------------------------ */
+
+.extonify-wcep-status--active {
+	color: #007017;
+	font-weight: 600;
+}
+
+.extonify-wcep-status--inactive {
+	color: #646970;
+}
+
+.extonify-wcep-invalid {
+	color: #d63638;
+}
+
+.extonify-wcep-inert,
+.extonify-wcep-exclude {
+	color: #646970;
+}
+
+.extonify-wcep-empty {
+	padding: 24px 0;
+	text-align: center;
+}
+
+.extonify-wcep-errors {
+	list-style: disc;
+	margin: 0 0 8px 20px;
+}
+
+@media screen and ( max-width: 782px ) {
+	.extonify-wcep-label {
+		flex: 1 1 100%;
+	}
+
+	.extonify-wcep-results {
+		width: 100%;
+	}
+}

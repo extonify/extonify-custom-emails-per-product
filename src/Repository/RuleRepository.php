@@ -57,6 +57,64 @@ class RuleRepository {
 	const JSON_COLUMNS = array( 'targeting', 'recipients' );
 
 	/**
+	 * Refusal codes (ADR-0017 §3). WHY a column was refused, so the admin editor can
+	 * say something a merchant can act on rather than "could not save".
+	 *
+	 * They name the KIND of refusal, never the message: the wording is presentation
+	 * and belongs to whatever surface is showing it.
+	 *
+	 * The value is not one of the column's permitted values.
+	 */
+	const REFUSED_NOT_IN_VOCABULARY = 'not_in_vocabulary';
+
+	/**
+	 * The value is not the right SHAPE for the column at all.
+	 */
+	const REFUSED_MALFORMED = 'malformed';
+
+	/**
+	 * The value is well-formed but insert mode forbids it (ADR-0013 §2, ADR-0016 §2).
+	 */
+	const REFUSED_INSERT_FORBIDS = 'insert_forbids';
+
+	/**
+	 * An insert rule left `native_email_id` empty, so it targets no email at all.
+	 */
+	const REFUSED_REQUIRED_FOR_INSERT = 'required_for_insert';
+
+	/**
+	 * The named WooCommerce email is not one this store has.
+	 */
+	const REFUSED_UNREGISTERED = 'unregistered';
+
+	/**
+	 * Columns the list screen may sort by, mapped to themselves.
+	 *
+	 * ⚠ AN ALLOWLIST BECAUSE `ORDER BY` CANNOT BE BOUND (ADR-0017 §8). `$wpdb->prepare()`
+	 * binds VALUES; an identifier has to be interpolated, so a request-supplied column
+	 * name reaching that clause is SQL injection with a capability check in front of
+	 * it. Anything not a key of this map takes the default, and the direction is
+	 * matched against exactly two literals.
+	 */
+	const ORDERABLE_COLUMNS = array(
+		'id'            => 'id',
+		'name'          => 'name',
+		'status'        => 'status',
+		'priority'      => 'priority',
+		'trigger_type'  => 'trigger_type',
+		'delivery_mode' => 'delivery_mode',
+		'consolidation' => 'consolidation',
+		'delay_seconds' => 'delay_seconds',
+		'updated_at'    => 'updated_at',
+		'created_at'    => 'created_at',
+	);
+
+	/**
+	 * Columns self::query() and self::count() filter on by exact match.
+	 */
+	const FILTERABLE_COLUMNS = array( 'status', 'trigger_type', 'delivery_mode', 'consolidation' );
+
+	/**
 	 * Longest storable `native_email_id` — the `varchar(100)` column's own width.
 	 *
 	 * ⚠ MUST MATCH `Migrator`'s SCHEMA, AND A TEST ASSERTS THAT IT DOES against
@@ -447,6 +505,57 @@ class RuleRepository {
 	 * @return bool
 	 */
 	private static function write_is_valid( array $data, array $existing ): bool {
+		return array() === self::invalid_column( $data, $existing );
+	}
+
+	/**
+	 * WHY a write would be refused, as a `{field, code}` pair (ADR-0017 §3).
+	 *
+	 * ⚠ THE REFUSAL CONTRACT HAS EXACTLY ONE IMPLEMENTATION, AND THIS IS IT.
+	 * self::write_is_valid() is now DERIVED from this — `array() === explain_refusal()`
+	 * — rather than computed beside it, so the boolean and the explanation cannot
+	 * disagree about which writes are storable. That matters because the admin editor
+	 * has to tell a merchant WHICH FIELD was refused and why (ADR-0017 §3), and the
+	 * obvious alternative — an admin-side diagnosis mirroring these checks — is a
+	 * second copy of a six-column contract, free to drift the next time either side is
+	 * edited, and free to name the WRONG field to a merchant who then edits the wrong
+	 * thing.
+	 *
+	 * ⚠ IT IS AN EXPLANATION, NEVER A GATE. The repository's own return value is the
+	 * sole source of truth for whether a write happened (ADR-0017 §3.1); this says why
+	 * one did not. A refusal it cannot account for — a genuine `$wpdb` failure — still
+	 * returns `array()` here while `insert()` returns `0`, and the caller must treat
+	 * the return value, not this, as the outcome.
+	 *
+	 * Covers the six validated columns AND the trigger resolution that
+	 * `insert()`/`update()` refuse separately, in the order those two apply them, so
+	 * the field named is the first one that actually stops the write.
+	 *
+	 * @param array $data     Raw input, exactly as it would be passed to insert()/update().
+	 * @param array $existing Stored row, or empty for an insert.
+	 * @return array Empty when the write is storable; otherwise `array{field:string, code:string}`.
+	 */
+	public static function explain_refusal( array $data, array $existing = array() ): array {
+		$column = self::invalid_column( $data, $existing );
+
+		if ( array() !== $column ) {
+			return $column;
+		}
+
+		return self::invalid_trigger( $data, $existing );
+	}
+
+	/**
+	 * The validated-column half of the refusal contract.
+	 *
+	 * The body of what self::write_is_valid() used to be, returning the offending
+	 * column instead of `false`. Same checks, same order, same predicates.
+	 *
+	 * @param array $data     Raw input; its KEYS are the presence check.
+	 * @param array $existing Stored row, or empty for an insert.
+	 * @return array Empty, or `array{field:string, code:string}`.
+	 */
+	private static function invalid_column( array $data, array $existing ): array {
 		/*
 		 * THE ENUMERATIONS FIRST, ON THEIR RAW VALUES, AND BEFORE ANYTHING READS
 		 * THEM. `delivery_mode` in particular decides which of the branches below
@@ -454,11 +563,11 @@ class RuleRepository {
 		 * a mode that had already been coerced.
 		 */
 		if ( array_key_exists( 'status', $data ) && ! in_array( self::raw_value( $data, 'status' ), self::STATUSES, true ) ) {
-			return false;
+			return self::refusal( 'status', self::REFUSED_NOT_IN_VOCABULARY );
 		}
 
 		if ( array_key_exists( 'delivery_mode', $data ) && ! in_array( self::raw_value( $data, 'delivery_mode' ), self::DELIVERY_MODES, true ) ) {
-			return false;
+			return self::refusal( 'delivery_mode', self::REFUSED_NOT_IN_VOCABULARY );
 		}
 
 		/*
@@ -506,11 +615,11 @@ class RuleRepository {
 		$consolidation = self::effective_consolidation( $data, $existing );
 
 		if ( ! self::is_well_formed_key( $consolidation, self::MAX_CONSOLIDATION_LENGTH ) ) {
-			return false;
+			return self::refusal( 'consolidation', self::REFUSED_MALFORMED );
 		}
 
 		if ( ! Consolidation::is_valid( $consolidation ) ) {
-			return false;
+			return self::refusal( 'consolidation', self::REFUSED_NOT_IN_VOCABULARY );
 		}
 
 		/*
@@ -524,14 +633,14 @@ class RuleRepository {
 			$raw = self::raw_value( $data, 'native_email_id' );
 
 			if ( '' !== $raw && ! self::is_well_formed_native_email_id( $raw ) ) {
-				return false;
+				return self::refusal( 'native_email_id', self::REFUSED_MALFORMED );
 			}
 		}
 
 		$mode = self::effective_mode( $data, $existing );
 
 		if ( 'insert' !== $mode ) {
-			return true;
+			return array();
 		}
 
 		/*
@@ -547,7 +656,12 @@ class RuleRepository {
 			: (string) ( $existing['native_email_id'] ?? '' );
 
 		if ( ! self::is_well_formed_native_email_id( $native ) ) {
-			return false;
+			// Empty and malformed are different things to a merchant: one is a field
+			// they have not filled in, the other is a value they cannot use.
+			return self::refusal(
+				'native_email_id',
+				'' === $native ? self::REFUSED_REQUIRED_FOR_INSERT : self::REFUSED_MALFORMED
+			);
 		}
 
 		$delay = array_key_exists( 'delay_seconds', $data )
@@ -555,7 +669,7 @@ class RuleRepository {
 			: (int) ( $existing['delay_seconds'] ?? 0 );
 
 		if ( 0 !== $delay ) {
-			return false;
+			return self::refusal( 'delay_seconds', self::REFUSED_INSERT_FORBIDS );
 		}
 
 		/*
@@ -576,10 +690,70 @@ class RuleRepository {
 		 * coercion ADR-0009's write boundary exists to prevent.
 		 */
 		if ( Consolidation::NONE !== self::effective_consolidation( $data, $existing ) ) {
-			return false;
+			return self::refusal( 'consolidation', self::REFUSED_INSERT_FORBIDS );
 		}
 
-		return self::native_email_is_registered( $native );
+		if ( ! self::native_email_is_registered( $native ) ) {
+			return self::refusal( 'native_email_id', self::REFUSED_UNREGISTERED );
+		}
+
+		return array();
+	}
+
+	/**
+	 * The trigger half of the refusal contract.
+	 *
+	 * ⚠ REPRODUCES self::resolve_trigger_for_mode()'s DECISION, NOT ITS RESULT, and
+	 * says which HALF is at fault. `insert()` and `update()` refuse a null trigger
+	 * with the same `0`/`false` they use for an invalid column, so a merchant whose
+	 * `trigger_value` reads `pending>` would otherwise be told only that the rule
+	 * could not be saved.
+	 *
+	 * The defaults match what `insert()` passes for a fresh row — type `status`,
+	 * value empty — so an insert and an update are judged identically.
+	 *
+	 * @param array $data     Raw input.
+	 * @param array $existing Stored row, or empty for an insert.
+	 * @return array Empty, or `array{field:string, code:string}`.
+	 */
+	private static function invalid_trigger( array $data, array $existing ): array {
+		// ADR-0013 §2: an insert rule stores empty trigger fields and skips trigger
+		// validation entirely, so there is nothing here that can refuse it.
+		if ( 'insert' === self::effective_mode( $data, $existing ) ) {
+			return array();
+		}
+
+		$type = array_key_exists( 'trigger_type', $data )
+			? (string) self::raw_value( $data, 'trigger_type' )
+			: (string) ( $existing['trigger_type'] ?? TriggerEvent::TYPE_STATUS );
+
+		$value = array_key_exists( 'trigger_value', $data )
+			? (string) self::raw_value( $data, 'trigger_value' )
+			: (string) ( $existing['trigger_value'] ?? '' );
+
+		if ( ! in_array( $type, self::TRIGGER_TYPES, true ) ) {
+			return self::refusal( 'trigger_type', self::REFUSED_NOT_IN_VOCABULARY );
+		}
+
+		if ( null === self::normalize_trigger_value( $type, $value ) ) {
+			return self::refusal( 'trigger_value', self::REFUSED_MALFORMED );
+		}
+
+		return array();
+	}
+
+	/**
+	 * One refusal, as a `{field, code}` pair.
+	 *
+	 * @param string $field Column name.
+	 * @param string $code  One of the self::REFUSED_* codes.
+	 * @return array
+	 */
+	private static function refusal( string $field, string $code ): array {
+		return array(
+			'field' => $field,
+			'code'  => $code,
+		);
 	}
 
 	/**
@@ -698,6 +872,140 @@ class RuleRepository {
 		);
 
 		return array_map( array( $this, 'hydrate' ), (array) $rows );
+	}
+
+	/**
+	 * A filtered, ordered, paged page of rules — THE LIST SCREEN'S ONLY READ
+	 * (ADR-0017 §8).
+	 *
+	 * ⚠ FILTERING AND PAGING HAPPEN IN SQL, NEVER IN PHP. Loading every rule to slice
+	 * it afterwards is unbounded in the one dimension a store grows over time, and it
+	 * is the shape that works perfectly on the developer's twelve rules.
+	 *
+	 * ⚠ THE ORDER-BY IDENTIFIER IS ALLOWLISTED AND THE DIRECTION IS ONE OF TWO
+	 * LITERALS. `prepare()` binds values, not identifiers, so this is the one clause
+	 * where a request-supplied string could reach SQL uninterpolated. Every filter
+	 * VALUE is still bound, exactly as everywhere else in this class.
+	 *
+	 * `id` is appended as the final sort key so paging is STABLE: without it, two rules
+	 * sharing a priority may swap places between page 1 and page 2 and one of them is
+	 * never shown.
+	 *
+	 * @param array $args {
+	 *     Filter, ordering and paging arguments.
+	 *
+	 *     @type string $status        Exact-match filter, or '' for all.
+	 *     @type string $trigger_type  Exact-match filter, or '' for all.
+	 *     @type string $delivery_mode Exact-match filter, or '' for all.
+	 *     @type string $consolidation Exact-match filter, or '' for all.
+	 *     @type string $search        Substring of the rule name, or ''.
+	 *     @type string $orderby       A key of self::ORDERABLE_COLUMNS.
+	 *     @type string $order         `ASC` or `DESC`.
+	 *     @type int    $limit         Page size.
+	 *     @type int    $offset        Page offset.
+	 * }
+	 * @return array[] Rules with JSON columns decoded.
+	 */
+	public function query( array $args = array() ): array {
+		global $wpdb;
+		$table = $this->table();
+
+		$where = $this->where_clause( $args );
+
+		$orderby = isset( self::ORDERABLE_COLUMNS[ (string) ( $args['orderby'] ?? '' ) ] )
+			? self::ORDERABLE_COLUMNS[ (string) $args['orderby'] ]
+			: 'priority';
+
+		$order = 'DESC' === strtoupper( (string) ( $args['order'] ?? '' ) ) ? 'DESC' : 'ASC';
+
+		$limit  = max( 1, (int) ( $args['limit'] ?? 20 ) );
+		$offset = max( 0, (int) ( $args['offset'] ?? 0 ) );
+
+		$sql = "SELECT * FROM {$table} {$where['sql']} ORDER BY {$orderby} {$order}, id {$order} LIMIT %d OFFSET %d";
+
+		$params = array_merge( $where['params'], array( $limit, $offset ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- paged listing read of the plugin-owned rules table.
+		$rows = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table}, {$orderby} and {$order} are plugin-derived identifiers from self::ORDERABLE_COLUMNS and a two-literal direction; every VALUE is bound through $params.
+			$wpdb->prepare( $sql, $params ),
+			ARRAY_A
+		);
+
+		return array_map( array( $this, 'hydrate' ), (array) $rows );
+	}
+
+	/**
+	 * How many rules match the same filters self::query() would apply.
+	 *
+	 * ⚠ SHARES ONE WHERE-CLAUSE BUILDER WITH self::query(), so the count and the page
+	 * can never disagree about what they are counting — a pager that says 40 while the
+	 * pages hold 37 is a bug nobody sees until the last page renders empty.
+	 *
+	 * @param array $args Same filter keys as self::query(); paging and ordering ignored.
+	 * @return int
+	 */
+	public function count( array $args = array() ): int {
+		global $wpdb;
+		$table = $this->table();
+
+		$where = $this->where_clause( $args );
+
+		// A no-filter count carries no values at all, and prepare() with an empty
+		// argument list is a deprecation rather than a no-op — so the unfiltered
+		// clause, which is a constant plus a plugin-derived identifier, is issued
+		// directly and the filtered one is always bound.
+		$sql = "SELECT COUNT(*) FROM {$table} {$where['sql']}";
+
+		if ( array() !== $where['params'] ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$table} is a plugin-derived identifier; every value is bound through $params.
+			$sql = $wpdb->prepare( $sql, $where['params'] );
+		}
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- count for the pager over the plugin-owned rules table; see above.
+		return (int) $wpdb->get_var( $sql );
+	}
+
+	/**
+	 * The shared WHERE clause for self::query() and self::count().
+	 *
+	 * Every filter is an EXACT match on a column the storage layer already
+	 * validates, so an unrecognised filter value simply matches nothing — there is
+	 * no repair, and no filter value ever reaches SQL uninterpolated.
+	 *
+	 * @param array $args Filter arguments.
+	 * @return array{sql:string, params:array}
+	 */
+	private function where_clause( array $args ): array {
+		global $wpdb;
+
+		$clauses = array();
+		$params  = array();
+
+		foreach ( self::FILTERABLE_COLUMNS as $column ) {
+			$value = (string) ( $args[ $column ] ?? '' );
+
+			if ( '' === $value ) {
+				continue;
+			}
+
+			$clauses[] = $column . ' = %s';
+			$params[]  = $value;
+		}
+
+		$search = trim( (string) ( $args['search'] ?? '' ) );
+
+		if ( '' !== $search ) {
+			// esc_like() first, then bind: without it a merchant searching for `100%`
+			// matches every rule, which reads as the filter being broken.
+			$clauses[] = 'name LIKE %s';
+			$params[]  = '%' . $wpdb->esc_like( $search ) . '%';
+		}
+
+		return array(
+			'sql'    => array() === $clauses ? '' : 'WHERE ' . implode( ' AND ', $clauses ),
+			'params' => $params,
+		);
 	}
 
 	/**

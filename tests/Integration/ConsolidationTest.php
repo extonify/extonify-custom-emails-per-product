@@ -2302,6 +2302,113 @@ final class ConsolidationTest extends ScheduledDeliveryTestCase {
 	}
 
 	/**
+	 * 8C-3a / gate 25. A COLLAPSED TITLE WHOSE **PARENT NAME** CONTAINS THE
+	 *                  DISTINGUISHING VALUES STILL DISTINGUISHES ITS SIBLINGS
+	 *                  (carried from Prompt 8C, fixed in Prompt 9; ADR-0016 §7a,
+	 *                  ADR-0017).
+	 *
+	 * ⚠ THE HOLE 8C's OWN FIX LEFT. 8C appends `wc_get_formatted_variation( …, true )`
+	 * — WooCommerce's "do not list attributes already part of the variation name" —
+	 * so a title that already says `T-Shirt - Red` does not become
+	 * `T-Shirt - Red – Colour: Red`. But when the title has COLLAPSED it contains no
+	 * attributes at all, and `wc_is_attribute_in_product_name()` is a plain substring
+	 * test over that title:
+	 *
+	 *     stristr( $name, ' ' . $value . ',' ) || 0 === stripos( strrev( $name ), strrev( ' ' . $value ) )
+	 *
+	 * A parent named `WCEP Shirt Red, Blue` therefore matches ` Red,` for one sibling
+	 * and a trailing ` Blue` for the other — both FALSE POSITIVES, found in text the
+	 * parent's author wrote rather than in a suffix WooCommerce appended. Both colours
+	 * are skipped, the two siblings differ in NOTHING ELSE, and a cap-1 fallback
+	 * renders two identical label-only lines: two distinct units, either line could be
+	 * either.
+	 *
+	 * ⚠ THE PREMISES ARE ASSERTED BEFORE THE FIX IS, so this test cannot pass
+	 * vacuously. It asserts (a) WooCommerce titled both variations with the bare parent
+	 * name, and (b) WooCommerce's own predicate really does claim BOTH distinguishing
+	 * values are "already in the name" — which is the false positive itself. If either
+	 * stops being true, the fixture no longer reproduces the defect and the test says
+	 * so rather than going green for the wrong reason.
+	 *
+	 * @return void
+	 */
+	public function test_a_collapsed_title_matching_the_parent_name_still_distinguishes_siblings() {
+		$category = $this->make_term( 'product_cat', 'WCEP Sub8C ' . uniqid() );
+
+		// ⚠ THE PARENT'S OWN TEXT CARRIES BOTH COLOURS — that is the whole fixture.
+		$parent = 'WCEP Shirt Red, Blue';
+
+		$variable = $this->make_collapsing_variable_product(
+			$parent,
+			array(
+				array(
+					'colour' => 'Red',
+					'size'   => 'Large',
+					'fabric' => 'Cotton',
+				),
+				array(
+					'colour' => 'Blue',
+					'size'   => 'Large',
+					'fabric' => 'Cotton',
+				),
+			),
+			array( 'category_ids' => array( $category ) )
+		);
+
+		// PREMISE (a): WooCommerce named both variations identically.
+		$this->assertVariationTitlesCollapsed( $variable, $parent );
+
+		/*
+		 * PREMISE (b): WooCommerce's own predicate reports BOTH values as "already in
+		 * the name". Without this the fixture would merely be a variable product and
+		 * the assertions below would pass whatever the plugin did.
+		 */
+		$this->assertTrue(
+			(bool) wc_is_attribute_in_product_name( 'Red', $parent ),
+			'⚠ PREMISE FAILED: wc_is_attribute_in_product_name() no longer matches "Red" inside '
+				. '"' . $parent . '", so this fixture no longer reproduces the false positive. '
+				. 'Re-read wc_is_attribute_in_product_name() and ADR-0017 §on the carried 8C fix.'
+		);
+		$this->assertTrue(
+			(bool) wc_is_attribute_in_product_name( 'Blue', $parent ),
+			'⚠ PREMISE FAILED: wc_is_attribute_in_product_name() no longer matches a trailing '
+				. '"Blue" in "' . $parent . '"; the fixture no longer reproduces the false positive.'
+		);
+
+		$this->make_capped_rule( $category, 1, '' );
+
+		$html  = $this->body_in_format( 'html', $this->delayed_order( $variable['variations'] ) );
+		$plain = $this->body_in_format( 'plain', $this->delayed_order( $variable['variations'] ) );
+
+		foreach ( array(
+			'html'  => $html,
+			'plain' => $plain,
+		) as $format => $body ) {
+			// THE FULL ATTRIBUTE SET IS APPENDED, because the name could not answer.
+			$this->assertStringContainsString( 'Colour: Red', $body, $format . ': the first sibling is not identified' );
+			$this->assertStringContainsString( 'Colour: Blue', $body, $format . ': the second sibling is not identified' );
+		}
+
+		// AND THE TWO LABELS ARE DIFFERENT, which is the invariant.
+		$labels = $this->section_labels( $html, $parent );
+
+		$this->assertCount( 2, $labels, 'a unit lost its section' );
+		$this->assertCount(
+			2,
+			array_unique( $labels ),
+			'⚠ two distinct units produced the same label: the parent name swallowed both colours.'
+		);
+
+		fwrite(
+			STDERR,
+			"\n[8C carried / gate 25] parent name contains BOTH values — `" . $parent . "`:\n"
+			. '            HTML  = ' . implode( ' | ', $labels ) . "\n"
+		);
+
+		$this->gate[] = 'unit label: a parent name containing the values still distinguishes two siblings';
+	}
+
+	/**
 	 * 8C-4. A SIMPLE PRODUCT'S LABEL IS BYTE-IDENTICAL to `{product_name}`.
 	 *
 	 * No churn where there is no problem: the change adds detail to a live VARIATION and

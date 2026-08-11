@@ -89,6 +89,38 @@ if ( ! function_exists( 'extonify_wcep_boot' ) ) {
 }
 
 // ---------------------------------------------------------------------------
+// GATE 32 — THE FRONT-END REQUEST, RECORDED BEFORE ANY TEST CAN DISTURB IT.
+//
+// `wp-load.php` has just booted the plugin as a FRONT-END request: no WP_ADMIN,
+// no current screen, `is_admin()` false. THIS IS THE ONLY MOMENT IN THE PROCESS
+// WHEN THE ADMIN ENTRY POINTS MEAN ANYTHING. Every admin test afterwards
+// legitimately registers menus, screens and AJAX handlers in order to exercise
+// them, and one that forgets to unregister leaves `has_action()` answering about
+// the test rather than about the plugin — which is exactly how a front-end
+// isolation test comes to pass, or fail, for the wrong reason.
+//
+// So it is recorded here, once, and `Integration\AdminIsolationTest` asserts on
+// the recording. Nothing is instantiated to take it: `wp_scripts()` would create
+// `WP_Scripts` and fire `wp_default_scripts` as a side effect of asking, so the
+// globals are inspected only if something else already made them — and nothing
+// having made them at all is the stronger answer.
+// ---------------------------------------------------------------------------
+$GLOBALS['extonify_wcep_front_end_state'] = array(
+	'is_admin'              => is_admin(),
+	'wp_admin'              => defined( 'WP_ADMIN' ) && WP_ADMIN,
+	'current_screen'        => isset( $GLOBALS['current_screen'] ),
+	'menu_hook'             => \Extonify\WCEP\Admin\Menu::hook(),
+	'admin_menu'            => has_action( 'admin_menu', array( \Extonify\WCEP\Admin\Menu::class, 'add_page' ) ),
+	'admin_enqueue_scripts' => has_action( 'admin_enqueue_scripts', array( \Extonify\WCEP\Admin\Assets::class, 'enqueue' ) ),
+	'wp_ajax'               => has_action( 'wp_ajax_' . \Extonify\WCEP\Admin\TargetSearch::ACTION ),
+	'wp_ajax_nopriv'        => has_action( 'wp_ajax_nopriv_' . \Extonify\WCEP\Admin\TargetSearch::ACTION ),
+	'scripts_touched'       => isset( $GLOBALS['wp_scripts'] )
+		&& in_array( \Extonify\WCEP\Admin\Assets::HANDLE, array_keys( $GLOBALS['wp_scripts']->registered ), true ),
+	'styles_touched'        => isset( $GLOBALS['wp_styles'] )
+		&& in_array( \Extonify\WCEP\Admin\Assets::HANDLE, array_keys( $GLOBALS['wp_styles']->registered ), true ),
+);
+
+// ---------------------------------------------------------------------------
 // SWITCH ONTO THE DEDICATED TEST DATABASE.
 //
 // WordPress boots against DB_NAME from wp-config.php, which is the working

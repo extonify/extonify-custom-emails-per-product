@@ -1687,3 +1687,27 @@ deliberately **not** fixed, plus what this leaves for later.
   drop-in replacement for `$wpdb` that does not clear it would make a missing row
   look like a failed read, which fails **safe** (the caller declines to act rather
   than acting on a guess).
+
+## Prompt 9A — the rules admin (accepted residual risks)
+
+- **⚠ Tier 3 — a description on a `role="group"` is announced less consistently than
+  one on a control.** `extonify-wcep-trigger-note` explains the whole *When it sends*
+  section — the "a rule that adds its content to a WooCommerce email has no trigger of
+  its own" caveat is about every trigger field at once, not about any one of them. It
+  is therefore associated with the section, which carries `role="group"` and an
+  `aria-labelledby` pointing at its own `<h2>` (`RuleEditor::open_section()`). Group
+  descriptions have thinner AT support than per-control ones. Accepted: the
+  alternative is `aria-describedby` on all four trigger controls, which reads the same
+  three-sentence paragraph out four times as the merchant tabs through them. Gate 33
+  asserts the group is *named*, because a description hung on an anonymous container
+  is announced with nothing to attach it to.
+- **⚠ Tier 3 — `extonify-wcep-content-description` is associated by rewriting
+  `wp_editor()`'s markup.** `wp_editor()` builds its own `<textarea>` and accepts no
+  attribute arguments, so the only way in is the documented `the_editor` filter, where
+  this plugin injects `aria-describedby` next to ` id="extonifywcepcontent"`
+  (`RuleEditor::section_content()`). If core ever changes that attribute's spelling or
+  spacing the `str_replace()` silently no-ops and the description is orphaned again.
+  Accepted rather than fixed because the failure is *loud on the next test run*: gate
+  33b enumerates every `<p id="extonify-wcep…">` and fails on any that no control
+  points at. The injection is anchored to this editor's id, so a second `wp_editor()`
+  on the same screen is untouched.
