@@ -354,6 +354,39 @@ class DeliveryLogger {
 	}
 
 	/**
+	 * The attempt type a claim array declares (ADR-0019 §8).
+	 *
+	 * ⚠ CARRIED ON THE CLAIM FOR THE SAME REASON `transition_from` IS. `send()` and
+	 * `attempt()` serve the immediate, delayed and manual paths, and each writes a
+	 * different attempt type — putting it on the claim means the shared code does the
+	 * right thing without knowing which caller invoked it, and its absence is what
+	 * marks an automatic delivery.
+	 *
+	 * @param array $claim Claim result.
+	 * @return string One of `DeliveryDetailRepository::TYPES`.
+	 */
+	public static function attempt_type( array $claim ): string {
+		$type = (string) ( $claim['attempt_type'] ?? '' );
+
+		return '' === $type ? 'auto' : $type;
+	}
+
+	/**
+	 * The rule revision a claim array says this attempt is sending.
+	 *
+	 * ⚠ A MANUAL SEND RENDERS FROM THE CURRENT RULE (ADR-0019 §3), so the tombstone's
+	 * `rule_revision_sent` has to move with it. An automatic delivery records its
+	 * revision at claim time and passes 0 here, which `set_final_status()` and
+	 * `transition()` both read as "leave it alone".
+	 *
+	 * @param array $claim Claim result.
+	 * @return int
+	 */
+	public static function attempt_revision( array $claim ): int {
+		return max( 0, (int) ( $claim['rule_revision_sent'] ?? 0 ) );
+	}
+
+	/**
 	 * Verify a write outcome and report any shortfall.
 	 *
 	 * @param int    $delivery_id   Tombstone id.
@@ -604,13 +637,22 @@ class DeliveryLogger {
 	 * email the customer has in their inbox. A lost transition is recorded as its own
 	 * diagnostic instead: it is a fact about this attempt, not about the delivery.
 	 *
+	 * ⚠ `$type` EXISTS SO A MERCHANT'S CANCELLATION IS DISTINGUISHABLE FROM THE
+	 * SCHEDULER'S (ADR-0019 §8). It defaults to `auto`, so every existing caller is
+	 * unchanged; the admin cancel handler passes `manual`. Without it the delivery
+	 * history would show a merchant's deliberate cancellation and an automatic
+	 * re-validation cancellation as the same thing, which is exactly where the
+	 * difference matters — and the alternative, a second cancellation path for the
+	 * admin, is how two paths diverge.
+	 *
 	 * @param int    $delivery_id Tombstone id.
 	 * @param string $code        Machine-readable cause.
 	 * @param string $sentence    What to tell the merchant.
 	 * @param string $from        State the tombstone is being moved OUT of.
+	 * @param string $type        Attempt type for the row: `auto` or `manual`.
 	 * @return array Structured result.
 	 */
-	public function record_scheduled_cancellation( int $delivery_id, string $code, string $sentence, string $from ): array {
+	public function record_scheduled_cancellation( int $delivery_id, string $code, string $sentence, string $from, string $type = 'auto' ): array {
 		if ( $delivery_id <= 0 ) {
 			return self::result( false, 1, 0, false );
 		}
@@ -640,7 +682,9 @@ class DeliveryLogger {
 		$written = $this->details->insert(
 			$delivery_id,
 			array(
-				'type'     => 'auto',
+				// Validated against `DeliveryDetailRepository::TYPES` at the storage
+				// boundary, so an unrecognised value is refused rather than stored.
+				'type'     => $type,
 				'state'    => 'cancelled',
 				'reason'   => Text::log_value( $sentence ),
 				'snapshot' => array(
@@ -890,9 +934,12 @@ class DeliveryLogger {
 	 * @param array              $snapshot    Structured diagnostic payload.
 	 * @param string|null        $from        State being left on the scheduled path
 	 *                                        (ADR-0015 §8.1); null for the immediate one.
+	 * @param string             $type        Attempt type (ADR-0019 §8): `auto`,
+	 *                                        `manual` or `resend`.
+	 * @param int                $revision    Rule revision to record, or 0 to leave it.
 	 * @return array Structured result.
 	 */
-	public function record_send( int $delivery_id, ResolvedRecipients $recipients, string $subject, bool $sent, string $reason = '', array $snapshot = array(), ?string $from = null ): array {
+	public function record_send( int $delivery_id, ResolvedRecipients $recipients, string $subject, bool $sent, string $reason = '', array $snapshot = array(), ?string $from = null, string $type = 'auto', int $revision = 0 ): array {
 		return $this->write_attempt_rows(
 			$delivery_id,
 			$recipients,
@@ -902,7 +949,9 @@ class DeliveryLogger {
 			$sent ? null : 'the mailer reported the message as not sent',
 			$snapshot,
 			$sent ? 'a send' : 'a failed send',
-			$from
+			$from,
+			$type,
+			$revision
 		);
 	}
 
@@ -988,16 +1037,18 @@ class DeliveryLogger {
 	 * @param string                  $what        Description for the shortfall log.
 	 * @param string|null             $from        State being left on the scheduled
 	 *                                             path (ADR-0015 §8.1).
+	 * @param string                  $type        Attempt type (ADR-0019 §8).
+	 * @param int                     $revision    Rule revision to record, or 0.
 	 * @return array Structured result.
 	 */
-	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what, ?string $from = null ): array {
+	private function write_attempt_rows( int $delivery_id, ?ResolvedRecipients $recipients, string $subject, string $state, string $reason, ?string $failure, array $snapshot, string $what, ?string $from = null, string $type = 'auto', int $revision = 0 ): array {
 		$rows = $this->insert_attempt_rows(
 			$delivery_id,
 			$recipients,
-			self::attempt_row( $state, $subject, $reason, $failure, $snapshot )
+			self::attempt_row( $state, $subject, $reason, $failure, $snapshot, $type )
 		);
 
-		$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from );
+		$finalized = $this->finalize( $delivery_id, 'sent' === $state ? 'sent' : 'failed', $from, $revision );
 
 		$this->note_lost_attempt_ownership( $delivery_id, $what, $finalized, $from );
 
@@ -1018,11 +1069,16 @@ class DeliveryLogger {
 	 * @param string      $reason   Resolution notes.
 	 * @param string|null $failure  Failure message, or null.
 	 * @param array       $snapshot Structured diagnostic payload.
+	 * @param string      $type     Attempt type (ADR-0019 §8).
 	 * @return array
 	 */
-	private static function attempt_row( string $state, string $subject, string $reason, ?string $failure, array $snapshot ): array {
+	private static function attempt_row( string $state, string $subject, string $reason, ?string $failure, array $snapshot, string $type = 'auto' ): array {
 		$row = array(
-			'type'            => 'auto',
+			// ⚠ DECLARED BY THE CALLER, NOT ASSUMED (ADR-0019 §8). `manual` and `resend`
+			// are what a merchant's own action writes, and `DeliveryDetailRepository`
+			// validates the value against `TYPES` — so an unrecognised type is refused
+			// at the storage boundary rather than stored.
+			'type'            => $type,
 			'state'           => $state,
 			'subject'         => $subject,
 			'reason'          => Text::log_value( $reason ),

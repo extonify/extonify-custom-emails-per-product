@@ -1771,3 +1771,50 @@ deliberately **not** fixed, plus what this leaves for later.
   `RuleRepository::names_all()`, a two-column read. Recorded because the shape is easy
   to reintroduce: `query()` is the obvious method and its cost is invisible until the
   store is large.
+
+## Prompt 11 — manual delivery actions (findings and accepted residual risks)
+
+- **⚠ Tier 3 (design, disclosed) — a manually sent email can be followed by the
+  automatic one.** ADR-0019 §2 gives a manual send its own `manual:<token>` identity,
+  so it consumes no automatic identity and the rule still fires normally later. The
+  customer can therefore receive the message twice. The alternative — letting a manual
+  send consume the automatic identity — would silently disable the rule for that order
+  with nothing on any screen to say so, which is worse. The confirmation dialog states
+  it before the merchant commits, and
+  `ManualDeliveryTest::test_a_manual_send_does_not_suppress_the_automatic_delivery()`
+  asserts both halves.
+- **⚠ Tier 3 — a resend renders from the rule as it is NOW.** A resend after an edit
+  does not reproduce what the customer originally received (ADR-0019 §3).
+  `rule_revision_sent` moves to the revision that actually produced the resend, so the
+  history stays honest; reproducing the original would mean retaining every rendered
+  body forever, which ADR-0015 §2 deliberately refused.
+- **⚠ Tier 3 — confirmation tokens are rows in `wp_options`.** Non-autoloaded (so they
+  never load on a normal request), carrying an expiry, and purged a bounded page
+  (`ConfirmationToken::PURGE_LIMIT`) at a time when a new one is issued. A store that
+  opens thousands of confirmation screens inside the 30-minute TTL and completes none
+  of them holds thousands of small rows until they expire. Bounded, not unbounded.
+- **⚠ Tier 3 — the purge runs a `LIKE` scan on `wp_options`.** Only when a merchant
+  opens a confirmation screen, never on a storefront or checkout request. Accepted
+  rather than indexed: the alternative is a plugin-owned table for a handful of
+  short-lived rows.
+- **⚠ Tier 3 — "send now" re-validates and may cancel instead of sending**
+  (ADR-0019 §7). A merchant who disabled a rule and then clicks *Send now* gets a
+  cancellation, because that is the same answer the delay would have produced.
+  Diverging from it would make "send now" mean something different from "send". The
+  notice says so specifically (`wcep_send_now_cancelled`) rather than reporting a send.
+- **⚠ Tier 3 — `DeliveryConfirm` re-evaluates the refusals the handler will
+  re-evaluate.** The screen must not offer a button for something that will be
+  refused, and the handler must not trust the screen — so both check. The duplication
+  is deliberate; the handler is the boundary and the screen is a courtesy.
+- **Corrected in-round** — ADR-0019 §8 first claimed the `resend` attempt type was
+  derived by `DeliveryDetailRepository::record_attempt()`'s `$type_by_genuine_attempt`.
+  It is not: that path serves INSERT-mode renders, while a separate-mode send records
+  through `DeliveryLogger::write_attempt_rows()`, which hard-coded `auto`. The type is
+  now declared by the action and carried on the claim array beside `transition_from`.
+  The ADR records the correction rather than hiding it.
+- **Corrected in-round** — an earlier draft added an "R8: the rule already has a
+  delivery for this order" refusal for manual sends, and the order panel's picker hid
+  such rules. Both contradicted ADR-0019 §2 (two deliberate manual sends are two
+  identities *because the merchant asked twice*), and would have made a second
+  deliberate send unreachable through the UI while the handler still allowed it. Both
+  removed.

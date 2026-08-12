@@ -865,35 +865,170 @@ class Orchestrator {
 			return null;
 		}
 
-		$decision = MatchDecision::create( (int) $rule['id'], MatchDecision::MATCHED, $identity, $matched_items );
-
-		// No `EvaluationResult`: this run EXECUTES a decision taken hours ago in a
-		// different request rather than making one (ADR-0015 §3).
-		$outcome = new RunOutcome();
-
-		$this->send(
+		return $this->execute_claimed(
 			$order,
 			$email,
 			$rule,
-			$decision,
-			array(
-				'result'          => \Extonify\WCEP\Repository\DeliveryRepository::CLAIMED,
-				'delivery_id'     => $delivery_id,
-
-				/*
-				 * ⚠ THE ONE FIELD THAT MAKES THE SHARED SEND PATH SAFE FOR A DELAYED
-				 * DELIVERY (ADR-0015 §8.1). `send()` and `attempt()` serve both
-				 * phases, and every terminal write they reach must be CONDITIONAL for
-				 * this one — otherwise a `sent` tombstone could be overwritten by a
-				 * cancellation, or the reverse. Carrying it on the claim means the
-				 * shared code does the right thing without knowing which phase called
-				 * it, and its absence is what marks the immediate path.
-				 */
-				'transition_from' => \Extonify\WCEP\Repository\DeliveryRepository::EXECUTING,
-			),
+			$matched_items,
+			$delivery_id,
+			$identity,
 			array( 'scheduled' => array( 'revision' => $revision ) ),
-			$outcome
+			// ⚠ THE ONE ARGUMENT THAT MAKES THE SHARED SEND PATH SAFE FOR A DELAYED
+			// DELIVERY (ADR-0015 §8.1). `send()` and `attempt()` serve every phase, and
+			// every terminal write they reach must be CONDITIONAL for this one —
+			// otherwise a `sent` tombstone could be overwritten by a cancellation, or
+			// the reverse. Passing it here means the shared code does the right thing
+			// without knowing which phase called it, and passing null is what marks the
+			// immediate and manual paths.
+			\Extonify\WCEP\Repository\DeliveryRepository::EXECUTING
 		);
+	}
+
+	/**
+	 * The addresses a delivery for this rule and order would really reach.
+	 *
+	 * ⚠ FOR THE CONFIRMATION SCREEN, AND IT DELEGATES TO THE SAME RESOLVER THE SEND
+	 * USES (ADR-0019 §6, gate 39). A confirmation that showed a merchant a DIFFERENT
+	 * answer from the one the send will produce would be worse than no confirmation:
+	 * they would approve a send to one set of people believing it went to another.
+	 * Read-only — resolving recipients writes nothing.
+	 *
+	 * @param \WC_Order $order Order.
+	 * @param array     $rule  Rule row.
+	 * @return ResolvedRecipients
+	 */
+	public function preview_recipients( \WC_Order $order, array $rule ): ResolvedRecipients {
+		return $this->resolve_recipients( $order, $rule );
+	}
+
+	/**
+	 * Whether a manual send may proceed AT ALL (ADR-0019 §4, R6/R9).
+	 *
+	 * ⚠ ASKED BEFORE ANYTHING IS CLAIMED, which is the same posture `deliver()` takes
+	 * and for the same reason (ADR-0012 §5): claiming first and discovering the switch
+	 * afterwards would consume the identity permanently, so re-enabling the feature and
+	 * asking again would be suppressed by a delivery that never happened.
+	 *
+	 * ⚠ IT READS THE SAVED SETTING ONLY (ADR-0012 §5a). `is_globally_enabled()` does not
+	 * apply `woocommerce_email_enabled_{id}`; that per-delivery filter runs later, in
+	 * `Custom_Email::trigger()`, with the order attached — so a third party answering
+	 * "false for order #123" cannot be misread here as "false, globally".
+	 *
+	 * @return bool
+	 */
+	public function manual_send_is_available(): bool {
+		if ( ! self::is_operational() ) {
+			return false;
+		}
+
+		$email = $this->email();
+
+		return null !== $email && $email->is_globally_enabled();
+	}
+
+	/**
+	 * Send a delivery a MERCHANT asked for by hand (ADR-0019 §7).
+	 *
+	 * ⚠ IT IS `send_scheduled()`'s BODY WITH ONE ARGUMENT CHANGED, AND THAT IS THE
+	 * WHOLE POINT OF GATE 39. A manual send runs the same third-party code an automatic
+	 * one does — recipient resolution, WooCommerce's formatters, this plugin's own
+	 * placeholder filters, an SMTP plugin — so it needs the same containment boundary;
+	 * and a second implementation of "resolve, render, fan out, send, record" is a
+	 * second place for the two to disagree about what a delivery is. Both callers reach
+	 * `execute_claimed()`, which is the only body that builds a decision and enters
+	 * `send()`.
+	 *
+	 * ⚠ NO `transition_from`, WHICH IS THE IMMEDIATE PATH'S SHAPE. There is no lease
+	 * here: a manual send's tombstone was claimed microseconds ago by this same request
+	 * (ADR-0019 §2), and a resend's is already terminal. Nothing else can be holding
+	 * either, so the terminal write is unconditional exactly as `deliver()`'s is.
+	 *
+	 * ⚠ THE CALLER MUST HAVE CHECKED `is_globally_enabled()` AND THE SCHEMA BEFORE
+	 * CLAIMING (ADR-0019 §4, R6/R9). The scheduled path discovers those under its lease
+	 * and has to terminalise a consumed identity; the manual path refuses BEFORE it
+	 * claims, so a refused action leaves no tombstone at all — the same posture
+	 * `deliver()` takes.
+	 *
+	 * @param \WC_Order $order         Live order.
+	 * @param array     $rule          Rule row, read fresh (ADR-0019 §3).
+	 * @param array[]   $matched_items Items this send is bound to.
+	 * @param int       $delivery_id   Tombstone id, already claimed or already terminal.
+	 * @param string    $identity      Trigger identity the tombstone carries.
+	 * @param string    $type          Attempt type: `manual` or `resend` (ADR-0019 §8).
+	 * @param array     $snapshot      Extra diagnostic payload for the attempt rows.
+	 * @return RunOutcome|null Null when orchestration was inert.
+	 */
+	public function send_manual( \WC_Order $order, array $rule, array $matched_items, int $delivery_id, string $identity, string $type = 'manual', array $snapshot = array() ): ?RunOutcome {
+		if ( ! self::is_operational() ) {
+			return null;
+		}
+
+		$email = $this->email();
+
+		if ( null === $email ) {
+			// Nothing is terminalised here. Unlike the scheduled path, this one holds no
+			// lease and the caller checked before claiming, so there is no consumed
+			// identity to strand — the merchant simply gets a refusal.
+			return null;
+		}
+
+		return $this->execute_claimed(
+			$order,
+			$email,
+			$rule,
+			$matched_items,
+			$delivery_id,
+			$identity,
+			$snapshot,
+			null,
+			$type,
+			// ⚠ THE CURRENT REVISION, RECORDED ON THE TOMBSTONE (ADR-0019 §3). A resend
+			// renders from the rule as it is now, so a `rule_revision_sent` still naming
+			// the revision that ran months ago would make the history lie about what the
+			// customer just received.
+			max( 0, (int) ( $rule['revision'] ?? 0 ) )
+		);
+	}
+
+	/**
+	 * THE ONE BODY THAT EXECUTES AN ALREADY-CLAIMED DECISION (ADR-0015 §3, ADR-0019 §7).
+	 *
+	 * Shared by the delayed phase and by every manual action. It makes no decision of
+	 * its own: the decision was taken hours ago by the matcher, or seconds ago by a
+	 * merchant, and this executes it.
+	 *
+	 * @param \WC_Order    $order           Live order.
+	 * @param Custom_Email $email           The live email object.
+	 * @param array        $rule            Rule row.
+	 * @param array[]      $matched_items   Items this send is bound to.
+	 * @param int          $delivery_id     Tombstone id.
+	 * @param string       $identity        Trigger identity.
+	 * @param array        $snapshot        Extra diagnostic payload.
+	 * @param string|null  $transition_from State the terminal write must move OUT of,
+	 *                                      or null for an unconditional write.
+	 * @param string       $type            Attempt type for the rows this writes.
+	 * @param int          $revision        Revision to record, or 0 to leave it.
+	 * @return RunOutcome
+	 */
+	private function execute_claimed( \WC_Order $order, Custom_Email $email, array $rule, array $matched_items, int $delivery_id, string $identity, array $snapshot, ?string $transition_from, string $type = 'auto', int $revision = 0 ): RunOutcome {
+		$decision = MatchDecision::create( (int) $rule['id'], MatchDecision::MATCHED, $identity, $matched_items );
+
+		// No `EvaluationResult`: this run EXECUTES a decision taken elsewhere rather
+		// than making one (ADR-0015 §3).
+		$outcome = new RunOutcome();
+
+		$claim = array(
+			'result'             => \Extonify\WCEP\Repository\DeliveryRepository::CLAIMED,
+			'delivery_id'        => $delivery_id,
+			'attempt_type'       => $type,
+			'rule_revision_sent' => $revision,
+		);
+
+		if ( null !== $transition_from ) {
+			$claim['transition_from'] = $transition_from;
+		}
+
+		$this->send( $order, $email, $rule, $decision, $claim, $snapshot, $outcome );
 
 		return $outcome;
 	}
@@ -1244,7 +1379,19 @@ class Orchestrator {
 			$delivery_id,
 			// ADR-0015 §8.1: `executing -> sent|failed` for a delayed delivery, an
 			// unconditional write for an immediate one.
-			$this->logger->record_send( $delivery_id, $recipients, $subject, $sent, $notes, $snapshot, DeliveryLogger::transition_from( $claim ) )
+			// ADR-0019 §8: the attempt type and the revision ride on the claim, exactly
+			// as `transition_from` does, so this shared line serves all three paths.
+			$this->logger->record_send(
+				$delivery_id,
+				$recipients,
+				$subject,
+				$sent,
+				$notes,
+				$snapshot,
+				DeliveryLogger::transition_from( $claim ),
+				DeliveryLogger::attempt_type( $claim ),
+				DeliveryLogger::attempt_revision( $claim )
+			)
 		);
 
 		// ⚠ AFTER THE RECORD, NOT AFTER THE SEND. A throw from the recording itself

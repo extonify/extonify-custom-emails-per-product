@@ -83,6 +83,50 @@ final class Notices {
 			'delete_failed'    => array( 'error', __( 'The rule could not be deleted, so nothing was changed.', 'extonify-custom-emails-per-product' ) ),
 			'duplicate_failed' => array( 'error', __( 'The rule could not be duplicated. Open it and check its settings — a setting this plugin no longer accepts stops the copy being created.', 'extonify-custom-emails-per-product' ) ),
 			'toggle_failed'    => array( 'error', __( 'This rule could not be enabled or disabled because one of its settings is no longer accepted. Correct the setting below and save.', 'extonify-custom-emails-per-product' ) ),
+		) + self::delivery_messages();
+	}
+
+	/**
+	 * What each manual delivery action reports (ADR-0019 §4, gate 38).
+	 *
+	 * ⚠ EVERY REFUSAL HAS ITS OWN SENTENCE, AND THAT IS THE GATE. "The email could not
+	 * be sent" tells a merchant nothing they can act on — they cannot tell a deleted
+	 * rule from an insert-mode one from a delivery somebody else is already sending,
+	 * and those need three different responses. Gate 38 fails on a refusal code that
+	 * reaches this map without one.
+	 *
+	 * @return array<string,array{0:string,1:string}>
+	 */
+	public static function delivery_messages(): array {
+		return array(
+			// --- successes ---------------------------------------------------
+			'wcep_resent'                     => array( 'success', __( 'The email was resent. It was rendered from this rule as it is now, not as it was when the delivery first ran.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_sent_manual'                => array( 'success', __( 'The email was sent. This was a one-off send and it does not replace the rule\'s automatic delivery, so the customer may receive it again if the rule\'s trigger fires later.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_sent_now'                   => array( 'success', __( 'The email was sent immediately and the scheduled job was removed.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_cancelled'                  => array( 'success', __( 'The scheduled delivery was cancelled and its job removed. This rule will not send again for this order and trigger.', 'extonify-custom-emails-per-product' ) ),
+
+			// ⚠ SEND NOW RE-VALIDATES, SO "SENT" IS NOT THE ONLY SUCCESSFUL OUTCOME
+			// (ADR-0019 §7). Reporting "sent" for a delivery that was cancelled during
+			// re-validation would be untrue about an email that never went out.
+			'wcep_send_now_cancelled'         => array( 'warning', __( 'Nothing was sent. When the delivery ran it no longer passed the checks it makes before sending — most often because the rule or the order changed after it was scheduled. Open the delivery to see the recorded reason.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_send_now_other'             => array( 'warning', __( 'The delivery ran but did not send. Open it to see the recorded outcome.', 'extonify-custom-emails-per-product' ) ),
+
+			// --- refusals, one sentence each ----------------------------------
+			'wcep_refused_replayed'           => array( 'warning', __( 'Nothing was sent, because this confirmation had already been used. Each confirmation runs once; open the delivery and confirm again if you meant to send a second email.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_rule_deleted'       => array( 'error', __( 'This rule has been deleted, so there is no message left to send. A completed delivery does not keep a copy of what it sent.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_rule_insert_mode'   => array( 'error', __( 'This rule adds its content to a WooCommerce email rather than sending one of its own, so there is no message to send on its own. Resend the WooCommerce email instead.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_rule_vocabulary'    => array( 'error', __( 'This rule has a setting this plugin no longer accepts, so it cannot be delivered. Open the rule, correct the setting and save it first.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_not_terminal'       => array( 'error', __( 'This delivery has not finished yet, so it cannot be resent. Wait for it to finish, or cancel it.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_not_scheduled'      => array( 'error', __( 'This delivery is no longer scheduled, so it cannot be sent early or cancelled. Something else has already run or cancelled it.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_already_delivered'  => array( 'warning', __( 'Nothing was sent, because this exact send had already been recorded. Reload the delivery history to see it.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_delivery_missing'   => array( 'error', __( 'That delivery no longer exists.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_order_missing'      => array( 'error', __( 'That order no longer exists, so there is nothing to send an email about.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_no_matching_items'  => array( 'error', __( 'Nothing on this order matches what this rule targets, so there is nothing to send about. Check the rule\'s products, categories and tags.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_lost_race'          => array( 'warning', __( 'Nothing was changed, because something else was already running this delivery. Reload the delivery history to see what it did.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_write_failed'       => array( 'error', __( 'Nothing was sent and nothing was changed, because the delivery record could not be written. Check the WooCommerce logs (source: extonify-wcep) and try again.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_email_unavailable'  => array( 'error', __( 'Nothing was sent, because custom product emails are switched off in WooCommerce settings, or WooCommerce has not registered this plugin\'s email. Nothing was recorded against this order.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_schema_unavailable' => array( 'error', __( 'Nothing was sent, because this plugin\'s database tables are unavailable. Deactivate and reactivate the plugin, then try again.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_denied'             => array( 'error', __( 'You are not allowed to send custom product emails.', 'extonify-custom-emails-per-product' ) ),
 		);
 	}
 

@@ -138,6 +138,17 @@ class ScheduledDelivery {
 	/**
 	 * Reasons produced OUTSIDE a run (ADR-0015 §8.3, §8.6, §8.8).
 	 */
+	/**
+	 * A store administrator cancelled a scheduled delivery by hand (ADR-0019 §1).
+	 *
+	 * ⚠ DISTINCT FROM EVERY AUTOMATIC REASON, AND IT HAS TO BE. The §4 re-validation
+	 * codes all describe something that happened TO the delivery; this one describes a
+	 * decision somebody made about it. Collapsing them would leave a merchant unable to
+	 * tell "the plugin cancelled this because the rule changed" from "I cancelled this",
+	 * which is the first question asked when a customer says they never got the email.
+	 */
+	const REASON_MERCHANT_CANCELLED = 'merchant_cancelled';
+
 	const REASON_LEASE_EXPIRED      = 'lease_expired';
 	const REASON_ORPHANED           = 'orphaned_no_job';
 	const REASON_PLUGIN_DEACTIVATED = 'plugin_deactivated';
@@ -278,6 +289,8 @@ class ScheduledDelivery {
 		self::REASON_ORPHANED              => 'the queued job for this delayed delivery no longer exists and it could not be re-queued',
 		self::REASON_PLUGIN_DEACTIVATED    => 'the plugin was deactivated while this delayed delivery was still queued',
 		self::REASON_SHUTDOWN_INTERRUPT    => 'the plugin was shut down while a worker was running this delayed delivery, so whether the message was sent is not known',
+
+		self::REASON_MERCHANT_CANCELLED    => 'a store administrator cancelled this delivery before it was sent',
 	);
 
 	/*
@@ -1084,13 +1097,17 @@ class ScheduledDelivery {
 	 * §4 re-validation check. They are not interchangeable, and a default would be
 	 * a decision somebody could skip making.
 	 *
+	 * ⚠ `$type` MARKS A MERCHANT'S CANCELLATION AS ONE (ADR-0019 §8). It defaults to
+	 * `auto`, so every automatic caller is unchanged.
+	 *
 	 * @param int    $delivery_id Tombstone id.
 	 * @param string $reason      One of the self::REASON_* codes.
 	 * @param string $from        State the tombstone is being moved out of.
+	 * @param string $type        Attempt type: `auto` or `manual`.
 	 * @return array Structured write result.
 	 */
-	public static function cancel( int $delivery_id, string $reason, string $from ): array {
-		return self::logger()->record_scheduled_cancellation( $delivery_id, $reason, self::reason_text( $reason ), $from );
+	public static function cancel( int $delivery_id, string $reason, string $from, string $type = 'auto' ): array {
+		return self::logger()->record_scheduled_cancellation( $delivery_id, $reason, self::reason_text( $reason ), $from, $type );
 	}
 
 	/**

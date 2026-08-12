@@ -67,12 +67,56 @@ final class DeliveryIdentity {
 	 * `customer_processing_order` would be indistinguishable from an invented
 	 * format — which is the one thing this list exists to make impossible.
 	 */
-	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund', self::NATIVE_PREFIX );
+	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund', self::NATIVE_PREFIX, self::MANUAL_PREFIX );
 
 	/**
 	 * Prefix marking an insert-mode identity.
 	 */
 	const NATIVE_PREFIX = 'native';
+
+	/**
+	 * Prefix marking a delivery a MERCHANT asked for by hand (ADR-0019 §2).
+	 *
+	 * ⚠ A MANUAL SEND HAS NO TRIGGER, SO IT HAS NO TRIGGER IDENTITY — and ADR-0004's
+	 * uniqueness key needs one. This is an ADDITION to the vocabulary, not a weakening
+	 * of it: the key is still `sha256(order_id|rule_id|mode|trigger_identity)`, the
+	 * UNIQUE index is untouched, and the form still has to satisfy
+	 * self::is_valid_trigger_identity(). A fourth prefix simply becomes recognisable.
+	 *
+	 * ⚠ IT CANNOT COLLIDE WITH AN AUTOMATIC IDENTITY, BY CONSTRUCTION. `TriggerEvent`
+	 * emits only `status:`, `transition:` and `refund:`; insert mode emits only
+	 * `native:`. No automatic path can produce this prefix, and the prefix is inside
+	 * the hashed string — so a manual delivery never consumes an identity a trigger
+	 * would later want, and a trigger never suppresses a manual send.
+	 *
+	 * ⚠ AND THE VALUE IS A PER-CONFIRMATION TOKEN, NOT THE ORDER OR THE RULE. Those are
+	 * already in the hash. What the token adds is that ONE CONFIRMED CLICK maps to one
+	 * identity: a replayed submission carries the same token, hashes the same, and is
+	 * SUPPRESSED by the same single statement that has prevented duplicate automatic
+	 * sends since ADR-0004 — while a merchant who deliberately confirms a second time
+	 * gets a fresh token and a genuinely separate delivery (ADR-0019 §5).
+	 */
+	const MANUAL_PREFIX = 'manual';
+
+	/**
+	 * Build the identity for one manually confirmed send (ADR-0019 §2).
+	 *
+	 * @param string $token Per-confirmation token from `Admin\ConfirmationToken`.
+	 * @return string
+	 */
+	public static function manual( string $token ): string {
+		return self::MANUAL_PREFIX . ':' . self::normalize( $token );
+	}
+
+	/**
+	 * Whether an identity was produced by a merchant's manual send.
+	 *
+	 * @param string $trigger_identity Recorded identity.
+	 * @return bool
+	 */
+	public static function is_manual( string $trigger_identity ): bool {
+		return 0 === strpos( self::normalize( $trigger_identity ), self::MANUAL_PREFIX . ':' );
+	}
 
 	/**
 	 * Build the insert-mode identity for one native email (ADR-0013 §1).

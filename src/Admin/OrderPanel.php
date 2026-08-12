@@ -197,6 +197,9 @@ final class OrderPanel {
 			// A tombstone with no detail rows never reaches here — it is a delivery, and
 			// `DeliveryPresenter::attempts_cell()` explains its missing detail.
 			echo '<p>' . esc_html__( 'No custom emails have been sent for this order.', 'extonify-custom-emails-per-product' ) . '</p>';
+
+			self::render_manual_send( $order_id );
+
 			echo '</div>';
 			return;
 		}
@@ -218,11 +221,84 @@ final class OrderPanel {
 			Menu::history_url( array( DeliveriesListTable::ARG_ORDER => $order_id ) )
 		) . '">' . esc_html__( 'View this order in the full delivery history', 'extonify-custom-emails-per-product' ) . '</a></p>';
 
+		self::render_manual_send( $order_id );
+
 		// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- retention_note() returns markup already escaped at each of its own output points.
 		echo DeliveryPresenter::retention_note();
 
 		echo '</div>';
 	}
+
+	/**
+	 * The manual-send control: pick a rule, go to its confirmation (ADR-0019 §6).
+	 *
+	 * ⚠ IT IS A GET FORM TO A CONFIRMATION SCREEN, NOT A SEND. Choosing a rule here
+	 * sends nothing and needs no nonce; the confirmation screen it lands on shows the
+	 * resolved recipients and renders the POST that does (gate 36).
+	 *
+	 * ⚠ EVERY RULE IS OFFERED, INCLUDING ONES THAT HAVE ALREADY DELIVERED FOR THIS
+	 * ORDER. Hiding those was the first design and it contradicted ADR-0019 §2: two
+	 * deliberate manual sends are two distinct identities BECAUSE the merchant asked
+	 * twice, so a picker that removed a rule after its first manual send would make the
+	 * second one unreachable through the UI while the handler still allowed it. The
+	 * delivery's own `Resend` control remains the better route when one exists, and the
+	 * confirmation screen says what a second send will do.
+	 *
+	 * @param int $order_id Order id.
+	 * @return void
+	 */
+	private static function render_manual_send( int $order_id ): void {
+		$options = array();
+
+		foreach ( Plugin::instance()->rules()->names_all( self::MAX_RULE_OPTIONS ) as $rule_id => $name ) {
+			$name = trim( $name );
+
+			$options[ (int) $rule_id ] = '' !== $name
+				? $name
+				/* translators: %d: rule id. */
+				: sprintf( __( 'Rule #%d (no name)', 'extonify-custom-emails-per-product' ), (int) $rule_id );
+		}
+
+		if ( array() === $options ) {
+			return;
+		}
+
+		echo '<div class="extonify-wcep-manual-send">';
+
+		echo '<h4>' . esc_html__( 'Send one of these emails for this order', 'extonify-custom-emails-per-product' ) . '</h4>';
+
+		echo '<form method="get" action="' . esc_url( admin_url( 'admin.php' ) ) . '">';
+
+		echo '<input type="hidden" name="page" value="' . esc_attr( Menu::HISTORY_PAGE ) . '" />';
+		echo '<input type="hidden" name="wcep_action" value="' . esc_attr( DeliveryActions::ACTION_MANUAL ) . '" />';
+		echo '<input type="hidden" name="' . esc_attr( DeliveryActions::FIELD_ORDER ) . '" value="' . esc_attr( (string) $order_id ) . '" />';
+
+		echo '<label class="screen-reader-text" for="extonify-wcep-manual-rule">'
+			. esc_html__( 'Choose which email to send', 'extonify-custom-emails-per-product' ) . '</label>';
+
+		echo '<select name="' . esc_attr( DeliveryActions::FIELD_RULE ) . '" id="extonify-wcep-manual-rule">';
+
+		foreach ( $options as $rule_id => $label ) {
+			echo '<option value="' . esc_attr( (string) $rule_id ) . '">' . esc_html( $label ) . '</option>';
+		}
+
+		echo '</select> ';
+
+		echo '<button type="submit" class="button">' . esc_html__( 'Choose…', 'extonify-custom-emails-per-product' ) . '</button>';
+
+		echo '</form>';
+
+		echo '<p class="description">'
+			. esc_html__( 'You will be shown who the email would go to, and asked to confirm, before anything is sent.', 'extonify-custom-emails-per-product' )
+			. '</p>';
+
+		echo '</div>';
+	}
+
+	/**
+	 * How many rules the manual-send picker offers.
+	 */
+	const MAX_RULE_OPTIONS = 200;
 
 	/**
 	 * One order's deliveries with their details, in the SAME fixed number of
@@ -275,6 +351,7 @@ final class OrderPanel {
 		echo '<th scope="col">' . esc_html__( 'Status', 'extonify-custom-emails-per-product' ) . '</th>';
 		echo '<th scope="col">' . esc_html__( 'When', 'extonify-custom-emails-per-product' ) . '</th>';
 		echo '<th scope="col">' . esc_html__( 'Attempts', 'extonify-custom-emails-per-product' ) . '</th>';
+		echo '<th scope="col">' . esc_html__( 'Actions', 'extonify-custom-emails-per-product' ) . '</th>';
 		echo '</tr></thead>';
 
 		echo '<tbody>';
@@ -308,6 +385,11 @@ final class OrderPanel {
 			echo '<td>';
 			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside the presenter.
 			echo DeliveryPresenter::attempts_cell( (array) ( $page['details'][ $delivery_id ] ?? array() ) );
+			echo '</td>';
+
+			echo '<td>';
+			// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped inside the presenter; every link points at a CONFIRMATION screen, never at a send (ADR-0019 §6).
+			echo DeliveryPresenter::actions_cell( $delivery );
 			echo '</td>';
 
 			echo '</tr>';

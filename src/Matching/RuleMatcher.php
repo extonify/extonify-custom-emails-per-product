@@ -263,6 +263,38 @@ class RuleMatcher {
 			return MatchDecision::create( $rule_id, MatchDecision::TARGETING_INVALID, $identity );
 		}
 
+		$evaluated = self::match_items( $targeting, $items );
+
+		$matched      = $evaluated['matched'];
+		$any_excluded = $evaluated['any_excluded'];
+
+		if ( array() !== $matched ) {
+			return MatchDecision::create( $rule_id, MatchDecision::MATCHED, $identity, $matched );
+		}
+
+		// Matched the include set and was then excluded: ADR-0005 REQUIRES this
+		// be logged, which is exactly why the engine returns reason codes
+		// rather than a boolean.
+		if ( $any_excluded ) {
+			return MatchDecision::create( $rule_id, MatchDecision::EXCLUDED_BY_RULE, $identity );
+		}
+
+		return MatchDecision::create( $rule_id, MatchDecision::NO_TARGETING_MATCH, $identity );
+	}
+
+	/**
+	 * Evaluate one targeting document against a set of resolved items.
+	 *
+	 * ⚠ EXTRACTED SO THE MANUAL PATH RUNS THIS EXACT LOOP (ADR-0019 §7, gate 39). A
+	 * manual send that resolved its own items could address a message to products the
+	 * rule does not target — a divergence invisible until a customer receives an email
+	 * about something they did not buy. There is one loop, and both callers use it.
+	 *
+	 * @param Targeting $targeting Parsed targeting document.
+	 * @param array[]   $items     Resolved item descriptors.
+	 * @return array{matched:array[], any_excluded:bool}
+	 */
+	private static function match_items( Targeting $targeting, array $items ): array {
 		$matched      = array();
 		$any_excluded = false;
 
@@ -304,17 +336,47 @@ class RuleMatcher {
 			}
 		}
 
-		if ( array() !== $matched ) {
-			return MatchDecision::create( $rule_id, MatchDecision::MATCHED, $identity, $matched );
+		return array(
+			'matched'      => $matched,
+			'any_excluded' => $any_excluded,
+		);
+	}
+
+	/**
+	 * The line items ONE rule's targeting matches on ONE order, with no trigger and no
+	 * status policy (ADR-0019 §3, §7).
+	 *
+	 * ⚠ IT DELIBERATELY DOES NOT ASK WHETHER THE RULE IS ACTIVE. `decide_rule()` refuses
+	 * a disabled rule because an automatic delivery must not fire from one; a MANUAL
+	 * send of a disabled rule is explicitly allowed (ADR-0019 §3), since the merchant is
+	 * acting deliberately on one specific order and refusing would mean disabling a rule
+	 * retroactively blocks support for the orders it already served. The confirmation
+	 * says the rule is disabled; this method does not second-guess it.
+	 *
+	 * ⚠ IT DOES NOT ASK WHETHER A TRIGGER FIRED EITHER, because none did. That is the
+	 * whole premise of a manual send, and it is why this is a separate entry point
+	 * rather than an argument to `evaluate()`: the trigger question and the targeting
+	 * question are different, and merging them would let a caller accidentally send on a
+	 * trigger that never happened.
+	 *
+	 * Targeting validity is still enforced: an unreadable document matches nothing, so
+	 * the caller sees no items and refuses.
+	 *
+	 * @param \WC_Order $order Order to match against.
+	 * @param array     $rule  Rule row.
+	 * @return array[] Matched item descriptors, in the same shape a decision carries.
+	 */
+	public function match_rule_against_order( \WC_Order $order, array $rule ): array {
+		$prepared = PreparedRule::from_row( $rule );
+
+		$targeting = $prepared->targeting();
+
+		if ( ! $targeting->is_valid() ) {
+			return array();
 		}
 
-		// Matched the include set and was then excluded: ADR-0005 REQUIRES this
-		// be logged, which is exactly why the engine returns reason codes
-		// rather than a boolean.
-		if ( $any_excluded ) {
-			return MatchDecision::create( $rule_id, MatchDecision::EXCLUDED_BY_RULE, $identity );
-		}
+		$resolved = $this->items->resolve_order( $order );
 
-		return MatchDecision::create( $rule_id, MatchDecision::NO_TARGETING_MATCH, $identity );
+		return self::match_items( $targeting, (array) $resolved['items'] )['matched'];
 	}
 }

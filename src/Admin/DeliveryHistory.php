@@ -61,7 +61,10 @@ final class DeliveryHistory {
 
 		echo '<hr class="wp-header-end" />';
 
-		echo '<p>' . esc_html__( 'Every custom product email this store has delivered, newest first. This screen is a record of what happened; it does not send anything.', 'extonify-custom-emails-per-product' ) . '</p>';
+		// The outcome of a manual action that redirected back here (ADR-0019 §6).
+		Notices::render_request_notice();
+
+		echo '<p>' . esc_html__( 'Every custom product email this store has delivered, newest first. Sending, resending and cancelling are done from a delivery\'s own confirmation screen.', 'extonify-custom-emails-per-product' ) . '</p>';
 
 		echo '<form method="get">';
 

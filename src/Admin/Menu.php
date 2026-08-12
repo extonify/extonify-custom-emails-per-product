@@ -197,16 +197,40 @@ final class Menu {
 	public static function load_history(): void {
 		self::require_capability();
 
+		$action = self::requested_action();
+
+		/*
+		 * ⚠ THE SENDING ACTIONS RUN HERE, AT `load-{$hook}`, BEFORE ANY OUTPUT — the
+		 * same place `Admin\Menu::load()` runs the rule handlers, and for the same
+		 * reason: a completed action must redirect (post/redirect/get), and a redirect
+		 * needs headers that have not been sent. It also means a reload after a send
+		 * re-issues a GET rather than re-submitting the POST.
+		 */
+		if ( DeliveryActions::is_write_action( $action ) ) {
+			self::dispatch( DeliveryActions::handle( $action, $_POST ) ); // phpcs:ignore WordPress.Security.NonceVerification.Missing -- DeliveryActions::handle() verifies the capability, the request method, an action-specific nonce and a single-use token before it reads anything; passing $_POST in is what makes that verification testable without a live request.
+			return;
+		}
+
+		if ( '' !== DeliveryConfirm::requested_action() ) {
+			// The confirmation screen is read-only and builds nothing here.
+			return;
+		}
+
 		DeliveryHistory::prepare();
 	}
 
 	/**
-	 * Render the history screen.
+	 * Render the history screen, or the confirmation screen it links to.
 	 *
 	 * @return void
 	 */
 	public static function render_history(): void {
 		self::require_capability();
+
+		if ( '' !== DeliveryConfirm::requested_action() ) {
+			DeliveryConfirm::render();
+			return;
+		}
 
 		DeliveryHistory::render();
 	}

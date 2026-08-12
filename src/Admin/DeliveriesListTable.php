@@ -108,7 +108,18 @@ final class DeliveriesListTable extends \WP_List_Table {
 			'status'   => __( 'Status', 'extonify-custom-emails-per-product' ),
 			'when'     => __( 'When', 'extonify-custom-emails-per-product' ),
 			'attempts' => __( 'Attempts', 'extonify-custom-emails-per-product' ),
+			'actions'  => __( 'Actions', 'extonify-custom-emails-per-product' ),
 		);
+	}
+
+	/**
+	 * The actions cell (ADR-0019 §6).
+	 *
+	 * @param array $item Tombstone row.
+	 * @return string
+	 */
+	public function column_actions( $item ) {
+		return DeliveryPresenter::actions_cell( (array) $item );
 	}
 
 	/**

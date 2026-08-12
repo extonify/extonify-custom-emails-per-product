@@ -432,13 +432,20 @@ final class ScheduledExitBranchesTest extends ScheduledDeliveryTestCase {
 		 * telling that merchant they "changed the rule" would send them looking for an
 		 * edit they never made.
 		 *
-		 * ⚠ AND THIS ASSERTION FAILING IS THIS TEST WORKING. It caught the addition on
-		 * the first full 8A run and required it to be written down here — which is
-		 * exactly the same discipline as gate 15's enumeration and the collection
-		 * census. Widening it to `assertGreaterThan` would remove the only thing that
-		 * makes a new reason code impossible to add silently.
+		 * ⚠ 19 SINCE PROMPT 11: `merchant_cancelled` (ADR-0019 §1). Every other reason
+		 * here describes something that happened TO a delivery; this one describes a
+		 * decision somebody MADE about it. Collapsing it into any of the automatic codes
+		 * would leave a merchant unable to tell "the plugin cancelled this because the
+		 * rule changed" from "I cancelled this" — which is the first question asked when
+		 * a customer says they never got the email.
+		 *
+		 * ⚠ AND THIS ASSERTION FAILING IS THIS TEST WORKING. It caught the 8A addition
+		 * on the first full run, and caught this one the same way — which is exactly the
+		 * same discipline as gate 15's enumeration and the collection census. Widening
+		 * it to `assertGreaterThan` would remove the only thing that makes a new reason
+		 * code impossible to add silently.
 		 */
-		$this->assertCount( 18, $codes, 'the reason-code set changed without this assertion being updated' );
+		$this->assertCount( 19, $codes, 'the reason-code set changed without this assertion being updated' );
 
 		fwrite(
 			STDERR,

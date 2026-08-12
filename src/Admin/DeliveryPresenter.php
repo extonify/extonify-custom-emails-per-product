@@ -452,6 +452,74 @@ final class DeliveryPresenter {
 	}
 
 	/**
+	 * The actions available on one delivery (ADR-0019 §6, gate 36).
+	 *
+	 * ⚠ EVERY LINK GOES TO A CONFIRMATION SCREEN, NEVER TO A SEND. There is no
+	 * nonce-carrying "resend" URL anywhere in this plugin, because a URL that sends is
+	 * a URL a browser follows from history, a prefetcher warms and a referrer leaks.
+	 * The send is a POST the confirmation screen renders.
+	 *
+	 * ⚠ AN UNAVAILABLE ACTION IS ABSENT, NOT DISABLED (ADR-0001, ADR-0018 §9). A greyed
+	 * "Resend" is what a paid tier looks like from the merchant's side, and this plugin
+	 * has no paid tier to advertise.
+	 *
+	 * @param array $delivery Tombstone row.
+	 * @return string Escaped HTML, or '' when nothing is available.
+	 */
+	public static function actions_cell( array $delivery ): string {
+		$delivery_id = (int) ( $delivery['id'] ?? 0 );
+
+		if ( $delivery_id <= 0 || ! current_user_can( Menu::CAPABILITY ) ) {
+			return '';
+		}
+
+		$links = array();
+
+		if ( DeliveryConfirm::is_scheduled( $delivery ) ) {
+			$links[] = self::action_link(
+				DeliveryActions::ACTION_SEND_NOW,
+				$delivery_id,
+				__( 'Send now', 'extonify-custom-emails-per-product' ),
+				''
+			);
+			$links[] = self::action_link(
+				DeliveryActions::ACTION_CANCEL,
+				$delivery_id,
+				__( 'Cancel', 'extonify-custom-emails-per-product' ),
+				'submitdelete'
+			);
+		} elseif ( DeliveryConfirm::can_resend( $delivery ) ) {
+			$links[] = self::action_link(
+				DeliveryActions::ACTION_RESEND,
+				$delivery_id,
+				__( 'Resend', 'extonify-custom-emails-per-product' ),
+				''
+			);
+		}
+
+		if ( array() === $links ) {
+			return '';
+		}
+
+		return '<span class="extonify-wcep-delivery-actions">' . implode( ' | ', $links ) . '</span>';
+	}
+
+	/**
+	 * One action link to a confirmation screen.
+	 *
+	 * @param string $action      The action.
+	 * @param int    $delivery_id Delivery id.
+	 * @param string $label       Link text.
+	 * @param string $css_class   Extra CSS class.
+	 * @return string Escaped HTML.
+	 */
+	private static function action_link( string $action, int $delivery_id, string $label, string $css_class ): string {
+		return '<a href="' . esc_url( DeliveryConfirm::url( $action, $delivery_id ) ) . '"'
+			. ( '' !== $css_class ? ' class="' . esc_attr( $css_class ) . '"' : '' ) . '>'
+			. esc_html( $label ) . '</a>';
+	}
+
+	/**
 	 * The retention note shown beneath both surfaces (ADR-0018 §4d).
 	 *
 	 * ⚠ IT STATES THE WINDOWS **AND** THAT NOTHING CURRENTLY APPLIES THEM, WHICH IS

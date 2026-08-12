@@ -8,6 +8,9 @@
 namespace Extonify\WCEP\Tests\Integration;
 
 use Extonify\WCEP\Admin\Assets;
+use Extonify\WCEP\Admin\ConfirmationToken;
+use Extonify\WCEP\Admin\DeliveryActions;
+use Extonify\WCEP\Admin\DeliveryConfirm;
 use Extonify\WCEP\Admin\DeliveryHistory;
 use Extonify\WCEP\Admin\Menu;
 use Extonify\WCEP\Admin\OrderPanel;
@@ -83,7 +86,146 @@ final class AdminAuthorizationTest extends AdminTestCase {
 			// property directly — no delivery data reaches them — rather than inferring
 			// it from a status code this surface should not be issuing.
 			'panel render: order screen' => array( 'panel', Menu::CAPABILITY . ' (renders nothing)', '— (read-only)' ),
+			// --- ADR-0019: the four actions that mail a customer -------------------
+			// ⚠ EACH ALSO CONSUMES A SINGLE-USE TOKEN (gate 37), which the nonce column
+			// cannot express and which is a SECOND barrier rather than a substitute for
+			// one. `ManualDeliveryTest` owns that half.
+			'screen render: confirm'     => array( 'render', Menu::CAPABILITY, '— (read-only)' ),
+			'handler: wcep_resend'       => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_resend_{id}_{rule}' ),
+			'handler: wcep_send_now'     => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_send_now_{id}_{rule}' ),
+			'handler: wcep_cancel'       => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_cancel_{id}_{rule}' ),
+			'handler: wcep_send_manual'  => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_send_manual_{order}_{rule}' ),
 		);
+	}
+
+	/**
+	 * GATE 28j. EVERY DELIVERY HANDLER REFUSES WITHOUT THE CAPABILITY — with a VALID
+	 *           nonce and a VALID token, so the capability is what refused.
+	 *
+	 * ⚠ THE VALID NONCE AND TOKEN MATTER. A handler tested without them refuses for
+	 * the wrong reason and would go on refusing if the capability check were deleted.
+	 *
+	 * @dataProvider delivery_action_provider
+	 *
+	 * @param string $action The delivery action.
+	 * @return void
+	 */
+	public function test_every_delivery_handler_refuses_without_the_capability( string $action ) {
+		$this->become_manager();
+
+		// Minted and issued while privileged, so both are genuinely valid.
+		$post = array(
+			'action'                        => $action,
+			DeliveryActions::FIELD_DELIVERY => 1,
+			DeliveryActions::FIELD_ORDER    => 1,
+			DeliveryActions::FIELD_RULE     => 1,
+			DeliveryActions::FIELD_TOKEN    => ConfirmationToken::issue(),
+			DeliveryActions::FIELD_NONCE    => wp_create_nonce( DeliveryActions::nonce_action( $action, 1, 1 ) ),
+		);
+
+		$_SERVER['REQUEST_METHOD'] = 'POST';
+
+		foreach ( array( 'logged out', 'subscriber' ) as $who ) {
+			if ( 'logged out' === $who ) {
+				$this->become_logged_out();
+			} else {
+				$this->become_subscriber();
+			}
+
+			$result = DeliveryActions::handle( $action, $post );
+
+			$this->assertSame(
+				RuleActions::OUTCOME_DENIED,
+				$result['outcome'] ?? '',
+				'⚠ TIER 1: delivery handler "' . $action . '" did not refuse a ' . $who . ' user holding a valid nonce and token.'
+			);
+		}
+
+		unset( $_SERVER['REQUEST_METHOD'] );
+
+		$this->gate[] = 'capability: handler: ' . $action . ' refuses both a logged-out and an unprivileged user '
+			. 'EVEN WITH A VALID NONCE AND A VALID SINGLE-USE TOKEN';
+	}
+
+	/**
+	 * GATE 28k. THE CONFIRMATION SCREEN REFUSES WITHOUT THE CAPABILITY.
+	 *
+	 * @return void
+	 */
+	public function test_the_confirmation_screen_refuses_without_the_capability() {
+		foreach ( array( 'logged out', 'subscriber' ) as $who ) {
+			if ( 'logged out' === $who ) {
+				$this->become_logged_out();
+			} else {
+				$this->become_subscriber();
+			}
+
+			$this->request(
+				array(
+					'page'        => Menu::HISTORY_PAGE,
+					'wcep_action' => DeliveryActions::ACTION_RESEND,
+					'delivery'    => 1,
+				)
+			);
+
+			$refusal = $this->assertRefuses(
+				static function () {
+					DeliveryConfirm::render();
+				},
+				'⚠ TIER 1: the send-confirmation screen rendered for a ' . $who . ' user.'
+			);
+
+			$this->assertSame( 403, $refusal->status() );
+		}
+
+		$this->gate[] = 'capability: screen render: confirm refuses both a logged-out and an unprivileged user (403)';
+	}
+
+	/**
+	 * Every delivery action.
+	 *
+	 * @return array<string,array{0:string}>
+	 */
+	public static function delivery_action_provider(): array {
+		$cases = array();
+
+		foreach ( DeliveryActions::write_actions() as $action ) {
+			$cases[ $action ] = array( $action );
+		}
+
+		return $cases;
+	}
+
+	/**
+	 * GATE 28l. THE DELIVERY ENTRY-POINT TABLE IS COMPLETE.
+	 *
+	 * ⚠ THE MECHANISM, NOT THE DOCUMENTATION. A fifth sending action added to
+	 * `DeliveryActions::write_actions()` without a table row — and therefore without a
+	 * capability test and a nonce test — fails here rather than shipping unnoticed.
+	 *
+	 * @return void
+	 */
+	public function test_the_delivery_entry_point_table_is_complete() {
+		$named = array();
+
+		foreach ( array_keys( self::entry_points() ) as $label ) {
+			if ( 0 === strpos( $label, 'handler: wcep_' ) ) {
+				$named[] = substr( $label, strlen( 'handler: ' ) );
+			}
+		}
+
+		sort( $named );
+
+		$actual = DeliveryActions::write_actions();
+		sort( $actual );
+
+		$this->assertSame(
+			$actual,
+			$named,
+			'⚠ a sending action exists that the gate-28 table does not name. Add it, with its capability and nonce tests.'
+		);
+
+		$this->gate[] = 'entry-point table: ' . count( $actual ) . ' sending actions, all named';
 	}
 
 	/**
@@ -100,7 +242,11 @@ final class AdminAuthorizationTest extends AdminTestCase {
 		$named = array();
 
 		foreach ( array_keys( self::entry_points() ) as $label ) {
-			if ( 0 === strpos( $label, 'handler: ' ) ) {
+			// ⚠ THE RULE HANDLERS ONLY. ADR-0019 added four `wcep_`-prefixed SENDING
+			// handlers to the same table; they have their own completeness test against
+			// `DeliveryActions::write_actions()`, and folding the two lists together
+			// would let a missing row in either be masked by a spare row in the other.
+			if ( 0 === strpos( $label, 'handler: ' ) && 0 !== strpos( $label, 'handler: wcep_' ) ) {
 				$named[] = substr( $label, strlen( 'handler: ' ) );
 			}
 		}
