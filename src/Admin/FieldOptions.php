@@ -8,10 +8,13 @@
 namespace Extonify\WCEP\Admin;
 
 use Extonify\WCEP\Delivery\Consolidation;
+use Extonify\WCEP\Domain\Recipient;
 use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
 use Extonify\WCEP\Matching\OrderStatuses;
 use Extonify\WCEP\Render\Injector;
+use Extonify\WCEP\Repository\DeliveryDetailRepository;
+use Extonify\WCEP\Repository\DeliveryRepository;
 use Extonify\WCEP\Repository\RuleRepository;
 
 defined( 'ABSPATH' ) || exit;
@@ -25,7 +28,10 @@ defined( 'ABSPATH' ) || exit;
  * control for a value the repository refuses, or hides one the repository accepts,
  * and either way the merchant is arguing with a screen rather than with a rule.
  * Every `values()` here reads the constant the storage layer validates against, and
- * `AdminVocabularyTest` asserts the rendered option set EQUALS that constant.
+ * the suite asserts the rendered option set EQUALS that constant — `AdminOutputTest`
+ * for the editor's vocabularies, `DeliveryHistoryTest` for the delivery ones.
+ * (This docblock previously named an `AdminVocabularyTest` that has never existed;
+ * corrected in Prompt 10 rather than left pointing at a file nobody can open.)
  *
  * LABELS ARE THIS LAYER'S OWN, deliberately. A vocabulary is data; its human name is
  * presentation, it is translatable, and it has no business in a domain constant. A
@@ -236,6 +242,88 @@ final class FieldOptions {
 			'cc'  => __( 'Cc', 'extonify-custom-emails-per-product' ),
 			'bcc' => __( 'Bcc', 'extonify-custom-emails-per-product' ),
 		);
+	}
+
+	/**
+	 * Delivery statuses => label (ADR-0018 §2).
+	 *
+	 * Read from `DeliveryRepository::FINAL_STATUSES`, the same constant
+	 * `set_final_status()` validates against, for the reason the class docblock
+	 * gives: a hard-coded duplicate renders a filter for a status the plugin never
+	 * writes, or hides one it does.
+	 *
+	 * ⚠ THREE OF THESE LABELS ARE THE WHOLE POINT OF THE VOCABULARY AND MUST NOT BE
+	 * COLLAPSED. `failed` means WooCommerce reported the send did not work;
+	 * `unresolved` means a send happened and NOTHING was reported back; `abandoned`
+	 * means no send happened at all (ADR-0013 §6a). A merchant reading "Failed" for
+	 * the second is being told something untrue about an email that may well have
+	 * arrived, and a resend feature would read it as "retry this".
+	 *
+	 * @return array<string,string>
+	 */
+	public static function delivery_statuses(): array {
+		return self::label(
+			DeliveryRepository::FINAL_STATUSES,
+			array(
+				'claimed'                            => __( 'In progress', 'extonify-custom-emails-per-product' ),
+				DeliveryRepository::SCHEDULED        => __( 'Scheduled', 'extonify-custom-emails-per-product' ),
+				DeliveryRepository::EXECUTING        => __( 'Sending now', 'extonify-custom-emails-per-product' ),
+				'sent'                               => __( 'Sent', 'extonify-custom-emails-per-product' ),
+				'failed'                             => __( 'Failed', 'extonify-custom-emails-per-product' ),
+				'cancelled'                          => __( 'Cancelled', 'extonify-custom-emails-per-product' ),
+				'skipped'                            => __( 'Skipped', 'extonify-custom-emails-per-product' ),
+				DeliveryDetailRepository::UNRESOLVED => __( 'Outcome unknown', 'extonify-custom-emails-per-product' ),
+				DeliveryDetailRepository::ABANDONED  => __( 'Not sent', 'extonify-custom-emails-per-product' ),
+			)
+		);
+	}
+
+	/**
+	 * Attempt states => label.
+	 *
+	 * @return array<string,string>
+	 */
+	public static function attempt_states(): array {
+		return self::label(
+			DeliveryDetailRepository::STATES,
+			array(
+				'scheduled'                          => __( 'Scheduled', 'extonify-custom-emails-per-product' ),
+				'sent'                               => __( 'Sent', 'extonify-custom-emails-per-product' ),
+				'failed'                             => __( 'Failed', 'extonify-custom-emails-per-product' ),
+				'cancelled'                          => __( 'Cancelled', 'extonify-custom-emails-per-product' ),
+				'skipped'                            => __( 'Skipped', 'extonify-custom-emails-per-product' ),
+				'suppressed'                         => __( 'Suppressed as a duplicate', 'extonify-custom-emails-per-product' ),
+				DeliveryDetailRepository::UNRESOLVED => __( 'Outcome unknown', 'extonify-custom-emails-per-product' ),
+				DeliveryDetailRepository::ABANDONED  => __( 'Not sent', 'extonify-custom-emails-per-product' ),
+			)
+		);
+	}
+
+	/**
+	 * Attempt types => label.
+	 *
+	 * @return array<string,string>
+	 */
+	public static function attempt_types(): array {
+		return self::label(
+			DeliveryDetailRepository::TYPES,
+			array(
+				'auto'   => __( 'Automatic', 'extonify-custom-emails-per-product' ),
+				'manual' => __( 'Sent by hand', 'extonify-custom-emails-per-product' ),
+				'resend' => __( 'Resend', 'extonify-custom-emails-per-product' ),
+				'test'   => __( 'Test', 'extonify-custom-emails-per-product' ),
+				'debug'  => __( 'Debug', 'extonify-custom-emails-per-product' ),
+			)
+		);
+	}
+
+	/**
+	 * Recipient types => label. The stored per-row form of self::recipient_channels().
+	 *
+	 * @return array<string,string>
+	 */
+	public static function recipient_types(): array {
+		return self::label( Recipient::TYPES, self::recipient_channels() );
 	}
 
 	/**

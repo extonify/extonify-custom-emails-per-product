@@ -211,3 +211,86 @@
 		width: 100%;
 	}
 }
+
+/* ---------------------------------------------------------------------------
+ * Delivery history (ADR-0018): the history screen and the order-screen panel.
+ * ------------------------------------------------------------------------ */
+
+.extonify-wcep-attempts {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.extonify-wcep-attempt {
+	margin: 0 0 8px;
+	padding: 0 0 8px;
+	border-bottom: 1px solid #f0f0f1;
+}
+
+.extonify-wcep-attempt:last-child {
+	margin-bottom: 0;
+	padding-bottom: 0;
+	border-bottom: 0;
+}
+
+/* Purged and redacted are DIFFERENT FACTS and must not read alike (ADR-0018
+   §4). Neither is an error, so neither borrows the error colour. */
+.extonify-wcep-purged,
+.extonify-wcep-redacted,
+.extonify-wcep-muted {
+	color: #646970;
+	font-style: italic;
+}
+
+.extonify-wcep-failure {
+	color: #8a2424;
+	font-style: normal;
+	word-break: break-word;
+}
+
+.extonify-wcep-delivery-status {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 9px;
+	font-size: 12px;
+	line-height: 1.6;
+	background: #f0f0f1;
+	color: #1d2327;
+}
+
+.extonify-wcep-delivery-status--sent {
+	background: #edfaef;
+	color: #005c12;
+}
+
+.extonify-wcep-delivery-status--failed {
+	background: #fcf0f1;
+	color: #8a2424;
+}
+
+.extonify-wcep-delivery-status--scheduled,
+.extonify-wcep-delivery-status--executing {
+	background: #fcf9e8;
+	color: #6a5b00;
+}
+
+.extonify-wcep-delivery-filters > * {
+	margin-right: 4px;
+	vertical-align: top;
+}
+
+.extonify-wcep-retention {
+	max-width: 46em;
+}
+
+.extonify-wcep-order-deliveries {
+	margin-bottom: 8px;
+}
+
+@media screen and ( max-width: 782px ) {
+	.extonify-wcep-delivery-filters > * {
+		display: block;
+		margin: 0 0 6px;
+	}
+}

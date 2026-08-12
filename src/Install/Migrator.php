@@ -172,6 +172,20 @@ class Migrator {
 					'columns' => array( 'final_status', 'lease_taken_at' ),
 					'unique'  => false,
 				),
+				// ADR-0018 §6: the delivery-history listing's DEFAULT view — no
+				// filter, newest first, paged. The existing indexes serve every
+				// FILTER (order_id, scheduled_lookup's leading rule_id,
+				// lease_sweep's leading final_status) and none of them serves the
+				// ORDERING, so without this the default view is a full scan plus a
+				// filesort of a table whose whole design is to grow for the lifetime
+				// of the store and which is never purged. `id` is the second column
+				// because it is the deterministic tie-break the pager depends on, so
+				// the index delivers the exact row order the query asks for. In-place
+				// amendment of the unreleased v1, as `lease_sweep` was.
+				'history_recent'   => array(
+					'columns' => array( 'first_claimed_at', 'id' ),
+					'unique'  => false,
+				),
 			),
 			'types'   => array( 'identity_hash' => 'char(64)' ),
 		),
@@ -605,7 +619,8 @@ class Migrator {
 	UNIQUE KEY identity_hash (identity_hash),
 	KEY order_id (order_id),
 	KEY scheduled_lookup (rule_id, final_status),
-	KEY lease_sweep (final_status, lease_taken_at)
+	KEY lease_sweep (final_status, lease_taken_at),
+	KEY history_recent (first_claimed_at, id)
 ) {$charset_collate};";
 
 		// One row per RESOLVED recipient (ADR-0009, amended Prompt 2a): the

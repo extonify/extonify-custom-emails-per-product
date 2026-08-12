@@ -110,6 +110,10 @@ $GLOBALS['extonify_wcep_front_end_state'] = array(
 	'wp_admin'              => defined( 'WP_ADMIN' ) && WP_ADMIN,
 	'current_screen'        => isset( $GLOBALS['current_screen'] ),
 	'menu_hook'             => \Extonify\WCEP\Admin\Menu::hook(),
+	// ADR-0018: the history screen and the order panel are admin entry points too, so
+	// gate 32 has to be able to assert their absence at the moment it means something.
+	'history_hook'          => \Extonify\WCEP\Admin\Menu::history_hook(),
+	'add_meta_boxes'        => has_action( 'add_meta_boxes', array( \Extonify\WCEP\Admin\OrderPanel::class, 'add' ) ),
 	'admin_menu'            => has_action( 'admin_menu', array( \Extonify\WCEP\Admin\Menu::class, 'add_page' ) ),
 	'admin_enqueue_scripts' => has_action( 'admin_enqueue_scripts', array( \Extonify\WCEP\Admin\Assets::class, 'enqueue' ) ),
 	'wp_ajax'               => has_action( 'wp_ajax_' . \Extonify\WCEP\Admin\TargetSearch::ACTION ),

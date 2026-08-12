@@ -1711,3 +1711,63 @@ deliberately **not** fixed, plus what this leaves for later.
   33b enumerates every `<p id="extonify-wcep…">` and fails on any that no control
   points at. The injection is anchored to this editor's id, so a second `wp_editor()`
   on the same screen is untouched.
+
+## Prompt 10 — delivery history (findings and accepted residual risks)
+
+- **⚠ Tier 2 — the retention purge STILL has no scheduler, and the history screen now
+  says so out loud.** `DeliveryDetailRepository::purge_older_than()` has no production
+  caller; `Install\Maintenance` records the gap in terms and this backlog has carried
+  it since Prompt 1a. ADR-0018 §4d required the retention windows to be stated on the
+  screen so an absent detail row is explicable — but stating ADR-0005's 90/180/14-day
+  windows as *current behaviour* would tell every merchant something untrue about
+  their own data, since nothing removes anything today. `DeliveryPresenter::retention_note()`
+  therefore states the windows **and** "Automatic clearing is not scheduled yet",
+  and `DeliveryHistoryTest::test_the_retention_note_states_the_windows_and_the_truth_about_them()`
+  asserts the premise by scanning `src/` for a call to `purge_older_than()`. **The day
+  retention is scheduled, that test goes red and forces the sentence to be corrected**
+  rather than leaving a stale falsehood on a merchant's screen. Building the scheduler
+  is still out of scope here; it belongs with the settings UI, as ADR-0015 §8.3 says.
+- **⚠ Tier 3 — filtering by `mode` alone, or by a very common `final_status`, may
+  filesort within the filtered set.** ADR-0018 §6 adds exactly one index,
+  `history_recent (first_claimed_at, id)`, which serves the default unfiltered view
+  and the date range. `mode` is a two-value column the planner would not use an index
+  for, and a `(final_status, first_claimed_at)` covering index would cost a write on
+  every `claim()` — the plugin's most load-bearing statement — to serve a query the
+  planner already has two workable plans for. Bounded by `LIMIT`, not by the table.
+- **⚠ Tier 3 — the order column shows the recorded `order_id`, not the WooCommerce
+  order NUMBER.** They differ only when a sequential-order-number plugin is active,
+  and resolving the display number costs one `wc_get_order()` per row, which is the
+  N+1 shape ADR-0018 §7 exists to forbid. The id is the value the tombstone actually
+  holds, and it still links correctly under both storages.
+- **⚠ Tier 3 — the tombstone records no rule NAME, so a deleted rule renders as
+  `Rule #12` plus "This rule has been deleted."** ADR-0018 §3 declined to add a
+  denormalised `rule_name` column, for the reason ADR-0015 §2 declined to widen the
+  same statement: `claim()` is the one atomic query the entire duplicate-prevention
+  design rests on. A denormalised copy would also go stale on the first rename.
+- **⚠ Tier 3 — the legacy-storage panel is exercised through the
+  `woocommerce_custom_orders_table_enabled` option, not against genuinely post-stored
+  orders.** That option is the *only* thing
+  `OrderUtil::custom_orders_table_usage_is_enabled()` reads, so the plugin's detection,
+  screen-id resolution, edit-URL shape and asset gate are all genuinely exercised in
+  both modes. The gap costs nothing **for this panel specifically** because the panel
+  never loads an order — it reads the `order_id` recorded on the tombstone (ADR-0018
+  §7). A surface that DID read orders could not be tested this way. The harness's live
+  configuration is HPOS, and `OrderPanelTest` prints which mode was real.
+- **⚠ Tier 3 — gate 33's text-domain scan flags any `'lowercase-string' )` literal.**
+  `AdminOutputTest::test_every_admin_string_is_translatable_and_whole()` extracts
+  candidate domains with `/'([a-z0-9-]+)'\s*\)/`, which matches any single-quoted
+  lowercase argument in final position — so `add_meta_box( …, 'normal', 'default' )`
+  read as a gettext call naming WordPress's `default` domain. The false positive was
+  resolved by omitting the argument (it was that parameter's own default), but the
+  heuristic will trip again on the next legitimate `'default'` or `'woocommerce'`
+  literal in `src/Admin/`. Accepted: it fails **loudly and safely**, in the direction
+  that costs a minute rather than shipping an untranslated string.
+- **⚠ Tier 3 (fixed in-round, recorded for the reasoning) — the rule filter's dropdown
+  originally called `RuleRepository::query()`**, which returns whole rule rows: the
+  email `content`, plus `targeting` and `recipients` for `hydrate()` to decode. That
+  read and discarded potentially megabytes on a store with a few hundred rules to
+  render a list of short names — a violation of ADR-0018 §5's own "nothing is loaded
+  that is not shown", committed by the screen that states the rule. Replaced with
+  `RuleRepository::names_all()`, a two-column read. Recorded because the shape is easy
+  to reintroduce: `query()` is the obvious method and its cost is invisible until the
+  store is large.

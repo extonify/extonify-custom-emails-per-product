@@ -1113,6 +1113,206 @@ class DeliveryRepository {
 	}
 
 	/**
+	 * Columns the history listing may filter on by exact match (ADR-0018 §5).
+	 *
+	 * An allowlist of IDENTIFIERS, keyed by the argument name the caller uses, so
+	 * the SQL text is assembled only from members of this constant. Every VALUE is
+	 * still bound.
+	 */
+	const HISTORY_INT_FILTERS = array(
+		'order_id' => 'order_id',
+		'rule_id'  => 'rule_id',
+	);
+
+	/**
+	 * String columns the history listing may filter on by exact match.
+	 *
+	 * ⚠ NO REPAIR AND NO FALLBACK. A value outside the stored vocabulary simply
+	 * matches nothing, exactly as `RuleRepository::where_clause()` behaves — the
+	 * alternative is a filter that silently widens itself when a merchant hand-edits
+	 * the URL, which is the shape that reads as the filter being broken.
+	 */
+	const HISTORY_STRING_FILTERS = array(
+		'final_status' => 'final_status',
+		'mode'         => 'mode',
+	);
+
+	/**
+	 * Date-range filters, argument name => comparison operator.
+	 *
+	 * Both bounds are inclusive, and both are compared against the SAME column the
+	 * ordering uses, so one index serves the filter and the sort.
+	 */
+	const HISTORY_DATE_FILTERS = array(
+		'date_from' => '>=',
+		'date_to'   => '<=',
+	);
+
+	/**
+	 * Rows the history screen reads at a time.
+	 *
+	 * Well below self::DELETE_CHUNK_SIZE, which is what keeps the per-page detail
+	 * and rule-name batches to ONE statement each (ADR-0018 §7).
+	 */
+	const HISTORY_PER_PAGE = 20;
+
+	/**
+	 * ONE PAGE OF DELIVERY HISTORY: filtered, ordered and paged IN SQL
+	 * (ADR-0018 §5).
+	 *
+	 * ⚠ NOTHING IS LOADED THAT IS NOT SHOWN. Reading the table and slicing it in PHP
+	 * is unbounded in the one dimension this table is DESIGNED to grow in — it is
+	 * never purged, by construction — and it is the defect the Prompt 7C sweep
+	 * corrected elsewhere. Every filter, the ordering and the page window are in the
+	 * statement.
+	 *
+	 * ⚠ ORDERED `first_claimed_at DESC, id DESC`, AND BOTH HALVES ARE LOAD-BEARING.
+	 * Newest first is what a merchant wants; the tie-break on the primary key is what
+	 * makes paging DETERMINISTIC. Without it two deliveries claimed in the same second
+	 * have no defined order, so MySQL is free to return them differently for page 1
+	 * and page 2 — and a row that swaps across the boundary is either shown twice or
+	 * never shown at all.
+	 *
+	 * ⚠ `first_claimed_at` AND NOT `last_seen_at`. `claim()`'s
+	 * `ON DUPLICATE KEY UPDATE` bumps `last_seen_at` every time the same trigger fires
+	 * again, so ordering by it would shuffle a year-old delivery to the top of the
+	 * history the moment a merchant re-saved the order.
+	 *
+	 * ⚠ THE ORDER-BY CARRIES NO CALLER INPUT AT ALL. `prepare()` binds values, not
+	 * identifiers, so the one clause where a request string could reach SQL
+	 * uninterpolated is simply not parameterised here — the listing has no sortable
+	 * columns and therefore no allowlist to get wrong.
+	 *
+	 * Served by the `history_recent (first_claimed_at, id)` index (ADR-0018 §6).
+	 *
+	 * @param array $args {
+	 *     Filter and paging arguments. Every one is optional.
+	 *
+	 *     @type int    $order_id     Exact-match filter; 0 or less for all.
+	 *     @type int    $rule_id      Exact-match filter; 0 or less for all.
+	 *     @type string $final_status Exact-match filter, or '' for all.
+	 *     @type string $mode         Exact-match filter, or '' for all.
+	 *     @type string $date_from    `Y-m-d H:i:s` UTC lower bound, inclusive.
+	 *     @type string $date_to      `Y-m-d H:i:s` UTC upper bound, inclusive.
+	 *     @type int    $limit        Page size.
+	 *     @type int    $offset       Page offset.
+	 * }
+	 * @return array[] Tombstone rows, newest first.
+	 */
+	public function query( array $args = array() ): array {
+		global $wpdb;
+
+		$table = $this->table();
+		$where = $this->history_where( $args );
+
+		$limit  = max( 1, (int) ( $args['limit'] ?? self::HISTORY_PER_PAGE ) );
+		$offset = max( 0, (int) ( $args['offset'] ?? 0 ) );
+
+		$sql = "SELECT * FROM {$table} {$where['sql']} ORDER BY first_claimed_at DESC, id DESC LIMIT %d OFFSET %d";
+
+		$params = array_merge( $where['params'], array( $limit, $offset ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- paged listing read of the plugin-owned tombstone table; a cached page would show a merchant a delivery state another request has already moved on from, which is the one thing this screen exists to report accurately.
+		$rows = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier and {$where['sql']} is assembled ONLY from the HISTORY_*_FILTERS class constants plus hardcoded date predicates; every VALUE is bound through $params.
+			$wpdb->prepare( $sql, $params ),
+			ARRAY_A
+		);
+
+		return is_array( $rows ) ? $rows : array();
+	}
+
+	/**
+	 * How many tombstones match the same filters self::query() would apply.
+	 *
+	 * ⚠ SHARES ONE WHERE-CLAUSE BUILDER WITH self::query(), so the pager and the page
+	 * can never disagree about what they are counting — a pager reporting 40 while the
+	 * pages hold 37 is a defect nobody sees until the last page renders empty.
+	 *
+	 * ⚠ NAMED `count_matching()` RATHER THAN OVERLOADING `count()`. The existing
+	 * no-argument `count()` means "every tombstone in the store" and is what the
+	 * lifecycle assertions and the uninstall smoke test read; giving it an optional
+	 * filter argument would make an unfiltered call and a call whose filters happened
+	 * to be empty indistinguishable at the call site.
+	 *
+	 * @param array $args Same filter keys as self::query(); paging is ignored.
+	 * @return int
+	 */
+	public function count_matching( array $args = array() ): int {
+		global $wpdb;
+
+		$table = $this->table();
+		$where = $this->history_where( $args );
+
+		$sql = "SELECT COUNT(*) FROM {$table} {$where['sql']}";
+
+		if ( array() !== $where['params'] ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$table} is a plugin-derived identifier and {$where['sql']} is built from the filter allowlists above; every value is bound.
+			$sql = $wpdb->prepare( $sql, $where['params'] );
+		}
+
+		// An unfiltered count carries no values at all, and prepare() with an empty
+		// argument list is a deprecation rather than a no-op — so that form is issued
+		// directly and the filtered one is always bound.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- pager count over the plugin-owned tombstone table; see above.
+		return (int) $wpdb->get_var( $sql );
+	}
+
+	/**
+	 * The shared WHERE clause for self::query() and self::count_matching().
+	 *
+	 * @param array $args Filter arguments.
+	 * @return array{sql:string, params:array}
+	 */
+	private function history_where( array $args ): array {
+		$clauses = array();
+		$params  = array();
+
+		foreach ( self::HISTORY_INT_FILTERS as $key => $column ) {
+			$value = (int) ( $args[ $key ] ?? 0 );
+
+			if ( $value <= 0 ) {
+				continue;
+			}
+
+			$clauses[] = $column . ' = %d';
+			$params[]  = $value;
+		}
+
+		foreach ( self::HISTORY_STRING_FILTERS as $key => $column ) {
+			$value = (string) ( $args[ $key ] ?? '' );
+
+			if ( '' === $value ) {
+				continue;
+			}
+
+			$clauses[] = $column . ' = %s';
+			$params[]  = $value;
+		}
+
+		// ⚠ THE RANGE IS ON `first_claimed_at`, THE SAME COLUMN THE ORDERING USES, so
+		// one index serves both. Both bounds are inclusive and both are UTC, because
+		// that is how `current_time( 'mysql', true )` wrote the column; converting a
+		// merchant's local date into this form is the admin layer's job, done once,
+		// rather than a timezone assumption buried in SQL.
+		foreach ( self::HISTORY_DATE_FILTERS as $key => $operator ) {
+			$value = trim( (string) ( $args[ $key ] ?? '' ) );
+
+			if ( '' === $value ) {
+				continue;
+			}
+
+			$clauses[] = 'first_claimed_at ' . $operator . ' %s';
+			$params[]  = $value;
+		}
+
+		return array(
+			'sql'    => array() === $clauses ? '' : 'WHERE ' . implode( ' AND ', $clauses ),
+			'params' => $params,
+		);
+	}
+
+	/**
 	 * Fetch one tombstone by primary key.
 	 *
 	 * @param int $delivery_id Tombstone id.

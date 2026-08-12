@@ -9,6 +9,7 @@ namespace Extonify\WCEP\Tests\Integration;
 
 use Extonify\WCEP\Admin\Assets;
 use Extonify\WCEP\Admin\Menu;
+use Extonify\WCEP\Admin\OrderPanel;
 use Extonify\WCEP\Admin\RuleActions;
 use Extonify\WCEP\Admin\TargetSearch;
 
@@ -224,14 +225,30 @@ final class AdminIsolationTest extends AdminTestCase {
 			'woocommerce_page_' . Menu::PAGE . '-extra',
 			'other_page_' . Menu::PAGE,
 			'admin_page_' . Menu::PAGE,
+			// ⚠ AND THE SAME NEAR-MISSES FOR THE HISTORY SLUG (ADR-0018 §10). The
+			// screen set grew from one hook to two, which is precisely the moment a
+			// `strpos()` starts to look like a tidy simplification.
+			Menu::HISTORY_PAGE,
+			'toplevel_page_' . Menu::HISTORY_PAGE,
+			'woocommerce_page_' . Menu::HISTORY_PAGE . '-extra',
+			'other_page_' . Menu::HISTORY_PAGE,
 		);
 
 		$this->with_registered_menu(
 			function ( string $hook ) use ( $foreign ) {
 				$this->assertTrue( Assets::is_our_screen( $hook ), 'the positive control failed: our own hook is not ours.' );
 
+				// BOTH of this plugin's screens are ours, and the set is exactly two.
+				$ours = Menu::hooks();
+
+				$this->assertCount( 2, $ours, 'this plugin no longer owns exactly the rules and history screens.' );
+
+				foreach ( $ours as $mine ) {
+					$this->assertTrue( Assets::is_our_screen( $mine ), 'a registered screen of ours was not recognised.' );
+				}
+
 				foreach ( $foreign as $other ) {
-					if ( $other === $hook ) {
+					if ( in_array( $other, $ours, true ) ) {
 						continue;
 					}
 
@@ -277,8 +294,9 @@ final class AdminIsolationTest extends AdminTestCase {
 		$loaded = $this->at_plugin_load();
 
 		$this->assertSame( '', $loaded['menu_hook'], '⚠ TIER 1: the menu registered a hook on a front-end request.' );
+		$this->assertSame( '', $loaded['history_hook'], '⚠ TIER 1: the history screen registered a hook on a front-end request.' );
 
-		foreach ( array( 'admin_menu', 'admin_enqueue_scripts', 'wp_ajax' ) as $hook ) {
+		foreach ( array( 'admin_menu', 'admin_enqueue_scripts', 'wp_ajax', 'add_meta_boxes' ) as $hook ) {
 			$this->assertFalse(
 				$loaded[ $hook ],
 				'⚠ TIER 1: "' . $hook . '" was hooked when the plugin loaded on a front-end request.'
@@ -349,6 +367,42 @@ final class AdminIsolationTest extends AdminTestCase {
 				Menu::load();
 			},
 			'⚠ TIER 1: the request dispatcher ran for a logged-out visitor.'
+		);
+
+		// ADR-0018: the two history entry points refuse on their own too.
+		$this->assertRefuses(
+			static function () {
+				Menu::render_history();
+			},
+			'⚠ TIER 1: the delivery history rendered for a logged-out visitor.'
+		);
+
+		$this->assertRefuses(
+			static function () {
+				Menu::load_history();
+			},
+			'⚠ TIER 1: the history dispatcher ran for a logged-out visitor.'
+		);
+
+		// ⚠ THE PANEL REFUSES BY RENDERING NOTHING, NOT BY DYING (ADR-0018 §8), so the
+		// assertion is on the DATA rather than on a `wp_die()` this surface must not
+		// issue — a fatal inside a meta box would take down WooCommerce's order screen.
+		$panel = $this->capture(
+			static function () {
+				OrderPanel::render( (object) array( 'ID' => 4242 ) );
+			}
+		);
+
+		$this->assertStringNotContainsString(
+			'<table',
+			$panel,
+			'⚠ TIER 1: the order panel rendered delivery data for a logged-out visitor.'
+		);
+
+		$this->assertStringContainsString(
+			'You are not allowed to view custom product email deliveries.',
+			$panel,
+			'⚠ the order panel did not refuse a logged-out visitor.'
 		);
 
 		$answer = $this->ajax(
@@ -478,39 +532,59 @@ final class AdminIsolationTest extends AdminTestCase {
 
 		$saved = array( $admin_page_hooks, $_registered_pages, $_parent_pages, $menu, $submenu );
 
-		$hook_property = new \ReflectionProperty( Menu::class, 'hook' );
-		$hook_property->setAccessible( true );
-		$saved_hook = $hook_property->getValue();
+		// ⚠ BOTH STATICS, SINCE ADR-0018 ADDED THE HISTORY PAGE. Restoring only `$hook`
+		// would leave `$history_hook` set, and `Assets::is_our_screen()` reads BOTH
+		// through `Menu::hooks()` — so the next test in this process would be told the
+		// history screen is ours on a front-end request, which is exactly the
+		// cross-test contamination gate 32 exists to rule out.
+		$properties = array();
+
+		foreach ( array( 'hook', 'history_hook' ) as $name ) {
+			$property = new \ReflectionProperty( Menu::class, $name );
+			$property->setAccessible( true );
+
+			$properties[ $name ] = array( $property, $property->getValue() );
+		}
 
 		$restore_user = get_current_user_id();
 		$hook         = '';
+		$history      = '';
 
 		try {
 			$this->become_manager();
 
 			Menu::add_page();
 
-			$hook = Menu::hook();
+			$hook    = Menu::hook();
+			$history = Menu::history_hook();
 
 			$this->assertNotSame( '', $hook, 'the menu did not register for a privileged user.' );
+			$this->assertNotSame( '', $history, 'the history page did not register for a privileged user.' );
 
 			$body( $hook );
 		} finally {
-			// `add_page()` also hangs the dispatcher on `load-{$hook}`. Left behind it
-			// would be an admin handler registered during a front-end request — the
+			// `add_page()` also hangs a dispatcher on each `load-{$hook}`. Left behind
+			// they would be admin handlers registered during a front-end request — the
 			// very thing this class asserts never happens.
 			if ( '' !== $hook ) {
 				remove_action( 'load-' . $hook, array( Menu::class, 'load' ) );
 			}
 
-			$hook_property->setValue( null, $saved_hook );
+			if ( '' !== $history ) {
+				remove_action( 'load-' . $history, array( Menu::class, 'load_history' ) );
+			}
+
+			foreach ( $properties as $entry ) {
+				$entry[0]->setValue( null, $entry[1] );
+			}
 
 			list( $admin_page_hooks, $_registered_pages, $_parent_pages, $menu, $submenu ) = $saved;
 
 			wp_set_current_user( $restore_user );
 		}
 
-		$this->assertSame( $saved_hook, Menu::hook(), 'the registered hook leaked out of the helper.' );
+		$this->assertSame( $properties['hook'][1], Menu::hook(), 'the registered hook leaked out of the helper.' );
+		$this->assertSame( $properties['history_hook'][1], Menu::history_hook(), 'the history hook leaked out of the helper.' );
 	}
 
 	/**

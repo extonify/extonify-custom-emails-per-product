@@ -36,6 +36,18 @@ final class Menu {
 	const PAGE = 'extonify-wcep-rules';
 
 	/**
+	 * The delivery-history page slug (ADR-0018 §1).
+	 *
+	 * ⚠ A SECOND REGISTERED PAGE, WHICH §1 OF ADR-0017 DECLINED FOR THE EDITOR AND
+	 * ADR-0018 §1 GRANTS HERE. The editor is the same subject matter as the list,
+	 * reached from it, so an `action` parameter was enough. History is a peer
+	 * destination with its own subject — deliveries, not rules — and a merchant asking
+	 * "did this customer get their email" is not editing anything. It costs one
+	 * submenu row under a menu this plugin already appears in, not a top-level slot.
+	 */
+	const HISTORY_PAGE = 'extonify-wcep-history';
+
+	/**
 	 * The capability every screen and every handler requires.
 	 */
 	const CAPABILITY = 'manage_woocommerce';
@@ -63,6 +75,13 @@ final class Menu {
 	private static $hook = '';
 
 	/**
+	 * The hook suffix the HISTORY page registered, or ''.
+	 *
+	 * @var string
+	 */
+	private static $history_hook = '';
+
+	/**
 	 * The outcome `load()` produced, read by `render()`.
 	 *
 	 * @var array
@@ -70,7 +89,7 @@ final class Menu {
 	private static $pending = array();
 
 	/**
-	 * Register the screen. Hooks only — zero queries, zero output.
+	 * Register the screens. Hooks only — zero queries, zero output.
 	 *
 	 * @return void
 	 */
@@ -79,6 +98,7 @@ final class Menu {
 		add_action( 'admin_enqueue_scripts', array( Assets::class, 'enqueue' ) );
 
 		TargetSearch::register();
+		OrderPanel::register();
 	}
 
 	/**
@@ -105,6 +125,37 @@ final class Menu {
 		self::$hook = $hook;
 
 		add_action( 'load-' . $hook, array( self::class, 'load' ) );
+
+		self::add_history_page();
+	}
+
+	/**
+	 * Add the delivery-history submenu entry (ADR-0018 §1).
+	 *
+	 * ⚠ ITS OWN `load-` HANDLER, AND ITS OWN CAPABILITY CHECK. The capability passed
+	 * to `add_submenu_page()` decides whether WordPress DRAWS THE LINK; it is not an
+	 * authorisation, because `admin.php?page=…` is reachable by URL whether the menu
+	 * rendered it or not.
+	 *
+	 * @return void
+	 */
+	private static function add_history_page(): void {
+		$hook = add_submenu_page(
+			self::PARENT,
+			__( 'Custom Email History', 'extonify-custom-emails-per-product' ),
+			__( 'Custom Email History', 'extonify-custom-emails-per-product' ),
+			self::CAPABILITY,
+			self::HISTORY_PAGE,
+			array( self::class, 'render_history' )
+		);
+
+		if ( ! is_string( $hook ) || '' === $hook ) {
+			return;
+		}
+
+		self::$history_hook = $hook;
+
+		add_action( 'load-' . $hook, array( self::class, 'load_history' ) );
 	}
 
 	/**
@@ -114,6 +165,63 @@ final class Menu {
 	 */
 	public static function hook(): string {
 		return self::$hook;
+	}
+
+	/**
+	 * The history page's hook suffix, or '' when it was not registered.
+	 *
+	 * @return string
+	 */
+	public static function history_hook(): string {
+		return self::$history_hook;
+	}
+
+	/**
+	 * Every hook suffix this plugin owns, with the empty ones removed.
+	 *
+	 * ⚠ THE ASSET GATE READS THIS AND COMPARES BY STRICT EQUALITY (gate 32). The
+	 * empties are filtered out so an unregistered page's `''` can never compare equal
+	 * to the empty hook suffix of a request that registered no menu at all.
+	 *
+	 * @return string[]
+	 */
+	public static function hooks(): array {
+		return array_values( array_filter( array( self::$hook, self::$history_hook ) ) );
+	}
+
+	/**
+	 * Prepare the history screen, before any output.
+	 *
+	 * @return void
+	 */
+	public static function load_history(): void {
+		self::require_capability();
+
+		DeliveryHistory::prepare();
+	}
+
+	/**
+	 * Render the history screen.
+	 *
+	 * @return void
+	 */
+	public static function render_history(): void {
+		self::require_capability();
+
+		DeliveryHistory::render();
+	}
+
+	/**
+	 * A URL on the history screen.
+	 *
+	 * @param array $args Extra query arguments.
+	 * @return string
+	 */
+	public static function history_url( array $args = array() ): string {
+		return add_query_arg(
+			array_merge( array( 'page' => self::HISTORY_PAGE ), $args ),
+			admin_url( 'admin.php' )
+		);
 	}
 
 	/**

@@ -8,7 +8,9 @@
 namespace Extonify\WCEP\Tests\Integration;
 
 use Extonify\WCEP\Admin\Assets;
+use Extonify\WCEP\Admin\DeliveryHistory;
 use Extonify\WCEP\Admin\Menu;
+use Extonify\WCEP\Admin\OrderPanel;
 use Extonify\WCEP\Admin\RuleActions;
 use Extonify\WCEP\Admin\RuleEditor;
 use Extonify\WCEP\Admin\RuleList;
@@ -70,6 +72,17 @@ final class AdminAuthorizationTest extends AdminTestCase {
 			'handler: deactivate'        => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_deactivate_rule_{id}' ),
 			'ajax: target search'        => array( 'ajax', Menu::CAPABILITY, TargetSearch::NONCE_ACTION ),
 			'asset enqueue'              => array( 'assets', Menu::CAPABILITY . ' (page registration)', '— (no state change)' ),
+			// --- ADR-0018: the delivery-history surfaces. Read-only, so no nonce ----
+			'screen render: history'     => array( 'render', Menu::CAPABILITY, '— (read-only)' ),
+			'request dispatch: history'  => array( 'load', Menu::CAPABILITY, '— (read-only)' ),
+			// ⚠ THE PANEL REFUSES BY RENDERING NOTHING, NOT WITH A 403, and the table
+			// records that rather than smoothing it over. It is a fragment of
+			// WooCommerce's own order screen: a `wp_die()` there would take down the
+			// whole order editor for a user holding `edit_shop_orders` without
+			// `manage_woocommerce` (ADR-0018 §8). `OrderPanelTest` asserts the security
+			// property directly — no delivery data reaches them — rather than inferring
+			// it from a status code this surface should not be issuing.
+			'panel render: order screen' => array( 'panel', Menu::CAPABILITY . ' (renders nothing)', '— (read-only)' ),
 		);
 	}
 
@@ -123,7 +136,11 @@ final class AdminAuthorizationTest extends AdminTestCase {
 	 * @return void
 	 */
 	public function test_a_screen_render_refuses_without_the_capability( string $label, array $get, string $method ) {
-		$this->use_our_screen();
+		if ( 'history' === $method || 'history_load' === $method ) {
+			set_current_screen( 'woocommerce_page_' . Menu::HISTORY_PAGE );
+		} else {
+			$this->use_our_screen();
+		}
 
 		foreach ( array( 'logged out', 'subscriber' ) as $who ) {
 			if ( 'logged out' === $who ) {
@@ -143,6 +160,25 @@ final class AdminAuthorizationTest extends AdminTestCase {
 
 					if ( 'editor' === $method ) {
 						RuleEditor::render();
+						return;
+					}
+
+					if ( 'history' === $method ) {
+						// ⚠ THE DISPATCHER AND THE SCREEN ARE ASSERTED SEPARATELY. The
+						// capability passed to `add_submenu_page()` decides whether
+						// WordPress draws the LINK; `admin.php?page=…` is reachable by
+						// URL whether it drew one or not.
+						Menu::render_history();
+						return;
+					}
+
+					if ( 'history_direct' === $method ) {
+						DeliveryHistory::render();
+						return;
+					}
+
+					if ( 'history_load' === $method ) {
+						Menu::load_history();
 						return;
 					}
 
@@ -191,6 +227,21 @@ final class AdminAuthorizationTest extends AdminTestCase {
 					'rule'   => 1,
 				),
 				'editor',
+			),
+			'history (dispatcher)'    => array(
+				'screen render: history',
+				array( 'page' => Menu::HISTORY_PAGE ),
+				'history',
+			),
+			'history (direct)'        => array(
+				'screen render: history',
+				array( 'page' => Menu::HISTORY_PAGE ),
+				'history_direct',
+			),
+			'history (load)'          => array(
+				'request dispatch: history',
+				array( 'page' => Menu::HISTORY_PAGE ),
+				'history_load',
 			),
 		);
 	}
@@ -510,11 +561,56 @@ final class AdminAuthorizationTest extends AdminTestCase {
 		Menu::add_page();
 
 		$this->assertSame( '', Menu::hook(), '⚠ the screen registered a hook for an unprivileged user.' );
+		$this->assertSame( '', Menu::history_hook(), '⚠ the history screen registered a hook for an unprivileged user.' );
+		$this->assertSame( array(), Menu::hooks(), '⚠ an unprivileged user owns a screen this plugin would load assets on.' );
 		$this->assertFalse( Assets::is_our_screen( 'woocommerce_page_' . Menu::PAGE ) );
+		$this->assertFalse( Assets::is_our_screen( 'woocommerce_page_' . Menu::HISTORY_PAGE ) );
 
 		list( $admin_page_hooks, $_registered_pages, $_parent_pages ) = $saved;
 
-		$this->gate[] = 'asset enqueue: no hook is registered for an unprivileged user, so no asset can load';
+		$this->gate[] = 'asset enqueue: neither the rules page nor the history page registers a hook for an '
+			. 'unprivileged user, so no asset can load';
+	}
+
+	/**
+	 * GATE 28i. THE ORDER PANEL IS NEITHER REGISTERED NOR RENDERED FOR A USER WITHOUT
+	 *           THE CAPABILITY (ADR-0018 §8).
+	 *
+	 * ⚠ IT REFUSES BY RENDERING NOTHING RATHER THAN WITH A 403, so the assertion is on
+	 * the DATA rather than on a status code. `wp_die()` inside a meta box would take
+	 * down WooCommerce's whole order editor for a user who legitimately holds
+	 * `edit_shop_orders` — a worse outcome than the one it would be preventing.
+	 * `OrderPanelTest` covers this in depth; this is the gate-28 row.
+	 *
+	 * @return void
+	 */
+	public function test_the_order_panel_refuses_without_the_capability() {
+		$this->become_subscriber();
+
+		$markup = '';
+
+		ob_start();
+
+		try {
+			OrderPanel::render( (object) array( 'ID' => 4242 ) );
+		} finally {
+			$markup = (string) ob_get_clean();
+		}
+
+		$this->assertStringContainsString(
+			'You are not allowed to view custom product email deliveries.',
+			$markup,
+			'⚠ the order panel did not refuse an unprivileged user.'
+		);
+
+		$this->assertStringNotContainsString(
+			'<table',
+			$markup,
+			'⚠ TIER 1: the order panel rendered delivery data for an unprivileged user.'
+		);
+
+		$this->gate[] = 'capability: panel render: order screen refuses an unprivileged user by rendering a sentence '
+			. 'and no delivery table (deliberately not a 403 — see the entry-point table)';
 	}
 
 	/**

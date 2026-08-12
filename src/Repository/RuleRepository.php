@@ -161,6 +161,14 @@ class RuleRepository {
 	const RAW_SUFFIX = Json::RAW_SUFFIX;
 
 	/**
+	 * How many ids to bind per statement in a batched lookup.
+	 *
+	 * The same bound the delivery repositories use, for the same reason: one
+	 * unbounded `IN (…)` list can exceed `max_allowed_packet`.
+	 */
+	const ID_CHUNK_SIZE = 200;
+
+	/**
 	 * Fields whose change does NOT bump `revision`.
 	 *
 	 * Deliberately an EXCLUSION list. An inclusion list silently exempted
@@ -330,6 +338,102 @@ class RuleRepository {
 		);
 
 		return is_array( $row ) ? $this->hydrate( $row ) : null;
+	}
+
+	/**
+	 * NAMES ONLY, FOR A WHOLE PAGE OF RULE IDS, IN ONE STATEMENT (ADR-0018 §7).
+	 *
+	 * ⚠ THIS EXISTS SO THE HISTORY SCREEN CANNOT BE WRITTEN AS `find()` IN A LOOP,
+	 * which is one statement per row — and one full row, decoding two JSON documents,
+	 * to render a single label. The delivery history joins tombstones to rules by id,
+	 * and a page of twenty deliveries needs twenty names and nothing else.
+	 *
+	 * ⚠ AN ID WITH NO ROW IS SIMPLY ABSENT FROM THE RESULT, and the caller must read
+	 * that as "this rule was deleted" rather than as "the lookup failed". ADR-0004
+	 * keeps a tombstone when its rule goes, so a delivery naming a rule that no longer
+	 * exists is the ordinary state of an old row.
+	 *
+	 * Chunked on the same bound as every other id batch in the repositories, so one
+	 * enormous `IN (…)` list can never exceed `max_allowed_packet`.
+	 *
+	 * @param int[] $rule_ids Rule ids.
+	 * @return array<int,string> rule_id => name, for the ids that still exist.
+	 */
+	public function names_for_ids( array $rule_ids ): array {
+		global $wpdb;
+
+		$ids = array();
+
+		foreach ( $rule_ids as $id ) {
+			$id = (int) $id;
+
+			if ( $id > 0 ) {
+				$ids[ $id ] = $id;
+			}
+		}
+
+		if ( array() === $ids ) {
+			return array();
+		}
+
+		$table = $this->table();
+		$out   = array();
+
+		foreach ( array_chunk( array_values( $ids ), self::ID_CHUNK_SIZE ) as $chunk ) {
+			// Placeholders are generated from the COUNT of ids, and every id is an
+			// int cast above — no value reaches the SQL unprepared.
+			$placeholders = implode( ', ', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- batched label read of the plugin-owned rules table for one admin page render.
+			$rows = $wpdb->get_results(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT id, name FROM {$table} WHERE id IN ( {$placeholders} )", $chunk ),
+				ARRAY_A
+			);
+
+			foreach ( (array) $rows as $row ) {
+				$out[ (int) $row['id'] ] = (string) $row['name'];
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * EVERY RULE'S ID AND NAME, FOR A PICKER — and nothing else (ADR-0018 §5).
+	 *
+	 * ⚠ `query()` WOULD RETURN THE WHOLE ROW, AND THAT IS THE POINT OF THIS METHOD.
+	 * A rule row carries `content` — the email body, which is merchant-authored HTML
+	 * and routinely kilobytes — plus `targeting` and `recipients`, two JSON documents
+	 * `hydrate()` decodes on the way out. Building a dropdown of names from that reads
+	 * and decodes megabytes on a store with a few hundred rules, to render a few
+	 * hundred short strings. "Nothing is loaded that is not shown" is the rule the
+	 * delivery history is built on; a filter control is not exempt from it.
+	 *
+	 * Ordered by name, because this feeds a control a human reads.
+	 *
+	 * @param int $limit Maximum rules to return.
+	 * @return array<int,string> rule_id => name.
+	 */
+	public function names_all( int $limit ): array {
+		global $wpdb;
+
+		$table = $this->table();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- two-column read of the plugin-owned rules table for one admin filter control.
+		$rows = $wpdb->get_results(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier; the ORDER BY names a hardcoded column and the limit is bound.
+			$wpdb->prepare( "SELECT id, name FROM {$table} ORDER BY name ASC, id ASC LIMIT %d", max( 1, $limit ) ),
+			ARRAY_A
+		);
+
+		$out = array();
+
+		foreach ( (array) $rows as $row ) {
+			$out[ (int) $row['id'] ] = (string) $row['name'];
+		}
+
+		return $out;
 	}
 
 	/**

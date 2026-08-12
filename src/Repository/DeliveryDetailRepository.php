@@ -539,6 +539,67 @@ class DeliveryDetailRepository {
 	}
 
 	/**
+	 * EVERY ATTEMPT ROW FOR A WHOLE PAGE OF TOMBSTONES, IN ONE STATEMENT
+	 * (ADR-0018 §7).
+	 *
+	 * ⚠ THIS EXISTS SO THE HISTORY SCREEN CANNOT BE WRITTEN THE OTHER WAY.
+	 * `find_for_delivery()` inside a render loop is one statement per row — twenty
+	 * per page today, and a number that grows the moment somebody raises the page
+	 * size. The batch is bound by the id COUNT, so its cost is one statement per
+	 * chunk of self::DELETE_CHUNK_SIZE ids and the history page (20) is always one.
+	 *
+	 * ⚠ KEYED BY `delivery_id`, AND EVERY REQUESTED ID GETS A KEY — including the
+	 * ones with no rows at all. A tombstone whose details were purged by retention
+	 * must be DISTINGUISHABLE from one this method was never asked about, or the
+	 * screen cannot tell "the details aged out" from "I did not look" (ADR-0018 §4a).
+	 * An empty array is the answer, not a missing key.
+	 *
+	 * Ordered by `attempt` then `id`: attempt order is the merchant's reading order,
+	 * and the primary key breaks a tie between two rows of the same attempt — one per
+	 * resolved recipient, which is the ADR-0009 shape.
+	 *
+	 * @param int[] $delivery_ids Tombstone ids.
+	 * @return array<int,array[]> delivery_id => its attempt rows, `snapshot` decoded.
+	 */
+	public function find_for_deliveries( array $delivery_ids ): array {
+		global $wpdb;
+
+		$ids = $this->positive_ints( $delivery_ids );
+
+		// Pre-seeded with an empty page per requested id, so "no rows" is an answer
+		// rather than an absence — see the note above.
+		$out = array();
+		foreach ( $ids as $id ) {
+			$out[ $id ] = array();
+		}
+
+		if ( empty( $ids ) ) {
+			return $out;
+		}
+
+		$table = $this->table();
+
+		foreach ( array_chunk( $ids, self::DELETE_CHUNK_SIZE ) as $chunk ) {
+			// Placeholders are generated from the COUNT of ids, and every id is an
+			// int cast above — no value reaches the SQL unprepared.
+			$placeholders = implode( ', ', array_fill( 0, count( $chunk ), '%d' ) );
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- batched listing read of the plugin-owned detail table; a cached page would report an attempt state another request has already moved on from.
+			$rows = $wpdb->get_results(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT * FROM {$table} WHERE delivery_id IN ( {$placeholders} ) ORDER BY delivery_id ASC, attempt ASC, id ASC", $chunk ),
+				ARRAY_A
+			);
+
+			foreach ( (array) $rows as $row ) {
+				$out[ (int) $row['delivery_id'] ][] = $this->hydrate( $row );
+			}
+		}
+
+		return $out;
+	}
+
+	/**
 	 * Attempt rows for one recipient address, across every tombstone. Used by
 	 * the privacy exporter and eraser.
 	 *

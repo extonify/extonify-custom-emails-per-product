@@ -48,7 +48,26 @@ final class Assets {
 	 * @return void
 	 */
 	public static function enqueue( $hook_suffix ): void {
-		if ( ! self::is_our_screen( (string) $hook_suffix ) ) {
+		$hook_suffix = (string) $hook_suffix;
+
+		// ⚠ THE ORDER SCREEN GETS THE STYLESHEET AND NOTHING ELSE (ADR-0018 §10). The
+		// script exists for the targeting picker and the delete confirmation, neither of
+		// which is on somebody else's screen — and the localized payload carries a nonce
+		// for an endpoint the panel never calls. Shipping either onto the WooCommerce
+		// order editor would be this plugin putting its JavaScript on a page it does not
+		// own, which is the same failure as putting its CSS there.
+		if ( self::is_order_screen() && ! self::is_our_screen( $hook_suffix ) ) {
+			wp_enqueue_style(
+				self::HANDLE,
+				EXTONIFY_WCEP_URL . 'assets/admin.css',
+				array(),
+				EXTONIFY_WCEP_VERSION
+			);
+
+			return;
+		}
+
+		if ( ! self::is_our_screen( $hook_suffix ) ) {
 			return;
 		}
 
@@ -71,18 +90,56 @@ final class Assets {
 	}
 
 	/**
-	 * Whether this is the screen this plugin registered.
+	 * Whether this is one of the screens this plugin registered.
 	 *
-	 * Strict equality against the hook suffix `add_submenu_page()` returned, and
-	 * `false` whenever this plugin has registered no menu at all.
+	 * ⚠ STRICT EQUALITY AGAINST AN ENUMERATED SET, NOT A `strpos()`. The set grew from
+	 * one hook to two when ADR-0018 added the history page, and that growth is exactly
+	 * the moment a substring test looks tempting — it would accept every hook
+	 * CONTAINING either slug, including `woocommerce_page_extonify-wcep-rules-extra`,
+	 * and it would silently start matching more screens the day somebody registered a
+	 * similarly named page.
+	 *
+	 * ⚠ AND AN UNREGISTERED PAGE CANNOT MATCH. `Menu::hooks()` filters out the empty
+	 * hooks, so the `''` hook suffix of a front-end request never compares equal to the
+	 * `''` of a menu that was never registered.
 	 *
 	 * @param string $hook_suffix The screen WordPress is rendering.
 	 * @return bool
 	 */
 	public static function is_our_screen( string $hook_suffix ): bool {
-		$ours = Menu::hook();
+		if ( '' === $hook_suffix ) {
+			return false;
+		}
 
-		return '' !== $ours && $hook_suffix === $ours;
+		return in_array( $hook_suffix, Menu::hooks(), true );
+	}
+
+	/**
+	 * Whether WordPress is rendering the WooCommerce order editor (ADR-0018 §8).
+	 *
+	 * ⚠ THE HOOK SUFFIX CANNOT ANSWER THIS UNDER LEGACY STORAGE. There the order
+	 * editor is `post.php`, whose hook suffix is shared with every other post type on
+	 * the site — so the question is asked of the SCREEN, whose id distinguishes them,
+	 * and compared by strict equality against the id the active storage reports.
+	 *
+	 * ⚠ FALSE ON A FRONT-END REQUEST BY CONSTRUCTION. `get_current_screen()` is not
+	 * even defined outside the admin, and returns null before `admin_init` — both of
+	 * which this returns `false` for rather than guessing.
+	 *
+	 * @return bool
+	 */
+	public static function is_order_screen(): bool {
+		if ( ! function_exists( 'get_current_screen' ) ) {
+			return false;
+		}
+
+		$screen = get_current_screen();
+
+		if ( ! $screen instanceof \WP_Screen ) {
+			return false;
+		}
+
+		return OrderPanel::screen_id() === (string) $screen->id;
 	}
 
 	/**
