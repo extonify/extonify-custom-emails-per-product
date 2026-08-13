@@ -64,6 +64,20 @@ final class Menu {
 	const ACTION_EDIT = 'edit';
 
 	/**
+	 * The preview screen (ADR-0020 §2, §5).
+	 *
+	 * ⚠ AN `action` ON THIS PAGE RATHER THAN A THIRD REGISTERED PAGE, for the reason §1
+	 * of ADR-0017 gives for the editor: preview is the same subject matter as the rule
+	 * list, reached from it, about one rule. It is also where ADR-0020 §5 says preview
+	 * belongs — "where a merchant is already looking at a rule".
+	 *
+	 * ⚠ AND IT IS NOT A WRITE ACTION. It renders and it is a GET, because it writes
+	 * nothing and sends nothing; the test send that sits beside it on the same screen is
+	 * a POST through `DeliveryActions` and carries the whole ADR-0019 §5 gate.
+	 */
+	const ACTION_PREVIEW = 'preview';
+
+	/**
 	 * The hook suffix `add_submenu_page()` returned, or ''.
 	 *
 	 * ⚠ THE ASSET GATE IS EQUALITY AGAINST THIS, NEVER A `strpos()` ON THE PAGE NAME
@@ -263,9 +277,19 @@ final class Menu {
 			return;
 		}
 
-		if ( self::ACTION_EDIT === $action ) {
+		/*
+		 * ⚠ THE TEST SEND IS NOT DISPATCHED HERE, DELIBERATELY. It is a
+		 * `DeliveryActions` write action like the other four and is confirmed and
+		 * submitted on the history screen, where `load_history()` already dispatches
+		 * every member of `DeliveryActions::write_actions()`. A second dispatch site for
+		 * the same handler would be a second entry point to protect, prove and keep in
+		 * step for no gain — the only thing this screen needs is to be where the merchant
+		 * LANDS afterwards, which `DeliveryActions::return_url()` handles.
+		 */
+		if ( self::ACTION_EDIT === $action || self::ACTION_PREVIEW === $action ) {
 			// A screen-option-free page still wants the editor's own list-table
-			// dependencies absent; nothing to prepare here beyond the capability.
+			// dependencies absent; nothing to prepare here beyond the capability. The
+			// preview screen builds its own render at output time and writes nothing.
 			return;
 		}
 
@@ -281,6 +305,11 @@ final class Menu {
 		self::require_capability();
 
 		$action = self::requested_action();
+
+		if ( self::ACTION_PREVIEW === $action && array() === self::$pending ) {
+			RulePreviewScreen::render();
+			return;
+		}
 
 		if ( self::ACTION_NEW === $action || self::ACTION_EDIT === $action || array() !== self::$pending ) {
 			RuleEditor::render( self::$pending );

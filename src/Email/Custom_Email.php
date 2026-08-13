@@ -538,6 +538,84 @@ class Custom_Email extends \WC_Email {
 	}
 
 	/**
+	 * Render one delivery's message in BOTH formats WITHOUT sending it
+	 * (ADR-0020 §1, §3).
+	 *
+	 * ⚠ IT IS self::trigger()'s BODY WITH THE SEND REMOVED, AND THAT IS THE POINT
+	 * (ADR-0020 §6). The same `capture_runtime_state()` / `apply_runtime_state()` /
+	 * `restore_runtime_state()` triple, and the same `WC_Email::get_content()` — so a
+	 * preview cannot show a merchant a wrapper, a heading or a body that differs from
+	 * what the send would produce. A second renderer is how a preview starts lying.
+	 *
+	 * ⚠ `get_content()`, NOT `get_content_html()` / `get_content_plain()` DIRECTLY, AND
+	 * THE FIRST DRAFT OF THIS METHOD GOT THAT WRONG. `WC_Email::get_content()` is what
+	 * `send()` calls, and for a PLAIN body it does more than fetch it:
+	 *
+	 *     wordwrap( preg_replace( $this->plain_search, $this->plain_replace,
+	 *               wp_strip_all_tags( $this->get_content_plain() ) ), 70 )
+	 *
+	 * — the pass that turns `&mdash;` into `—`, `&#036;` into `$`, and deletes every
+	 * other entity outright (ADR-0014 §9a). Calling the builder directly showed the
+	 * merchant the PRE-processed text, full of raw entities no customer would ever
+	 * receive. Caught by reading the first captured sample rather than by a failing
+	 * assertion, which is exactly why the sample is in the report.
+	 *
+	 * It also means the preview inherits `get_content()`'s block-email branch, so a
+	 * store using WooCommerce's block email editor previews what that editor produces
+	 * rather than what this method would have assembled instead.
+	 *
+	 * ⚠ NO `is_enabled()` CHECK, DELIBERATELY. That filter decides whether a delivery
+	 * may GO OUT; nothing is going out here. Refusing to render a preview because a
+	 * third party declined this delivery would leave the merchant unable to see the
+	 * content they are trying to debug (ADR-0020 §3b takes the same position for the
+	 * global switch).
+	 *
+	 * ⚠ NO `self::send()`, NO `get_headers()`, NO `wp_mail()`. This method cannot
+	 * reach a transport: it calls the two content builders and returns strings.
+	 *
+	 * ⚠ THE RESTORE IS IN A `finally`, WHICH IS THE WHOLE DIFFERENCE FROM CORE'S OWN
+	 * PREVIEW. `EmailPreview::render_preview_email()` mutates the live registered
+	 * email object and cleans up on the success path only (WC 11.0.1, verified), so an
+	 * interrupted preview leaves it addressed to the preview's subject. A throw from a
+	 * template, a filter or the inliner must not leave this shared object holding a
+	 * preview's state for the rest of the request.
+	 *
+	 * @param array $args Delivery arguments; see self::trigger().
+	 * @return array{subject:string, heading:string, html:string, plain:string}
+	 */
+	public function render_preview( array $args ): array {
+		$previous = $this->capture_runtime_state();
+		$type     = $this->email_type;
+
+		try {
+			$this->apply_runtime_state( $args );
+
+			// ⚠ `text/html` FOR THE INLINER'S SAKE. `style_inline()` consults
+			// `get_content_type()`, which reads this property, and returns the content
+			// untouched for anything that is not an HTML type — so an `email_type` of
+			// `plain` would hand back a preview with none of the store's email CSS.
+			$this->email_type = 'html';
+
+			$html = $this->style_inline( $this->get_content() );
+
+			$this->email_type = 'plain';
+
+			$plain = $this->get_content();
+
+			return array(
+				'subject' => $this->get_subject(),
+				'heading' => $this->get_heading(),
+				'html'    => (string) $html,
+				'plain'   => $plain,
+			);
+		} finally {
+			$this->email_type = $type;
+
+			$this->restore_runtime_state( $previous );
+		}
+	}
+
+	/**
 	 * The GLOBAL kill switch: the merchant's saved setting, and nothing else
 	 * (ADR-0012 §5a).
 	 *

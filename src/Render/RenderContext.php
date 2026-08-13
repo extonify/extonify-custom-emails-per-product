@@ -296,6 +296,31 @@ class RenderContext {
 	}
 
 	/**
+	 * Drop an object's pending-preview marker without pushing a frame.
+	 *
+	 * ⚠ THE CONSUMING HALF FOR A PREVIEW THAT RENDERS NO ORDER DETAILS (ADR-0020 §1a).
+	 * `push()` and `refuse()` consume the marker because a render happened. A
+	 * SEPARATE-MODE preview fires no `woocommerce_email_order_details` at all — its
+	 * templates are `emails/email-header.php` and `emails/email-footer.php`, neither of
+	 * which fires it — so nothing would ever consume the marker, and it would sit on a
+	 * request-shared object until a LATER, REAL send of that same object picked it up
+	 * and classified itself as a preview. That is precisely the silent-no-record failure
+	 * this whole mechanism exists to prevent, so the preview caller gives the marker back
+	 * in its `finally`.
+	 *
+	 * IDEMPOTENT BY CONSTRUCTION. When a render did consume the marker there is nothing
+	 * left to unset, and calling this is a no-op rather than an error.
+	 *
+	 * @param mixed $email Email object.
+	 * @return void
+	 */
+	public function forget_preview_pending( $email ): void {
+		if ( is_object( $email ) ) {
+			unset( $this->preview_pending[ spl_object_id( $email ) ] );
+		}
+	}
+
+	/**
 	 * Push a frame for a render that is beginning — or REFUSE it past the depth
 	 * bound (ADR-0013 §5c).
 	 *

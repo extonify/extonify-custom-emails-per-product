@@ -294,3 +294,53 @@
 		margin: 0 0 6px;
 	}
 }
+
+/* ADR-0020: the preview screen. */
+
+.extonify-wcep-preview-rule {
+	margin: 0 0 12px;
+}
+
+.extonify-wcep-preview-order,
+.extonify-wcep-preview-test {
+	margin: 12px 0;
+}
+
+.extonify-wcep-preview-order .description,
+.extonify-wcep-preview-test .description {
+	margin: 6px 0 0;
+	max-width: 46em;
+}
+
+.extonify-wcep-preview-facts {
+	margin: 12px 0;
+	max-width: 60em;
+}
+
+.extonify-wcep-preview-subject code {
+	display: inline-block;
+	padding: 4px 8px;
+}
+
+/*
+ * The rendered email. It is a sandboxed srcdoc iframe, so it needs an explicit
+ * height: an empty sandbox withholds scripting, which means nothing inside can
+ * report its own content height to resize it.
+ */
+.extonify-wcep-preview-frame {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	height: 620px;
+	max-width: 100%;
+	width: 100%;
+}
+
+.extonify-wcep-preview-plain {
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	max-height: 620px;
+	overflow: auto;
+	padding: 12px;
+	white-space: pre-wrap;
+	word-wrap: break-word;
+}

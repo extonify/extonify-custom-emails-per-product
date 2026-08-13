@@ -50,7 +50,8 @@ final class DeliveryConfirm {
 			$action,
 			self::requested_int( DeliveryActions::FIELD_DELIVERY ),
 			self::requested_int( DeliveryActions::FIELD_ORDER ),
-			self::requested_int( DeliveryActions::FIELD_RULE )
+			self::requested_int( DeliveryActions::FIELD_RULE ),
+			self::requested_address()
 		);
 
 		if ( '' !== (string) $context['refusal'] ) {
@@ -105,6 +106,17 @@ final class DeliveryConfirm {
 		echo '<input type="hidden" name="' . esc_attr( DeliveryActions::FIELD_ORDER ) . '" value="' . esc_attr( (string) $order_id ) . '" />';
 		echo '<input type="hidden" name="' . esc_attr( DeliveryActions::FIELD_RULE ) . '" value="' . esc_attr( (string) (int) $context['rule'] ) . '" />';
 
+		if ( DeliveryActions::ACTION_TEST === $action ) {
+			/*
+			 * ⚠ THE ADDRESS TRAVELS THROUGH THE CONFIRMATION, AND IT IS THE RESOLVED ONE
+			 * (ADR-0020 §4b). The value posted is the one printed above as "will be sent
+			 * to", so what the merchant approved and what the handler receives are the
+			 * same string. The handler validates it again with `is_email()` regardless —
+			 * the confirmation screen is a courtesy, and the handler is the boundary.
+			 */
+			echo '<input type="hidden" name="' . esc_attr( DeliveryActions::FIELD_ADDRESS ) . '" value="' . esc_attr( (string) ( $context['address'] ?? '' ) ) . '" />';
+		}
+
 		// ⚠ THE SINGLE-USE TOKEN (ADR-0019 §5). It is what makes a reload, a
 		// back-and-resubmit or a double-click produce exactly one email.
 		echo '<input type="hidden" name="' . esc_attr( DeliveryActions::FIELD_TOKEN ) . '" value="' . esc_attr( (string) $context['token'] ) . '" />';
@@ -112,7 +124,7 @@ final class DeliveryConfirm {
 		wp_nonce_field(
 			DeliveryActions::nonce_action(
 				$action,
-				DeliveryActions::ACTION_MANUAL === $action ? $order_id : (int) $context['delivery'],
+				DeliveryActions::is_order_scoped( $action ) ? $order_id : (int) $context['delivery'],
 				(int) $context['rule']
 			),
 			DeliveryActions::FIELD_NONCE
@@ -120,13 +132,44 @@ final class DeliveryConfirm {
 
 		echo '<p class="submit">';
 		echo '<button type="submit" class="button button-primary">' . esc_html( self::button( $action ) ) . '</button> ';
-		echo '<a class="button" href="' . esc_url( Menu::history_url( array( DeliveriesListTable::ARG_ORDER => $order_id ) ) ) . '">'
+		echo '<a class="button" href="' . esc_url( self::cancel_url( $action, $order_id, (int) $context['rule'] ) ) . '">'
 			. esc_html__( 'Cancel', 'extonify-custom-emails-per-product' ) . '</a>';
 		echo '</p>';
 
 		echo '</form>';
 
 		echo '</div>';
+	}
+
+	/**
+	 * Where "Cancel" goes: back to wherever the merchant came from.
+	 *
+	 * ⚠ A TEST WAS STARTED FROM THE PREVIEW SCREEN, so abandoning it must return there
+	 * rather than dumping the merchant into the delivery history with their preview
+	 * gone. The other four actions were started from the history, which is where their
+	 * subject lives.
+	 *
+	 * @param string $action   The action.
+	 * @param int    $order_id Order id.
+	 * @param int    $rule_id  Rule id.
+	 * @return string
+	 */
+	private static function cancel_url( string $action, int $order_id, int $rule_id ): string {
+		if ( DeliveryActions::ACTION_TEST === $action ) {
+			return RulePreviewScreen::url( $rule_id, $order_id );
+		}
+
+		return Menu::history_url( array( DeliveriesListTable::ARG_ORDER => $order_id ) );
+	}
+
+	/**
+	 * The test address this request carries, sanitised.
+	 *
+	 * @return string
+	 */
+	private static function requested_address(): string {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- reading which address to DESCRIBE on a read-only confirmation; `TestDelivery::address_for()` validates it with is_email(), and the state-changing POST this screen renders verifies its own nonce and token.
+		return isset( $_GET[ DeliveryActions::FIELD_ADDRESS ] ) ? sanitize_text_field( wp_unslash( $_GET[ DeliveryActions::FIELD_ADDRESS ] ) ) : '';
 	}
 
 	/**
@@ -199,6 +242,14 @@ final class DeliveryConfirm {
 			$warnings[] = __( 'This is a one-off send. It does not replace or switch off the rule\'s automatic delivery, so if the rule\'s trigger fires later the customer will receive this email again.', 'extonify-custom-emails-per-product' );
 		}
 
+		if ( DeliveryActions::ACTION_TEST === $action ) {
+			// ⚠ THE TWO FACTS A MERCHANT CANNOT INFER (ADR-0020 §4). It is a REAL email,
+			// so it costs a real send and a real record; and it is NOT the customer's,
+			// however the rule's recipients are configured.
+			$warnings[] = __( 'This is a real email. It is sent to the address above and to nobody else — not to the customer, and not to anyone this rule lists as a recipient.', 'extonify-custom-emails-per-product' );
+			$warnings[] = __( 'Its subject is marked as a test. It does not use up the rule\'s automatic delivery, so the rule still sends normally when its trigger fires.', 'extonify-custom-emails-per-product' );
+		}
+
 		if ( DeliveryActions::ACTION_RESEND === $action ) {
 			$warnings[] = __( 'The email will be rendered from this rule as it is now, and from the order as it is now — not as they were when the delivery first ran.', 'extonify-custom-emails-per-product' );
 		}
@@ -235,6 +286,7 @@ final class DeliveryConfirm {
 			DeliveryActions::ACTION_SEND_NOW => __( 'Send this email now?', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_CANCEL   => __( 'Cancel this scheduled email?', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_MANUAL   => __( 'Send this email for this order?', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_TEST     => __( 'Send a test of this email?', 'extonify-custom-emails-per-product' ),
 		);
 
 		return $headings[ $action ] ?? __( 'Confirm', 'extonify-custom-emails-per-product' );
@@ -252,6 +304,7 @@ final class DeliveryConfirm {
 			DeliveryActions::ACTION_SEND_NOW => __( 'This sends the scheduled email straight away instead of waiting for its delay.', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_CANCEL   => __( 'This stops the scheduled email from being sent. Nothing is emailed to the customer.', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_MANUAL   => __( 'This sends the rule\'s email for this order even though the rule has not fired for it.', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_TEST     => __( 'This sends the rule\'s email to you, rendered from this order, so you can see how it arrives. Check the address before you confirm.', 'extonify-custom-emails-per-product' ),
 		);
 
 		return $summaries[ $action ] ?? '';
@@ -269,6 +322,7 @@ final class DeliveryConfirm {
 			DeliveryActions::ACTION_SEND_NOW => __( 'Send it now', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_CANCEL   => __( 'Cancel the delivery', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_MANUAL   => __( 'Send the email', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_TEST     => __( 'Send the test', 'extonify-custom-emails-per-product' ),
 		);
 
 		return $labels[ $action ] ?? __( 'Confirm', 'extonify-custom-emails-per-product' );

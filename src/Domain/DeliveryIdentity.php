@@ -67,7 +67,7 @@ final class DeliveryIdentity {
 	 * `customer_processing_order` would be indistinguishable from an invented
 	 * format — which is the one thing this list exists to make impossible.
 	 */
-	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund', self::NATIVE_PREFIX, self::MANUAL_PREFIX );
+	const TRIGGER_PREFIXES = array( 'status', 'transition', 'refund', self::NATIVE_PREFIX, self::MANUAL_PREFIX, self::TEST_PREFIX );
 
 	/**
 	 * Prefix marking an insert-mode identity.
@@ -116,6 +116,48 @@ final class DeliveryIdentity {
 	 */
 	public static function is_manual( string $trigger_identity ): bool {
 		return 0 === strpos( self::normalize( $trigger_identity ), self::MANUAL_PREFIX . ':' );
+	}
+
+	/**
+	 * Prefix marking a delivery a merchant sent to THEMSELVES as a test (ADR-0020 §4d).
+	 *
+	 * ⚠ A TEST HAS NO TRIGGER EITHER, so it takes the same shape `manual` does and for
+	 * the same reason. The uniqueness key is unchanged, the UNIQUE index is untouched,
+	 * and the form still has to satisfy self::is_valid_trigger_identity(). A sixth
+	 * prefix simply becomes recognisable.
+	 *
+	 * ⚠ AND THIS IS WHAT "EXCLUDED FROM IDEMPOTENCY" MEANS IN PRACTICE (ADR-0005). A
+	 * test cannot consume an identity any automatic path would later want, because no
+	 * automatic path can produce this prefix: `TriggerEvent` emits only `status:`,
+	 * `transition:` and `refund:`, and insert mode only `native:`. The prefix is inside
+	 * the hashed string, so the disjointness is structural rather than a convention —
+	 * which is what lets a merchant test a rule and still receive its real delivery when
+	 * the trigger fires.
+	 *
+	 * ⚠ THE VALUE IS THE PER-CONFIRMATION TOKEN, so one confirmed click maps to one
+	 * identity and a replayed submission is SUPPRESSED off the UNIQUE index — the
+	 * ADR-0019 §5 mechanism, unchanged.
+	 */
+	const TEST_PREFIX = 'test';
+
+	/**
+	 * Build the identity for one confirmed test send (ADR-0020 §4d).
+	 *
+	 * @param string $token Per-confirmation token from `Admin\ConfirmationToken`.
+	 * @return string
+	 */
+	public static function test( string $token ): string {
+		return self::TEST_PREFIX . ':' . self::normalize( $token );
+	}
+
+	/**
+	 * Whether an identity was produced by a merchant's test send.
+	 *
+	 * @param string $trigger_identity Recorded identity.
+	 * @return bool
+	 */
+	public static function is_test( string $trigger_identity ): bool {
+		return 0 === strpos( self::normalize( $trigger_identity ), self::TEST_PREFIX . ':' );
 	}
 
 	/**

@@ -122,13 +122,35 @@ class Orchestrator {
 	/**
 	 * Whether a preview or customizer render is in progress.
 	 *
-	 * A COARSE GUARD, ON PURPOSE (ADR-0012 §8). The full render-context
-	 * machinery — render slots, the bind stack, preview-signal leak detection —
-	 * belongs to insert mode in Prompt 5. Separate mode is never triggered BY a
-	 * render in the first place: it is triggered by an order event. So erring
-	 * toward inertness here cannot drop a real delivery, and the cost of being
-	 * wrong in the other direction would be a customer email sent from a preview
-	 * screen.
+	 * A COARSE GUARD, ON PURPOSE (ADR-0012 §8). The full render-context machinery —
+	 * render slots, the bind stack — belongs to insert mode. Separate mode is never
+	 * triggered BY a render in the first place: it is triggered by an order event, so
+	 * erring toward inertness is cheap and the cost of being wrong in the other
+	 * direction would be a customer email sent from a preview screen.
+	 *
+	 * ⚠ BUT IT NOW SHARES ADR-0013 §5's DEMOTION, AND IT HAS TO (ADR-0020 §1b, gate 41).
+	 * The clause above used to read the raw signal alone, with a docblock claiming that
+	 * "erring toward inertness here cannot drop a real delivery". ⚠ **THAT WAS FALSE, AND
+	 * A TEST WRITTEN FOR GATE 41 PROVED IT.** After a third party's interrupted preview
+	 * leaks `woocommerce_is_email_preview` — which core's own
+	 * `EmailPreview::render_preview_email()` does, having no `try`/`finally`
+	 * (WC 11.0.1) — `is_operational()` answered false for the REST OF THE REQUEST. Every
+	 * separate-mode delivery whose trigger fired afterwards returned `null` from `run()`:
+	 * no claim, no tombstone, no attempt row, no log line and no email. A status change
+	 * happens once, so that delivery was **silently lost**, which is precisely the
+	 * outcome ADR-0013 §5 built demotion to prevent for insert mode.
+	 *
+	 * The two guards therefore now agree on ONE question — "is this signal trustworthy?"
+	 * — answered in one place. Once `RenderContext::reconcile_previews()` has PROVEN the
+	 * signal leaked (a stale preview frame with the signal still true), this guard stops
+	 * believing it too.
+	 *
+	 * ⚠ IT READS THE ESTABLISHED VERDICT AND DOES NOT RECONCILE. Calling
+	 * `reconcile_previews()` from here would tear down a preview frame that is still
+	 * LIVE whenever a third party triggers an order event from inside a preview render —
+	 * turning a coarse read into a destructive one. Until something proves the leak, an
+	 * unproven signal is still believed, which is ADR-0012 §8's original posture and
+	 * remains the safe direction to be wrong in.
 	 *
 	 * @return bool
 	 */
@@ -142,7 +164,7 @@ class Orchestrator {
 		 */
 		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce-owned hook; this is core's own documented way of reading the preview state.
 		if ( true === apply_filters( 'woocommerce_is_email_preview', false ) ) {
-			return true;
+			return ! \Extonify\WCEP\Render\RenderEvents::context()->signal_leaked();
 		}
 
 		return function_exists( 'is_customize_preview' ) && is_customize_preview();
@@ -991,26 +1013,144 @@ class Orchestrator {
 	}
 
 	/**
-	 * THE ONE BODY THAT EXECUTES AN ALREADY-CLAIMED DECISION (ADR-0015 §3, ADR-0019 §7).
+	 * Send a TEST of this rule to one address the merchant supplied (ADR-0020 §4).
 	 *
-	 * Shared by the delayed phase and by every manual action. It makes no decision of
-	 * its own: the decision was taken hours ago by the matcher, or seconds ago by a
-	 * merchant, and this executes it.
+	 * ⚠ THE ONLY TWO THINGS THAT DIFFER FROM A REAL SEND ARE THE RECIPIENT AND THE
+	 * SUBJECT MARKER, and both ride on the claim array exactly as `attempt_type` and
+	 * `transition_from` do (ADR-0019 §8's pattern). Everything else — the consolidation
+	 * plan, the placeholder resolution, the `Custom_Email` wrapper, the containment
+	 * boundary, the attempt rows — is the shared body, because a test that rendered
+	 * differently from a real send would be testing something the customer will never
+	 * receive.
 	 *
-	 * @param \WC_Order    $order           Live order.
-	 * @param Custom_Email $email           The live email object.
-	 * @param array        $rule            Rule row.
-	 * @param array[]      $matched_items   Items this send is bound to.
-	 * @param int          $delivery_id     Tombstone id.
-	 * @param string       $identity        Trigger identity.
-	 * @param array        $snapshot        Extra diagnostic payload.
-	 * @param string|null  $transition_from State the terminal write must move OUT of,
-	 *                                      or null for an unconditional write.
-	 * @param string       $type            Attempt type for the rows this writes.
-	 * @param int          $revision        Revision to record, or 0 to leave it.
+	 * ⚠ `$recipients` IS BUILT BY THE CALLER FROM THE MERCHANT'S OWN ADDRESS AND IS THE
+	 * ONLY WAY THIS CLASS WILL EVER ADDRESS A MESSAGE TO SOMEBODY THE RULE DOES NOT NAME
+	 * (gate 42). `self::resolve_recipients()` — and therefore the rule's recipients
+	 * document, `{customer_email}`, the admin address and every `cc`/`bcc` channel — is
+	 * NOT consulted anywhere on this path. A test reaching a real customer is Tier 1.
+	 *
+	 * ⚠ NO `transition_from`: a test's tombstone was claimed microseconds ago by this
+	 * same request under an identity nothing else can produce (ADR-0020 §4d), so there
+	 * is no lease and the terminal write is unconditional, exactly as a manual send's.
+	 *
+	 * @param \WC_Order          $order         Live order.
+	 * @param array              $rule          Rule row, read fresh.
+	 * @param array[]            $matched_items Items this send is bound to.
+	 * @param int                $delivery_id   Tombstone id, already claimed.
+	 * @param string             $identity      The `test:<token>` identity it carries.
+	 * @param ResolvedRecipients $recipients    The merchant's address, and nothing else.
+	 * @param string             $prefix        Subject marker (ADR-0020 §4e).
+	 * @return RunOutcome|null Null when orchestration was inert.
+	 */
+	public function send_test( \WC_Order $order, array $rule, array $matched_items, int $delivery_id, string $identity, ResolvedRecipients $recipients, string $prefix ): ?RunOutcome {
+		if ( ! self::is_operational() ) {
+			return null;
+		}
+
+		$email = $this->email();
+
+		if ( null === $email ) {
+			// Nothing is terminalised: the caller checked before claiming, exactly as
+			// `send_manual()` documents, so there is no consumed identity to strand.
+			return null;
+		}
+
+		return $this->execute_claimed(
+			$order,
+			$email,
+			$rule,
+			$matched_items,
+			$delivery_id,
+			$identity,
+			array(),
+			null,
+			'test',
+			max( 0, (int) ( $rule['revision'] ?? 0 ) ),
+			$recipients,
+			$prefix
+		);
+	}
+
+	/**
+	 * Resolve and compose ONE message for a preview, writing and sending nothing
+	 * (ADR-0020 §1, §6).
+	 *
+	 * ⚠ IT IS self::compose()'s OWN BODY, REACHED THROUGH THE SAME PLAN. The plan comes
+	 * from `Consolidation::plan()` with the same cap and the same capped fallback the
+	 * send uses, and the composition is the same private method — so a preview cannot
+	 * bind `{product_name}` differently, cap differently, or resolve a placeholder
+	 * differently from the delivery it is previewing.
+	 *
+	 * ⚠ IT CLAIMS NOTHING AND RECORDS NOTHING. No `DeliveryRepository`, no
+	 * `DeliveryLogger`, no `Custom_Email::trigger()`. The containment boundary is the
+	 * CALLER's (`Delivery\RulePreview`), because the notes and the failure reporting a
+	 * preview wants are a screen's, not a delivery record's.
+	 *
+	 * @param \WC_Order $order         Order to resolve against.
+	 * @param array     $rule          Rule row.
+	 * @param array[]   $matched_items Items the rule matches on this order; may be empty.
+	 * @return array{subject:string, heading:string, body:array{html:string,plain:string}, notes:string, messages:int}
+	 */
+	public function compose_preview( \WC_Order $order, array $rule, array $matched_items ): array {
+		$decision = MatchDecision::create( (int) ( $rule['id'] ?? 0 ), MatchDecision::MATCHED, 'preview', $matched_items );
+
+		$plan = Consolidation::plan( $rule, $matched_items, Consolidation::max_messages( $rule, $order ) );
+
+		$state = array(
+			'recipients' => null,
+			'values'     => null,
+			'subject'    => '',
+			'notes'      => Consolidation::note_line( $plan ),
+			'snapshot'   => array(),
+			'settled'    => false,
+			'prefix'     => '',
+		);
+
+		/*
+		 * ⚠ THE FIRST MESSAGE OF THE PLAN, AND THE COUNT REPORTED BESIDE IT. A
+		 * `per_product` rule sends N messages; previewing all N would put N full email
+		 * documents on one admin page, so the screen shows the first and STATES that
+		 * there would be N. Silently showing one and calling it "the email" would
+		 * misrepresent a fan-out.
+		 */
+		$composed = $this->compose( $order, $rule, $decision, $plan['messages'][0], $state );
+
+		return array(
+			'subject'  => $composed['subject'],
+			'heading'  => $composed['heading'],
+			'body'     => $composed['body'],
+			'notes'    => self::notes_for( $state ),
+			'messages' => count( (array) $plan['messages'] ),
+		);
+	}
+
+	/**
+	 * THE ONE BODY THAT EXECUTES AN ALREADY-CLAIMED DECISION (ADR-0015 §3, ADR-0019 §7,
+	 * ADR-0020 §4).
+	 *
+	 * Shared by the delayed phase, by every manual action and by the test send. It makes
+	 * no decision of its own: the decision was taken hours ago by the matcher, or
+	 * seconds ago by a merchant, and this executes it.
+	 *
+	 * @param \WC_Order               $order           Live order.
+	 * @param Custom_Email            $email           The live email object.
+	 * @param array                   $rule            Rule row.
+	 * @param array[]                 $matched_items   Items this send is bound to.
+	 * @param int                     $delivery_id     Tombstone id.
+	 * @param string                  $identity        Trigger identity.
+	 * @param array                   $snapshot        Extra diagnostic payload.
+	 * @param string|null             $transition_from State the terminal write must move
+	 *                                                 OUT of, or null for an
+	 *                                                 unconditional write.
+	 * @param string                  $type            Attempt type for the rows this writes.
+	 * @param int                     $revision        Revision to record, or 0 to leave it.
+	 * @param ResolvedRecipients|null $recipients      Addresses to use INSTEAD of the
+	 *                                                 rule's, or null to resolve the
+	 *                                                 rule's as every other path does.
+	 * @param string                  $prefix          Subject marker, or '' for none.
 	 * @return RunOutcome
 	 */
-	private function execute_claimed( \WC_Order $order, Custom_Email $email, array $rule, array $matched_items, int $delivery_id, string $identity, array $snapshot, ?string $transition_from, string $type = 'auto', int $revision = 0 ): RunOutcome {
+	private function execute_claimed( \WC_Order $order, Custom_Email $email, array $rule, array $matched_items, int $delivery_id, string $identity, array $snapshot, ?string $transition_from, string $type = 'auto', int $revision = 0, ?ResolvedRecipients $recipients = null, string $prefix = '' ): RunOutcome {
 		$decision = MatchDecision::create( (int) $rule['id'], MatchDecision::MATCHED, $identity, $matched_items );
 
 		// No `EvaluationResult`: this run EXECUTES a decision taken elsewhere rather
@@ -1026,6 +1166,17 @@ class Orchestrator {
 
 		if ( null !== $transition_from ) {
 			$claim['transition_from'] = $transition_from;
+		}
+
+		if ( null !== $recipients ) {
+			// ⚠ THE OVERRIDE IS ONLY EVER SET BY self::send_test() (ADR-0020 §4b). Its
+			// presence is what makes `self::recipients_for()` skip the rule's document
+			// entirely, and its absence is what every other path relies on.
+			$claim['recipients_override'] = $recipients;
+		}
+
+		if ( '' !== $prefix ) {
+			$claim['subject_prefix'] = $prefix;
 		}
 
 		$this->send( $order, $email, $rule, $decision, $claim, $snapshot, $outcome );
@@ -1097,6 +1248,15 @@ class Orchestrator {
 			'notes'      => '',
 			'snapshot'   => $snapshot,
 			'settled'    => false,
+
+			/*
+			 * ⚠ THE SUBJECT MARKER, READ OFF THE CLAIM AND SEEDED HERE (ADR-0020 §4e).
+			 * It travels in `$state` rather than as a parameter because `compose()` and
+			 * `compose_sectioned()` already take `$state` by reference and are the two
+			 * places a subject is built — so one seeding covers both, and the RECORDED
+			 * subject carries the marker as well as the sent one.
+			 */
+			'prefix'     => (string) ( $claim['subject_prefix'] ?? '' ),
 		);
 
 		try {
@@ -1268,7 +1428,7 @@ class Orchestrator {
 		$delivery_id = (int) $claim['delivery_id'];
 		$snapshot    = (array) $state['snapshot'];
 
-		$recipients          = $this->resolve_recipients( $order, $rule );
+		$recipients          = $this->recipients_for( $order, $rule, $claim );
 		$state['recipients'] = $recipients;
 
 		if ( ! $recipients->is_valid() || ! $recipients->is_deliverable() ) {
@@ -1436,7 +1596,7 @@ class Orchestrator {
 		$delivery_id = (int) $claim['delivery_id'];
 		$snapshot    = (array) $state['snapshot'];
 
-		$recipients          = $this->resolve_recipients( $order, $rule );
+		$recipients          = $this->recipients_for( $order, $rule, $claim );
 		$state['recipients'] = $recipients;
 
 		if ( ! $recipients->is_valid() || ! $recipients->is_deliverable() ) {
@@ -1687,7 +1847,7 @@ class Orchestrator {
 		// reports the notes taken up to it (ADR-0014 §1c).
 		$state['values'] = $values;
 
-		$subject          = HeaderGuard::strip( $values->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$subject          = self::subject_line( $state, $values->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
 		$state['subject'] = $subject;
 
 		return array(
@@ -1695,6 +1855,28 @@ class Orchestrator {
 			'heading' => HeaderGuard::strip( $values->render( (string) ( $rule['heading'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) ),
 			'body'    => PlaceholderResolver::render_body( $values, (string) ( $rule['content'] ?? '' ) ),
 		);
+	}
+
+	/**
+	 * One resolved subject line, with the claim's marker in front of it (ADR-0020 §4e).
+	 *
+	 * ⚠ THE MARKER GOES ON BEFORE `HeaderGuard::strip()`, NOT AFTER, so the whole line —
+	 * marker and resolved values together — passes the one header sanitisation. Stripping
+	 * first and concatenating afterwards would put an unsanitised join between two
+	 * sanitised halves, which is the shape a header-injection fix usually regresses into.
+	 *
+	 * ⚠ AND IT IS APPLIED WHERE THE SUBJECT IS BUILT, so the RECORDED subject carries it
+	 * too. A history row saying a plain subject went out while the mail said `[Test] …`
+	 * would be the history lying about a message that exists.
+	 *
+	 * @param array  $state    Containment state, read for its `prefix`.
+	 * @param string $resolved The subject with placeholders already substituted.
+	 * @return string
+	 */
+	private static function subject_line( array $state, string $resolved ): string {
+		$prefix = (string) ( $state['prefix'] ?? '' );
+
+		return HeaderGuard::strip( '' === $prefix ? $resolved : $prefix . $resolved );
 	}
 
 	/**
@@ -1755,7 +1937,7 @@ class Orchestrator {
 
 		$state['values'] = array( $header, $body['notes'] );
 
-		$subject          = HeaderGuard::strip( $header->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
+		$subject          = self::subject_line( $state, $header->render( (string) ( $rule['subject'] ?? '' ), PlaceholderSyntax::CONTEXT_HEADER ) );
 		$state['subject'] = $subject;
 
 		return array(
@@ -1797,6 +1979,36 @@ class Orchestrator {
 			'delivery_id'   => $delivery_id,
 			'object'        => $order,
 		);
+	}
+
+	/**
+	 * The addresses THIS delivery uses: the claim's override when it has one, the
+	 * rule's own document otherwise (ADR-0020 §4b).
+	 *
+	 * ⚠ THE OVERRIDE IS THE TEST SEND'S, AND IT IS A REPLACEMENT RATHER THAN AN
+	 * ADDITION. When it is present the rule's recipients document is not read, not
+	 * resolved and not merged — so a rule whose `to` is `customer` cannot contribute the
+	 * customer's address to a test, and no `cc` or `bcc` channel can contribute one
+	 * either. That exclusion is gate 42, and it is structural: there is exactly one
+	 * `return` between the override and the send.
+	 *
+	 * ⚠ EVERY OTHER PATH REACHES THE SECOND BRANCH. The immediate, delayed, manual and
+	 * resend paths set no override, so their behaviour is byte-identical to what it was
+	 * before this method existed.
+	 *
+	 * @param \WC_Order $order Order.
+	 * @param array     $rule  Rule row.
+	 * @param array     $claim Claim result, which may carry `recipients_override`.
+	 * @return ResolvedRecipients
+	 */
+	private function recipients_for( \WC_Order $order, array $rule, array $claim ): ResolvedRecipients {
+		$override = $claim['recipients_override'] ?? null;
+
+		if ( $override instanceof ResolvedRecipients ) {
+			return $override;
+		}
+
+		return $this->resolve_recipients( $order, $rule );
 	}
 
 	/**

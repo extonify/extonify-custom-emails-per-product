@@ -11,6 +11,7 @@ use Extonify\WCEP\Admin\Assets;
 use Extonify\WCEP\Admin\Menu;
 use Extonify\WCEP\Admin\OrderPanel;
 use Extonify\WCEP\Admin\RuleActions;
+use Extonify\WCEP\Admin\RulePreviewScreen;
 use Extonify\WCEP\Admin\TargetSearch;
 
 /**
@@ -369,6 +370,34 @@ final class AdminIsolationTest extends AdminTestCase {
 			'⚠ TIER 1: the request dispatcher ran for a logged-out visitor.'
 		);
 
+		// ADR-0020: the preview screen renders a real customer's order data, so it
+		// refuses on its own as well — through the dispatcher AND directly, because
+		// `Menu::render()` routing to it is a wiring fact a refactor can undo silently
+		// while the renderer's own check is a property of the entry point.
+		$this->request(
+			array(
+				'page'   => Menu::PAGE,
+				'action' => Menu::ACTION_PREVIEW,
+				'rule'   => 1,
+			)
+		);
+
+		$this->assertRefuses(
+			static function () {
+				Menu::render();
+			},
+			'⚠ TIER 1: the preview screen rendered for a logged-out visitor.'
+		);
+
+		$this->assertRefuses(
+			static function () {
+				RulePreviewScreen::render();
+			},
+			'⚠ TIER 1: the preview renderer ran for a logged-out visitor.'
+		);
+
+		$this->request( array() );
+
 		// ADR-0018: the two history entry points refuse on their own too.
 		$this->assertRefuses(
 			static function () {
@@ -430,8 +459,9 @@ final class AdminIsolationTest extends AdminTestCase {
 			'⚠ TIER 1: a logged-out visitor completed a save.'
 		);
 
-		$this->gate[] = 'logged out: the screen, the dispatcher, the AJAX endpoint and the save handler each '
-			. 'refuse a logged-out visitor on their own, independently of the menu never being registered';
+		$this->gate[] = 'logged out: the rules screen, the dispatcher, the history screen and dispatcher, the PREVIEW '
+			. 'screen and its renderer, the AJAX endpoint and the save handler each refuse a logged-out visitor on '
+			. 'their own, independently of the menu never being registered';
 	}
 
 	/**

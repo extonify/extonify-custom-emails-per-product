@@ -1818,3 +1818,93 @@ deliberately **not** fixed, plus what this leaves for later.
   identities *because the merchant asked twice*), and would have made a second
   deliberate send unreachable through the UI while the handler still allowed it. Both
   removed.
+
+## Prompt 12 — preview and test emails (findings and accepted residual risks)
+
+- **⚠ TIER 1 — FIXED IN-ROUND. The separate-mode preview guard did not share
+  ADR-0013 §5's demotion, so a leaked preview signal silently lost deliveries.**
+  `Orchestrator::is_rendering_preview()` (ADR-0012 §8) read
+  `woocommerce_is_email_preview` raw and returned `true` unconditionally, and
+  `is_operational()` is built on it. After **any** leak of that signal — core's own
+  `EmailPreview::render_preview_email()` has no `try`/`finally` (WC 11.0.1) — every
+  separate-mode delivery for the rest of the request returned `null` from `run()`: no
+  claim, no tombstone, no attempt row, no log line, no email. A status change fires
+  once, so the delivery was **silently lost**, which is the exact failure ADR-0013 §5
+  built demotion to prevent for insert mode. ADR-0012 §8's docblock asserted this
+  could not happen; that reasoning was wrong and is corrected in place. The guard now
+  reads `RenderContext::signal_leaked()`, so an **unproven** signal is still believed
+  (the safe direction: a preview must never mail a customer) while a **proven** leak is
+  believed by neither guard. Found by writing gate 41; asserted by
+  `PreviewInertnessTest::test_a_leaked_core_signal_is_demoted_and_the_real_send_still_records()`.
+- **⚠ TIER 2 — FIXED IN-ROUND. An interrupted preview leaked one output buffer per
+  nested template.** `wc_get_template_html()` is `ob_start(); … ob_get_clean();` with no
+  `try`/`finally` (WC 11.0.1, `wc-core-functions.php:369-373`). Because the preview
+  **catches** the throw and lets the request continue, the unbalanced buffer does not
+  die with a fatal — it swallows the rest of the admin page. `RulePreview::as_preview()`
+  now records `ob_get_level()` on entry and discards anything left above it, never
+  closing a buffer below its own entry depth. PHPUnit reported this as a *risky test*
+  rather than a failure, which is the point: an unbalanced buffer is invisible until
+  something notices it.
+- **⚠ TIER 2 — the gate-39 source scans were tripped by their own documentation.**
+  `ManualRefusalTest`'s "this class implements no send of its own" scan is a raw
+  substring search, so a class that *explains* why it does not use `RecipientResolver`
+  fails the gate — pushing a future author to delete the explanation to make the test
+  pass. All three scans now strip comments with `token_get_all()` and search the
+  executable tokens, which is what they always claimed to do.
+- **⚠ Tier 3 — a test email costs a tombstone row that is never purged.** ADR-0004
+  keeps tombstones forever, so a merchant who sends a thousand tests holds a thousand
+  rows. Bounded by deliberate confirmed clicks, and the alternative — reusing an
+  identity — is the design ADR-0020 §4d rejects, because it would let a test rewrite a
+  real delivery's recorded outcome.
+- **⚠ Tier 3 — `woocommerce_email_recipient_{id}` can still redirect a test.**
+  `WC_Email::get_recipient()` applies it and this plugin does not strip third-party
+  filters off WooCommerce's own hooks. A site that has hooked it has redirected *every*
+  WooCommerce email, not just this one. Gate 42 enumerates it as the single recipient
+  source outside this plugin's control and names it rather than claiming a guarantee it
+  cannot make.
+- **⚠ Tier 3 — the default-order scan looks at 20 orders and may miss a match.** A rule
+  that matches only older orders previews against the most recent order instead, with
+  the "targeting did not match" note attached (ADR-0020 §2a), and the merchant can type
+  any order id. The unbounded alternative is a full order-table scan plus one targeting
+  evaluation per row on an admin request, which is a resource that grows without bound
+  in normal operation.
+- **⚠ Tier 3 — a preview proves nothing about deliverability.** A rule can preview
+  perfectly and still fail to reach a customer through SMTP, spam filtering or a
+  `woocommerce_email_enabled_{id}` filter. That is what the test email is for, and the
+  screen says so.
+- **⚠ Tier 3 — the preview shows only the FIRST message of a fan-out.** A `per_product`
+  rule matching sixty products would otherwise put sixty full email documents on one
+  admin page. The screen states the real message count beside the one it renders.
+- **⚠ Tier 3 — the preview does not apply `woocommerce_mail_content`, and core's does**
+  (ADR-0020 §1c). Firing `WC_Email::send()`'s own filter from something that is not a
+  send would invoke `RenderEvents::on_mail_content()` → `RenderLedger::reserve()`, which
+  appends a reservation unconditionally — leaving ledger residue and contradicting
+  gate 40. A third party that modifies mail content only on that filter will not see its
+  change in the preview; that is the cheaper of the two wrongs.
+- **⚠ Tier 3 — `RulePreview::render_insert()` mutates the live registered `WC_Email`.**
+  Object, recipient, placeholders and `email_type` are captured first and restored in a
+  `finally`, which is strictly more than core's own preview does to the same shared
+  object (`EmailPreview::set_email_type()` restores nothing). A third party holding a
+  reference to that object *during* the preview would observe the preview's state; the
+  alternative — constructing a fresh email object — would carry none of the merchant's
+  settings and would preview the wrong thing.
+- **⚠ Tier 3 — the block email editor bypasses the previewed body.** New since the
+  WooCommerce this plugin's ADRs were verified against: `WC_Email::get_content()` now
+  begins with a `get_block_email_html_content()` branch which, when that feature is
+  enabled, returns block-rendered content and forces `email_type` to `html`, bypassing
+  `get_content_html()`. This plugin's `Custom_Email` has no block template and the
+  branch is behind a feature flag, so nothing changes on a default store. Recorded for
+  Prompt 13's compatibility matrix.
+- **⚠ Tier 3 — the bundled WooCommerce is 11.0.1, not the 10.9.4 every earlier ADR
+  names.** All four behaviours those ADRs flag were re-verified and still hold; the
+  version drift itself belongs to Prompt 13's compatibility matrix, not to this prompt.
+- **⚠ TIER 2 — FIXED IN-ROUND. The plain-text preview was not what the customer
+  receives.** Both renderers called `get_content_html()` / `get_content_plain()`
+  directly. `WC_Email::send()` calls `get_content()`, which for a plain body also runs
+  `wp_strip_all_tags()`, the `plain_search`/`plain_replace` entity pass and
+  `wordwrap( …, 70 )` — so the preview showed WooCommerce's own raw `&mdash;`, `&#036;`
+  and `&nbsp;` entities and unwrapped lines that no customer ever sees. Both renderers
+  now call `get_content()`, which also makes the preview inherit the block-email branch.
+  **⚠ No assertion caught this: every test was green and the defect was found by reading
+  the captured sample while writing the report.** `PreviewRenderTest` now asserts the
+  absence of those three entities and the presence of the 70-column wrap.

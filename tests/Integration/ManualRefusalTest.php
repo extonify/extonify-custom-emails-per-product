@@ -591,14 +591,72 @@ final class ManualRefusalTest extends ManualDeliveryTestCase {
 			);
 		}
 
-		// And `ManualDelivery` implements no send of its own.
-		$manual = (string) file_get_contents( dirname( __DIR__, 2 ) . '/src/Delivery/ManualDelivery.php' );
+		/*
+		 * And `ManualDelivery` implements no send of its own.
+		 *
+		 * ⚠ SCANNED WITH COMMENTS STRIPPED. These classes explain at length WHY they do
+		 * not reach for a resolver, a logger or a repository, so a raw substring scan is
+		 * tripped by the very prose that documents the guarantee — which would push a
+		 * future author to delete the explanation to make the gate pass. Scanning the
+		 * executable tokens makes the assertion mean what it says.
+		 */
+		$manual = $this->code_without_comments( dirname( __DIR__, 2 ) . '/src/Delivery/ManualDelivery.php' );
 
 		foreach ( array( 'wp_mail', '->trigger(', 'PlaceholderResolver', 'RecipientResolver' ) as $forbidden ) {
 			$this->assertStringNotContainsString(
 				$forbidden,
 				$manual,
 				'⚠ ManualDelivery reaches "' . $forbidden . '" directly, which is a second send path.'
+			);
+		}
+
+		/*
+		 * ⚠ ADR-0020's TWO FEATURES JOIN THE SAME TABLE, AND THE SAME PROHIBITION.
+		 * `TestDelivery` is a second SENDING path and `RulePreview` is a second RENDERING
+		 * path, and either one implementing its own would be exactly the divergence this
+		 * gate exists to prevent — a preview that shows what the delivery would not do,
+		 * or a test that mails what the customer would not receive.
+		 */
+		$this->assertTrue(
+			$reflection->hasMethod( 'send_test' ),
+			'⚠ the test send no longer has an entry point on the orchestrator.'
+		);
+
+		$this->assertStringContainsString(
+			'execute_claimed',
+			$this->method_source( $reflection, 'send_test' ),
+			'⚠ send_test() no longer delegates to the shared body — gate 39 is broken.'
+		);
+
+		$test = $this->code_without_comments( dirname( __DIR__, 2 ) . '/src/Delivery/TestDelivery.php' );
+
+		foreach ( array( 'wp_mail', '->trigger(', 'PlaceholderResolver', 'Consolidation::plan' ) as $forbidden ) {
+			$this->assertStringNotContainsString(
+				$forbidden,
+				$test,
+				'⚠ TestDelivery reaches "' . $forbidden . '" directly, which is a second send path.'
+			);
+		}
+
+		// ⚠ AND THE PREVIEW COMPOSES THROUGH `compose()` ITSELF, not through a copy of it.
+		$this->assertTrue(
+			$reflection->hasMethod( 'compose_preview' ),
+			'⚠ the preview no longer has an entry point on the orchestrator.'
+		);
+
+		$this->assertStringContainsString(
+			'$this->compose(',
+			$this->method_source( $reflection, 'compose_preview' ),
+			'⚠ compose_preview() no longer delegates to compose() — a preview can now diverge from the send.'
+		);
+
+		$preview = $this->code_without_comments( dirname( __DIR__, 2 ) . '/src/Delivery/RulePreview.php' );
+
+		foreach ( array( 'wp_mail', '->trigger(', 'DeliveryLogger', 'DeliveryRepository', '->claim(' ) as $forbidden ) {
+			$this->assertStringNotContainsString(
+				$forbidden,
+				$preview,
+				'⚠ TIER 1: RulePreview reaches "' . $forbidden . '", so a preview could send or record.'
 			);
 		}
 
@@ -611,25 +669,55 @@ final class ManualRefusalTest extends ManualDeliveryTestCase {
 			array( 'logging', 'DeliveryLogger::record_send()', 'ManualDeliveryTest::…records_a_resend_attempt' ),
 			array( 'send-now execution', 'ScheduledDelivery::run()', 'ManualDeliveryTest::…send_now_sends_immediately' ),
 			array( 'identity claim', 'DeliveryRepository::claim()', 'ManualDeliveryTest::…replayed_manual_send' ),
+			// --- ADR-0020 -------------------------------------------------------
+			array( 'test send: execution', 'Orchestrator::execute_claimed()', 'TestEmailTest::…attempt_row_is_typed_test' ),
+			array( 'test send: identity', 'DeliveryRepository::claim()', 'TestEmailTest::…replayed_test_submission' ),
+			array( 'test send: confirmation', 'Admin\\ConfirmationToken', 'TestEmailTest::…refuses_over_get' ),
+			array( 'test send: rule refusals', 'ManualDelivery::rule_refusal()', 'TestEmailTest::…names_its_own_reason' ),
+			array( 'preview: composition', 'Orchestrator::compose()', 'PreviewRenderTest::…html_and_plain_text' ),
+			array( 'preview: consolidation', 'Consolidation::plan()', 'PreviewRenderTest::…how_many_emails' ),
+			array( 'preview: targeting', 'ManualDelivery::matched_items()', 'PreviewRenderTest::…non_matching_order' ),
+			array( 'preview: email wrapper', 'Custom_Email::render_preview()', 'PreviewInertnessTest::…separate_mode_preview' ),
+			array( 'preview: no-slot state', 'RenderContext::mark_preview_pending()', 'PreviewInertnessTest::…no_ledger_residue' ),
 		);
 
 		$table = '';
 
 		foreach ( $rows as $row ) {
-			$table .= '             │ ' . str_pad( $row[0], 24 ) . ' │ ' . str_pad( $row[1], 42 ) . " │\n";
+			$table .= '             │ ' . str_pad( $row[0], 26 ) . ' │ ' . str_pad( $row[1], 42 ) . " │\n";
 		}
 
 		$this->gate[] = 'gate 39 (shared components): ' . count( $rows ) . " named, each with a test\n"
-			. "             ┌──────────────────────────┬────────────────────────────────────────────┐\n"
-			. "             │ component                │ shared through                             │\n"
-			. "             ├──────────────────────────┼────────────────────────────────────────────┤\n"
+			. "             ┌────────────────────────────┬────────────────────────────────────────────┐\n"
+			. "             │ component                  │ shared through                             │\n"
+			. "             ├────────────────────────────┼────────────────────────────────────────────┤\n"
 			. $table
-			. "             └──────────────────────────┴────────────────────────────────────────────┘\n";
+			. "             └────────────────────────────┴────────────────────────────────────────────┘\n";
 	}
 
 	// -----------------------------------------------------------------------
 	// Helpers
 	// -----------------------------------------------------------------------
+
+	/**
+	 * One production file's source with every comment removed.
+	 *
+	 * @param string $path Absolute path.
+	 * @return string
+	 */
+	private function code_without_comments( string $path ): string {
+		$code = '';
+
+		foreach ( token_get_all( (string) file_get_contents( $path ) ) as $token ) {
+			if ( is_array( $token ) && in_array( $token[0], array( T_COMMENT, T_DOC_COMMENT ), true ) ) {
+				continue;
+			}
+
+			$code .= is_array( $token ) ? $token[1] : $token;
+		}
+
+		return $code;
+	}
 
 	/**
 	 * One method's source text.

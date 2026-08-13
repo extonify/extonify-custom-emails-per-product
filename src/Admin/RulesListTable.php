@@ -321,6 +321,12 @@ final class RulesListTable extends \WP_List_Table {
 
 		$actions = array(
 			'edit'      => '<a href="' . esc_url( $edit ) . '">' . esc_html__( 'Edit', 'extonify-custom-emails-per-product' ) . '</a>',
+			// ⚠ A PLAIN GET LINK WITH NO NONCE, AND THAT IS CORRECT (ADR-0020 §5). Preview
+			// writes nothing and sends nothing, so it is not a row action in the sense the
+			// three below are — there is no state for a nonce to protect, and gate 36's
+			// prohibition is on GET links that SEND.
+			'preview'   => '<a href="' . esc_url( RulePreviewScreen::url( $rule_id ) ) . '">'
+				. esc_html__( 'Preview', 'extonify-custom-emails-per-product' ) . '</a>',
 			'duplicate' => '<a href="' . esc_url( Menu::row_action_url( RuleActions::ACTION_DUPLICATE, $rule_id ) ) . '">'
 				. esc_html__( 'Duplicate', 'extonify-custom-emails-per-product' ) . '</a>',
 			'toggle'    => '<a href="' . esc_url(

@@ -17,6 +17,7 @@ use Extonify\WCEP\Admin\OrderPanel;
 use Extonify\WCEP\Admin\RuleActions;
 use Extonify\WCEP\Admin\RuleEditor;
 use Extonify\WCEP\Admin\RuleList;
+use Extonify\WCEP\Admin\RulePreviewScreen;
 use Extonify\WCEP\Admin\TargetSearch;
 use Extonify\WCEP\Plugin;
 
@@ -95,6 +96,13 @@ final class AdminAuthorizationTest extends AdminTestCase {
 			'handler: wcep_send_now'     => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_send_now_{id}_{rule}' ),
 			'handler: wcep_cancel'       => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_cancel_{id}_{rule}' ),
 			'handler: wcep_send_manual'  => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_send_manual_{order}_{rule}' ),
+			// --- ADR-0020: preview (renders, writes nothing) and the test send -----
+			// ⚠ THE PREVIEW SCREEN CARRIES NO NONCE, AND THAT IS CORRECT. It is a GET
+			// that writes nothing and sends nothing, so there is no state for a nonce to
+			// protect — gate 36's prohibition is on GET requests that SEND. The
+			// capability is checked on the dispatcher AND on the renderer, both below.
+			'screen render: preview'     => array( 'render', Menu::CAPABILITY, '— (read-only)' ),
+			'handler: wcep_send_test'    => array( 'handler', Menu::CAPABILITY, 'extonify_wcep_wcep_send_test_{order}_{rule}' ),
 		);
 	}
 
@@ -328,6 +336,11 @@ final class AdminAuthorizationTest extends AdminTestCase {
 						return;
 					}
 
+					if ( 'preview' === $method ) {
+						RulePreviewScreen::render();
+						return;
+					}
+
 					Menu::render();
 				},
 				'⚠ ' . $label . ' rendered for a ' . $who . ' user: privilege boundary crossed.'
@@ -388,6 +401,25 @@ final class AdminAuthorizationTest extends AdminTestCase {
 				'request dispatch: history',
 				array( 'page' => Menu::HISTORY_PAGE ),
 				'history_load',
+			),
+			// ADR-0020: the preview screen, through the dispatcher and directly.
+			'preview (dispatcher)'    => array(
+				'screen render: preview',
+				array(
+					'page'   => Menu::PAGE,
+					'action' => Menu::ACTION_PREVIEW,
+					'rule'   => 1,
+				),
+				'menu',
+			),
+			'preview (direct)'        => array(
+				'screen render: preview',
+				array(
+					'page'   => Menu::PAGE,
+					'action' => Menu::ACTION_PREVIEW,
+					'rule'   => 1,
+				),
+				'preview',
 			),
 		);
 	}

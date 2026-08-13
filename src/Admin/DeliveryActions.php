@@ -8,6 +8,7 @@
 namespace Extonify\WCEP\Admin;
 
 use Extonify\WCEP\Delivery\ManualDelivery;
+use Extonify\WCEP\Delivery\TestDelivery;
 use Extonify\WCEP\Domain\DeliveryIdentity;
 use Extonify\WCEP\Plugin;
 use Extonify\WCEP\Repository\DeliveryRepository;
@@ -41,6 +42,17 @@ final class DeliveryActions {
 	const ACTION_MANUAL   = 'wcep_send_manual';
 
 	/**
+	 * The test send (ADR-0020 §5).
+	 *
+	 * ⚠ A FIFTH MEMBER OF THIS CLASS RATHER THAN A SECOND CONFIRMATION MECHANISM. The
+	 * capability → method → nonce → token order, the refusal vocabulary, the
+	 * post/redirect/get shape and the gate-28, gate-36, gate-37 and gate-38 tables are
+	 * all DERIVED from self::write_actions(), so joining that list is what makes a test
+	 * send inherit every one of them — and what makes it fail those gates if it does not.
+	 */
+	const ACTION_TEST = 'wcep_send_test';
+
+	/**
 	 * The confirmation screen's own `action` value. Read-only: it shows what WOULD
 	 * happen and sends nothing.
 	 */
@@ -56,6 +68,15 @@ final class DeliveryActions {
 	const FIELD_RULE     = 'rule';
 
 	/**
+	 * The address a test send goes to (ADR-0020 §4b).
+	 *
+	 * ⚠ THE ONLY FIELD IN THIS CLASS THAT IS NOT AN INTEGER ID, so it is the only one
+	 * that needs sanitising rather than casting — and it is validated with `is_email()`
+	 * by `TestDelivery::address_for()` before anything is claimed, never here.
+	 */
+	const FIELD_ADDRESS = 'test_address';
+
+	/**
 	 * Every action that sends or changes a delivery.
 	 *
 	 * ⚠ THE GATE-28 AND GATE-38 TABLES ARE DERIVED FROM THIS LIST, so an action added
@@ -65,7 +86,31 @@ final class DeliveryActions {
 	 * @return string[]
 	 */
 	public static function write_actions(): array {
-		return array( self::ACTION_RESEND, self::ACTION_SEND_NOW, self::ACTION_CANCEL, self::ACTION_MANUAL );
+		return array( self::ACTION_RESEND, self::ACTION_SEND_NOW, self::ACTION_CANCEL, self::ACTION_MANUAL, self::ACTION_TEST );
+	}
+
+	/**
+	 * The actions whose subject is an ORDER plus a RULE rather than a delivery.
+	 *
+	 * ⚠ THE NONCE'S SUBJECT DEPENDS ON THIS, so it is one list read in three places
+	 * rather than three `=== ACTION_MANUAL` comparisons that can drift apart. A manual
+	 * send and a test send both act on a rule and an order that may have no delivery at
+	 * all; the other three act on a delivery that already exists.
+	 *
+	 * @return string[]
+	 */
+	public static function order_scoped_actions(): array {
+		return array( self::ACTION_MANUAL, self::ACTION_TEST );
+	}
+
+	/**
+	 * Whether an action's nonce subject is the order rather than the delivery.
+	 *
+	 * @param string $action The action.
+	 * @return bool
+	 */
+	public static function is_order_scoped( string $action ): bool {
+		return in_array( $action, self::order_scoped_actions(), true );
 	}
 
 	/**
@@ -122,7 +167,7 @@ final class DeliveryActions {
 		$order_id    = isset( $post[ self::FIELD_ORDER ] ) ? max( 0, (int) wp_unslash( $post[ self::FIELD_ORDER ] ) ) : 0;
 		$rule_id     = isset( $post[ self::FIELD_RULE ] ) ? max( 0, (int) wp_unslash( $post[ self::FIELD_RULE ] ) ) : 0;
 
-		$subject = self::ACTION_MANUAL === $action ? $order_id : $delivery_id;
+		$subject = self::is_order_scoped( $action ) ? $order_id : $delivery_id;
 
 		// 3. The nonce, before anything is written.
 		$nonce = isset( $post[ self::FIELD_NONCE ] ) ? sanitize_text_field( wp_unslash( $post[ self::FIELD_NONCE ] ) ) : '';
@@ -140,7 +185,25 @@ final class DeliveryActions {
 			return self::refused( 'replayed', $delivery_id, $order_id );
 		}
 
-		return self::dispatch( $action, $delivery_id, $order_id, $rule_id, $token );
+		return self::dispatch( $action, $delivery_id, $order_id, $rule_id, $token, self::submitted_address( $post ) );
+	}
+
+	/**
+	 * The test address this request carries, sanitised but NOT yet validated.
+	 *
+	 * ⚠ SANITISED HERE, VALIDATED IN `TestDelivery::address_for()`, AND THE SPLIT IS
+	 * DELIBERATE. `sanitize_text_field()` makes the value safe to pass around;
+	 * `is_email()` decides whether it may be mailed. Doing the second one here would put
+	 * the "who does this go to" decision in the request layer, and gate 42 needs it in
+	 * exactly one place.
+	 *
+	 * @param array $post Raw `$_POST`.
+	 * @return string
+	 */
+	private static function submitted_address( array $post ): string {
+		return isset( $post[ self::FIELD_ADDRESS ] )
+			? sanitize_text_field( wp_unslash( $post[ self::FIELD_ADDRESS ] ) )
+			: '';
 	}
 
 	/**
@@ -151,9 +214,10 @@ final class DeliveryActions {
 	 * @param int    $order_id    Order id.
 	 * @param int    $rule_id     Rule id.
 	 * @param string $token       The consumed token.
+	 * @param string $address     Test address, for the test action only.
 	 * @return array Outcome.
 	 */
-	private static function dispatch( string $action, int $delivery_id, int $order_id, int $rule_id, string $token ): array {
+	private static function dispatch( string $action, int $delivery_id, int $order_id, int $rule_id, string $token, string $address = '' ): array {
 		if ( self::ACTION_RESEND === $action ) {
 			return self::report( $action, ManualDelivery::resend( $delivery_id ), $delivery_id, $order_id );
 		}
@@ -164,6 +228,10 @@ final class DeliveryActions {
 
 		if ( self::ACTION_CANCEL === $action ) {
 			return self::report( $action, ManualDelivery::cancel( $delivery_id ), $delivery_id, $order_id );
+		}
+
+		if ( self::ACTION_TEST === $action ) {
+			return self::report( $action, TestDelivery::send( $order_id, $rule_id, $address, $token ), 0, $order_id, $rule_id );
 		}
 
 		return self::report( $action, ManualDelivery::send_manual( $order_id, $rule_id, $token ), 0, $order_id );
@@ -180,19 +248,20 @@ final class DeliveryActions {
 	 * travels in the query string and is matched against a closed map, never echoed.
 	 *
 	 * @param string $action      The action.
-	 * @param array  $result      Result from `ManualDelivery`.
+	 * @param array  $result      Result from `ManualDelivery` or `TestDelivery`.
 	 * @param int    $delivery_id Delivery id.
 	 * @param int    $order_id    Order id.
+	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
 	 * @return array Outcome.
 	 */
-	private static function report( string $action, array $result, int $delivery_id, int $order_id ): array {
+	private static function report( string $action, array $result, int $delivery_id, int $order_id, int $rule_id = 0 ): array {
 		$code = (string) ( $result['code'] ?? '' );
 
 		if ( ManualDelivery::OK !== ( $result['outcome'] ?? '' ) ) {
-			return self::refused( $code, $delivery_id, $order_id );
+			return self::refused( $code, $delivery_id, $order_id, $action, $rule_id );
 		}
 
-		return self::redirect( self::success_message( $action, $code ), $delivery_id, $order_id );
+		return self::redirect( self::success_message( $action, $code ), $delivery_id, $order_id, $action, $rule_id );
 	}
 
 	/**
@@ -215,6 +284,10 @@ final class DeliveryActions {
 			return 'wcep_cancelled';
 		}
 
+		if ( self::ACTION_TEST === $action ) {
+			return 'wcep_sent_test';
+		}
+
 		return self::ACTION_MANUAL === $action ? 'wcep_sent_manual' : 'wcep_resent';
 	}
 
@@ -235,14 +308,16 @@ final class DeliveryActions {
 	 * @param string $code        Refusal code.
 	 * @param int    $delivery_id Delivery id.
 	 * @param int    $order_id    Order id.
+	 * @param string $action      The action, which decides where the merchant lands.
+	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
 	 * @return array
 	 */
-	private static function refused( string $code, int $delivery_id, int $order_id ): array {
+	private static function refused( string $code, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0 ): array {
 		return array(
 			'outcome'     => RuleActions::OUTCOME_REDIRECT,
 			'refusal'     => $code,
 			'delivery_id' => $delivery_id,
-			'url'         => self::return_url( 'wcep_refused_' . $code, $delivery_id, $order_id ),
+			'url'         => self::return_url( 'wcep_refused_' . $code, $delivery_id, $order_id, $action, $rule_id ),
 		);
 	}
 
@@ -252,14 +327,16 @@ final class DeliveryActions {
 	 * @param string $message     Notice code.
 	 * @param int    $delivery_id Delivery id.
 	 * @param int    $order_id    Order id.
+	 * @param string $action      The action, which decides where the merchant lands.
+	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
 	 * @return array
 	 */
-	private static function redirect( string $message, int $delivery_id, int $order_id ): array {
+	private static function redirect( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0 ): array {
 		return array(
 			'outcome'     => RuleActions::OUTCOME_REDIRECT,
 			'refusal'     => '',
 			'delivery_id' => $delivery_id,
-			'url'         => self::return_url( $message, $delivery_id, $order_id ),
+			'url'         => self::return_url( $message, $delivery_id, $order_id, $action, $rule_id ),
 		);
 	}
 
@@ -280,12 +357,31 @@ final class DeliveryActions {
 	/**
 	 * Where to send the merchant afterwards.
 	 *
+	 * ⚠ A TEST SEND GOES BACK TO THE PREVIEW SCREEN IT WAS SUBMITTED FROM, not to the
+	 * delivery history (ADR-0020 §5). The merchant is looking at a rule and iterating on
+	 * it; landing them on a different screen with their preview gone would make "send a
+	 * test" cost them their place. Every other action acts on a delivery, and the history
+	 * is where a delivery lives.
+	 *
 	 * @param string $message     Notice code.
 	 * @param int    $delivery_id Delivery id.
 	 * @param int    $order_id    Order id.
+	 * @param string $action      The action, which decides where the merchant lands.
+	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
 	 * @return string
 	 */
-	private static function return_url( string $message, int $delivery_id, int $order_id ): string {
+	private static function return_url( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0 ): string {
+		if ( self::ACTION_TEST === $action ) {
+			return Menu::url(
+				array(
+					'action'          => Menu::ACTION_PREVIEW,
+					'rule'            => $rule_id,
+					self::FIELD_ORDER => $order_id,
+					Notices::ARG      => $message,
+				)
+			);
+		}
+
 		$args = array( Notices::ARG => $message );
 
 		if ( $order_id > 0 ) {
@@ -318,14 +414,15 @@ final class DeliveryActions {
 	 * @param int    $delivery_id Delivery id.
 	 * @param int    $order_id    Order id.
 	 * @param int    $rule_id     Rule id.
+	 * @param string $address     Test address the merchant typed, for the test action.
 	 * @return array
 	 */
-	public static function confirmation( string $action, int $delivery_id, int $order_id, int $rule_id ): array {
+	public static function confirmation( string $action, int $delivery_id, int $order_id, int $rule_id, string $address = '' ): array {
 		$deliveries = Plugin::instance()->deliveries();
 
 		$tombstone = $delivery_id > 0 ? $deliveries->find_by_id( $delivery_id ) : null;
 
-		if ( self::ACTION_MANUAL !== $action ) {
+		if ( ! self::is_order_scoped( $action ) ) {
 			if ( null === $tombstone ) {
 				return array( 'refusal' => ManualDelivery::REFUSED_DELIVERY_MISSING );
 			}
@@ -354,6 +451,28 @@ final class DeliveryActions {
 			return array( 'refusal' => ManualDelivery::REFUSED_ORDER_MISSING );
 		}
 
+		/*
+		 * ⚠ A TEST'S CONFIRMATION SHOWS THE TEST ADDRESS, NEVER THE RULE'S RECIPIENTS
+		 * (ADR-0020 §4b, §5). Resolving the rule's recipients here would print the
+		 * CUSTOMER'S ADDRESS on the confirmation screen for an action that will never
+		 * mail it — telling the merchant the exact opposite of what is about to happen,
+		 * on the one screen whose job is to be right about that.
+		 */
+		if ( self::ACTION_TEST === $action ) {
+			$resolved = TestDelivery::address_for( $address );
+
+			if ( '' === $resolved ) {
+				return array( 'refusal' => TestDelivery::REFUSED_BAD_ADDRESS );
+			}
+
+			$recipients = array( 'to' => array( $resolved ) );
+		} else {
+			// ⚠ RESOLVED, NOT THE RULE'S DEFINITION (ADR-0019 §6). A merchant shown
+			// `{customer_email}` has not been told who is about to be emailed.
+			$resolved   = '';
+			$recipients = self::preview_recipients( $order, (array) $rule );
+		}
+
 		return array(
 			'refusal'    => '',
 			'action'     => $action,
@@ -362,9 +481,8 @@ final class DeliveryActions {
 			'rule'       => $rule_id,
 			'rule_row'   => (array) $rule,
 			'tombstone'  => (array) $tombstone,
-			// ⚠ RESOLVED, NOT THE RULE'S DEFINITION (ADR-0019 §6). A merchant shown
-			// `{customer_email}` has not been told who is about to be emailed.
-			'recipients' => self::preview_recipients( $order, (array) $rule ),
+			'recipients' => $recipients,
+			'address'    => $resolved,
 			'token'      => ConfirmationToken::issue(),
 		);
 	}
@@ -377,7 +495,7 @@ final class DeliveryActions {
 	 * @return string|null
 	 */
 	private static function state_refusal( string $action, ?array $tombstone ): ?string {
-		if ( self::ACTION_MANUAL === $action || null === $tombstone ) {
+		if ( self::is_order_scoped( $action ) || null === $tombstone ) {
 			return null;
 		}
 
