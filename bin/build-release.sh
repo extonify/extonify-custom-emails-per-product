@@ -40,11 +40,26 @@ mkdir -p "${STAGE_DIR}/${SLUG}"
 rsync "${RSYNC_ARGS[@]}" "${PLUGIN_DIR}/" "${STAGE_DIR}/${SLUG}/"
 
 # 2. Production-only autoloader: dev tooling must never ship.
+#
+# composer.json IS shipped (see .distignore); composer.lock is not, and --no-dev
+# keeps every require-dev package out of vendor/.
 cp "${PLUGIN_DIR}/composer.json" "${STAGE_DIR}/${SLUG}/composer.json"
 (
 	cd "${STAGE_DIR}/${SLUG}"
 	composer install --no-dev --optimize-autoloader --no-interaction --quiet
-	rm -f composer.json composer.lock
+	rm -f composer.lock
+
+	# Composer creates vendor/bin/ even when nothing installs a binary. An empty
+	# directory in the archive is noise; refuse to remove it if it ever is not empty,
+	# rather than silently discarding a real dependency's executable.
+	if [ -d vendor/bin ]; then
+		if [ -z "$(ls -A vendor/bin)" ]; then
+			rmdir vendor/bin
+		else
+			echo "vendor/bin is not empty — refusing to remove it." >&2
+			exit 1
+		fi
+	fi
 )
 
 # 3. Zip it.

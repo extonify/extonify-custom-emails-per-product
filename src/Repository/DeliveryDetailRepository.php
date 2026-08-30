@@ -303,8 +303,7 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned detail table inside the allocating transaction; a cached read would defeat the allocation.
 		$max = $wpdb->get_var(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT MAX(attempt) FROM {$table} WHERE delivery_id = %d", $delivery_id )
+			$wpdb->prepare( 'SELECT MAX(attempt) FROM %i WHERE delivery_id = %d', $table, $delivery_id )
 		);
 
 		return max( 1, (int) $max + 1 );
@@ -326,10 +325,11 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- probe of the plugin-owned detail table inside the allocating transaction; the answer decides a status write and must be live.
 		$found = $wpdb->get_var(
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the replacements arrive as one array the sniff cannot count through; it is built from the same constant the placeholders are counted from.
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %s tokens counted from the GENUINE_ATTEMPT_STATES constant, whose members are hardcoded literals.
-				"SELECT id FROM {$table} WHERE delivery_id = %d AND state IN ( {$placeholders} ) LIMIT 1",
-				array_merge( array( $delivery_id ), self::GENUINE_ATTEMPT_STATES )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %s tokens counted from the GENUINE_ATTEMPT_STATES constant, whose members are hardcoded literals.
+				"SELECT id FROM %i WHERE delivery_id = %d AND state IN ( {$placeholders} ) LIMIT 1",
+				array_merge( array( $table, $delivery_id ), self::GENUINE_ATTEMPT_STATES )
 			)
 		);
 
@@ -489,8 +489,7 @@ class DeliveryDetailRepository {
 		$deliveries = Migrator::table( 'deliveries' );
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- referential-integrity probe against the plugin-owned tombstone table; a cached read could admit an orphan.
 		$exists = $wpdb->get_var(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$deliveries} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT id FROM {$deliveries} WHERE id = %d FOR UPDATE", $delivery_id )
+			$wpdb->prepare( 'SELECT id FROM %i WHERE id = %d FOR UPDATE', $deliveries, $delivery_id )
 		);
 		if ( null === $exists ) {
 			return 'delivery #' . $delivery_id . ' does not exist';
@@ -502,8 +501,7 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- referential-integrity probe against the plugin-owned detail table.
 			$parent_delivery = $wpdb->get_var(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				$wpdb->prepare( "SELECT delivery_id FROM {$table} WHERE id = %d", $parent_id )
+				$wpdb->prepare( 'SELECT delivery_id FROM %i WHERE id = %d', $table, $parent_id )
 			);
 			if ( null === $parent_delivery ) {
 				return 'parent attempt #' . $parent_id . ' does not exist';
@@ -530,8 +528,7 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned detail table.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE delivery_id = %d ORDER BY id ASC", $delivery_id ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE delivery_id = %d ORDER BY id ASC', $table, $delivery_id ),
 			ARRAY_A
 		);
 
@@ -586,8 +583,8 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- batched listing read of the plugin-owned detail table; a cached page would report an attempt state another request has already moved on from.
 			$rows = $wpdb->get_results(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "SELECT * FROM {$table} WHERE delivery_id IN ( {$placeholders} ) ORDER BY delivery_id ASC, attempt ASC, id ASC", $chunk ),
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT * FROM %i WHERE delivery_id IN ( {$placeholders} ) ORDER BY delivery_id ASC, attempt ASC, id ASC", array_merge( array( $table ), $chunk ) ),
 				ARRAY_A
 			);
 
@@ -624,8 +621,8 @@ class DeliveryDetailRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned detail table; results must be live, never cached.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; an identifier cannot be bound by prepare().
-				"SELECT * FROM {$table} WHERE recipient = %s ORDER BY id ASC LIMIT %d OFFSET %d",
+				'SELECT * FROM %i WHERE recipient = %s ORDER BY id ASC LIMIT %d OFFSET %d',
+				$table,
 				$normalized,
 				max( 1, $limit ),
 				max( 0, $offset )
@@ -663,8 +660,8 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned detail table; results must be live.
 			$rows = $wpdb->get_col(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "SELECT id FROM {$table} WHERE delivery_id IN ( {$placeholders} )", $chunk )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT id FROM %i WHERE delivery_id IN ( {$placeholders} )", array_merge( array( $table ), $chunk ) )
 			);
 			foreach ( (array) $rows as $id ) {
 				$out[] = (int) $id;
@@ -692,8 +689,7 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned detail table; results must be live.
 		$rows = $wpdb->get_col(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT id FROM {$table} WHERE recipient = %s", $normalized )
+			$wpdb->prepare( 'SELECT id FROM %i WHERE recipient = %s', $table, $normalized )
 		);
 
 		return array_map( 'intval', (array) $rows );
@@ -720,8 +716,7 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned detail table; results must be live.
 		$rows = $wpdb->get_col(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT DISTINCT delivery_id FROM {$table} WHERE recipient = %s", $normalized )
+			$wpdb->prepare( 'SELECT DISTINCT delivery_id FROM %i WHERE recipient = %s', $table, $normalized )
 		);
 
 		return array_map( 'intval', (array) $rows );
@@ -760,8 +755,8 @@ class DeliveryDetailRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned detail table; results must be live.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $page, whose members are all int-cast above.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE id IN ( {$placeholders} ) ORDER BY id ASC", $page ),
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $page, whose members are all int-cast above.
+			$wpdb->prepare( "SELECT * FROM %i WHERE id IN ( {$placeholders} ) ORDER BY id ASC", array_merge( array( $table ), $page ) ),
 			ARRAY_A
 		);
 
@@ -809,8 +804,8 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy erasure over the plugin-owned detail table.
 			$updated = $wpdb->query(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier and {$set} is built ONLY from names intersected against the PERSONAL_FIELDS class constant above; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "UPDATE {$table} SET {$set} WHERE id IN ( {$placeholders} )", $chunk )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$set} is built ONLY from names intersected against the PERSONAL_FIELDS class constant above; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "UPDATE %i SET {$set} WHERE id IN ( {$placeholders} )", array_merge( array( $table ), $chunk ) )
 			);
 			$cleared += is_int( $updated ) ? $updated : 0;
 		}
@@ -920,8 +915,8 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- retention purge over the plugin-owned detail table.
 			$deleted = $wpdb->query(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier and {$predicate} is a hardcoded literal from the $tiers list above, whose %s token prepare() binds. The sniff cannot see a placeholder that arrives via a variable.
-				$wpdb->prepare( "DELETE FROM {$table} WHERE {$predicate}", $cutoff )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- {$predicate} is a hardcoded literal from the $tiers list above, whose %s token prepare() binds. The sniff cannot see a placeholder that arrives via a variable, so it counts one placeholder and two replacements.
+				$wpdb->prepare( "DELETE FROM %i WHERE {$predicate}", $table, $cutoff )
 			);
 
 			$removed += is_int( $deleted ) ? $deleted : 0;
@@ -965,8 +960,8 @@ class DeliveryDetailRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle cleanup of the plugin-owned detail table.
 			$deleted = $wpdb->query(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above, so every value is bound by prepare(). The sniff cannot see placeholders that arrive via a variable.
-				$wpdb->prepare( "DELETE FROM {$table} WHERE delivery_id IN ( {$placeholders} )", $chunk )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above, so every value is bound by prepare(). The sniff cannot see placeholders that arrive via a variable.
+				$wpdb->prepare( "DELETE FROM %i WHERE delivery_id IN ( {$placeholders} )", array_merge( array( $table ), $chunk ) )
 			);
 
 			if ( false === $deleted ) {
@@ -990,9 +985,12 @@ class DeliveryDetailRepository {
 		global $wpdb;
 		$table = $this->table();
 
+		// ⚠ ONE LINE, NOT TWO STACKED. `phpcs:ignore` applies to the NEXT line, so a
+		// second annotation below it consumes the first — which is how the
+		// DirectQuery/NoCaching half of this suppression was silently inert until
+		// Plugin Check reported it (Prompt 13).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned detail table.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; the statement takes no parameters.
-		return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+		return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
 	}
 
 	/**

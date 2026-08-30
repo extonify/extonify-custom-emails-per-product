@@ -306,11 +306,38 @@ final class MatchingPurityTest extends MatchingTestCase {
 
 		$this->assertCount( 40, $this->own_decisions( $result_40 ) );
 
-		$this->assertSame(
-			$cold_20,
-			$cold_40,
-			"Query count scaled with rule count: {$cold_20} for 20 rules, {$cold_40} for 40."
-		);
+		$budget = $this->cold_query_budget();
+
+		/*
+		 * ⚠ THE COLD COST IS A WOOCOMMERCE MEASUREMENT, NOT A PLUGIN ONE, AND IT IS
+		 * ASSERTED PER VERSION WITH BOTH BOUNDS LIVE (Prompt 13A item 5b).
+		 *
+		 * The bound was 60 and the scaling assertion was `assertSame` — both measured
+		 * on WooCommerce 11.x and both stated as invariants. At the declared 9.6 floor
+		 * the same fixture costs 101 queries for 20 rules and 96 for 40: WooCommerce's
+		 * own internals got cheaper between the two releases, and the plugin's query
+		 * pattern did not change at all. Raising the bound to 105 for everybody would
+		 * have discarded the tripwire that matters — a regression to 70 queries on
+		 * 11.x — so each supported version carries its own number and each is checked.
+		 *
+		 * The INVARIANT the test is named for is unchanged and asserted on both: cost
+		 * does not GROW with the rule count. 11.x is held to the stricter form
+		 * (identical), because that is what it actually does.
+		 */
+		if ( $budget['identical'] ) {
+			$this->assertSame(
+				$cold_20,
+				$cold_40,
+				"Query count scaled with rule count: {$cold_20} for 20 rules, {$cold_40} for 40."
+			);
+		} else {
+			$this->assertLessThanOrEqual(
+				$cold_20,
+				$cold_40,
+				"Query count GREW with rule count: {$cold_20} for 20 rules, {$cold_40} for 40."
+			);
+		}
+
 		$this->assertSame( $warm_20, $warm_40 );
 
 		// A warm second evaluation costs exactly the rule fetch: every product,
@@ -321,16 +348,53 @@ final class MatchingPurityTest extends MatchingTestCase {
 		// which is what a naive per-rule-per-item implementation would cost.
 		$this->assertLessThan( 200, $cold_20 );
 		$this->assertLessThanOrEqual(
-			60,
+			$budget['cold'],
 			$cold_20,
-			"Evaluating a 10-item order cold took {$cold_20} queries; the bound is one rule fetch plus a constant per DISTINCT product."
+			"Evaluating a 10-item order cold took {$cold_20} queries against a bound of {$budget['cold']} for "
+				. "WooCommerce {$budget['measured_on']}; the bound is one rule fetch plus a constant per DISTINCT product."
 		);
 
 		fwrite(
 			STDERR,
 			"\n[gate 6] 10-item order, 10 distinct products:"
 			. " cold {$cold_20} queries against 20 rules / {$cold_40} against 40;"
-			. " warm {$warm_20} / {$warm_40}.\n"
+			. " warm {$warm_20} / {$warm_40}"
+			. " (bound {$budget['cold']}, measured on WooCommerce {$budget['measured_on']}).\n"
+		);
+	}
+
+	/**
+	 * The cold-evaluation budget for the WooCommerce this run is against.
+	 *
+	 * ⚠ EVERY NUMBER HERE WAS MEASURED, AND THE VERSION IT WAS MEASURED ON IS PART
+	 * OF THE RECORD. A bound taken on one release and written down as an invariant is
+	 * a false claim the moment the supported range widens — which is exactly how the
+	 * 60 below came to fail at the plugin's own declared floor.
+	 *
+	 * | WooCommerce | cold (20 rules) | cold (40 rules) | bound |
+	 * |-------------|-----------------|-----------------|-------|
+	 * | 9.6.0       | 101             | 96              | 105   |
+	 * | 11.0.1      | 37              | 37              | 60    |
+	 *
+	 * @return array{cold:int, identical:bool, measured_on:string}
+	 */
+	private function cold_query_budget(): array {
+		$version = defined( 'WC_VERSION' ) ? (string) WC_VERSION : '';
+
+		if ( '' !== $version && version_compare( $version, '10.0', '<' ) ) {
+			return array(
+				'cold'        => 105,
+				// 9.6 measures 101 then 96: it does not GROW, but it is not stable
+				// either, so the weaker half of the invariant is what is asserted.
+				'identical'   => false,
+				'measured_on' => '9.6.0',
+			);
+		}
+
+		return array(
+			'cold'        => 60,
+			'identical'   => true,
+			'measured_on' => '11.0.1',
 		);
 	}
 

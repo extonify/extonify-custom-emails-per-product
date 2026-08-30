@@ -91,6 +91,22 @@
 			mirrors[ i ].disabled = ! isInsert;
 		}
 
+		/*
+		 * ⚠ THE RECIPIENTS GO READ-ONLY, NOT DISABLED, AND THEY HAVE NO MIRROR ON
+		 * PURPOSE. An insert rule has no recipients of its own — WooCommerce addresses
+		 * the email this rule's content joins — but it does not ERASE them either, so
+		 * the stored document has to survive the round trip untouched. Disabling these
+		 * would drop them from the submission and a hidden mirror could only carry the
+		 * value this page was RENDERED with, so a merchant who edited a recipient and
+		 * then switched to insert would have silently saved the older copy. A read-only
+		 * textarea submits whatever is in it, which is the only version there is.
+		 */
+		var frozen = document.querySelectorAll( '[data-extonify-wcep-insert-readonly]' );
+
+		for ( i = 0; i < frozen.length; i++ ) {
+			frozen[ i ].readOnly = isInsert;
+		}
+
 		// Rows that only apply to one mode are hidden rather than removed, so the
 		// values they hold still submit and the server still judges them.
 		var scoped = document.querySelectorAll( '[data-extonify-wcep-mode]' );
@@ -133,13 +149,93 @@
 	// Placeholder insertion
 	// ---------------------------------------------------------------------
 
+	/**
+	 * WHAT DECIDES WHERE A PLACEHOLDER LANDS.
+	 *
+	 * One rule, applied to every surface the same way: the token goes to the LAST
+	 * ELEMENT CARRYING `data-extonify-wcep-insertable` THAT RECEIVED FOCUS. The
+	 * server puts that marker on the subject, the heading AND the body textarea,
+	 * so there is no per-field branch here and there must not be one.
+	 *
+	 * Two corrections keep "last focused" honest:
+	 *
+	 *   1. FOCUS MOVING INTO TinyMCE CLEARS THE MEMORY. Focus inside the editor's
+	 *      iframe raises no `focusin` this document can see, so without an
+	 *      explicit clear the memory is stale from the moment the merchant clicks
+	 *      into the body on the Visual tab. `null` means "the visual editor".
+	 *   2. WHILE TinyMCE IS SHOWING, IT OWNS THE BODY. The token then goes through
+	 *      `mceInsertContent` even when the remembered field IS the body textarea:
+	 *      that textarea is hidden behind the iframe, and writing into it would
+	 *      look like it worked and be discarded on the editor's next sync.
+	 *
+	 * ⚠ THE MARKER IS THE ONLY THING CONSULTED, BECAUSE ITS ABSENCE WAS A TIER 1
+	 * DEFECT. Before Part G the server emitted it from ONE site — the plain-text row
+	 * helper — so it landed on whatever that helper drew (the rule name, the subject
+	 * and the heading) and never on the `wp_editor()` body. Focusing the body
+	 * therefore never updated this variable, the first branch of `insertToken()`
+	 * fired on whichever plain input was touched last, and a placeholder clicked
+	 * while the merchant was writing the body was inserted into the HEADING. The
+	 * token was not lost, which is worse: nothing on the screen said the merchant's
+	 * input had gone somewhere else. It is now a per-field decision on the server,
+	 * asserted as a complete map by
+	 * `AdminOutputTest::test_every_placeholder_target_is_marked_and_nothing_else_is()`.
+	 *
+	 * @type {?HTMLElement}
+	 */
 	var lastField = null;
 
+	/**
+	 * The attribute that makes a field insertable. Emitted by `RuleEditor`.
+	 *
+	 * @type {string}
+	 */
+	var INSERTABLE = 'data-extonify-wcep-insertable';
+
+	/**
+	 * The body's TinyMCE instance, but only while it is actually showing.
+	 *
+	 * @return {?Object} The editor, or null on the Text tab and with rich editing off.
+	 */
+	function visualEditor() {
+		var id = settings.editorId || '';
+		var editor = window.tinymce && id ? window.tinymce.get( id ) : null;
+
+		return editor && ! editor.isHidden() ? editor : null;
+	}
+
+	/**
+	 * The body `<textarea>`, whether or not TinyMCE is in front of it.
+	 *
+	 * @return {?HTMLTextAreaElement}
+	 */
+	function bodyTextarea() {
+		return settings.editorId ? document.getElementById( settings.editorId ) : null;
+	}
+
+	/**
+	 * Track focus across every insertable surface.
+	 *
+	 * @param {FocusEvent} event The focus event.
+	 * @return {void}
+	 */
 	function rememberField( event ) {
 		var target = event.target;
 
-		if ( target && target.hasAttribute && target.hasAttribute( 'data-extonify-wcep-insertable' ) ) {
+		if ( ! target || ! target.hasAttribute ) {
+			return;
+		}
+
+		if ( target.hasAttribute( INSERTABLE ) ) {
 			lastField = target;
+			return;
+		}
+
+		// Correction 1, outer-document half: some browsers report focus entering an
+		// iframe as a `focusin` on the `<iframe>` element itself. The editor's own
+		// `focus` event, bound in `bindPlaceholders()`, is the reliable half.
+		if ( 'IFRAME' === target.tagName && settings.editorId
+			&& target.id === settings.editorId + '_ifr' ) {
+			lastField = null;
 		}
 	}
 
@@ -160,40 +256,42 @@
 	}
 
 	/**
-	 * Insert a placeholder wherever the merchant last was.
+	 * Insert a placeholder into the surface the rule above selects.
 	 *
-	 * The Visual tab is TinyMCE, the Text tab is a textarea, and the subject and
-	 * heading are plain inputs. Each needs its own insertion, and picking the wrong
-	 * one silently drops the token.
+	 * There are exactly TWO insertion mechanisms, not one per field: TinyMCE's
+	 * `mceInsertContent` for the Visual tab, and a caret insert for everything
+	 * else — the Text tab's textarea, the subject and the heading.
 	 *
 	 * @param {string} token The placeholder, e.g. `{order_total}`.
+	 * @return {void}
 	 */
 	function insertToken( token ) {
-		var editorId = settings.editorId || '';
-		var editor = window.tinymce && editorId ? window.tinymce.get( editorId ) : null;
+		var editor = visualEditor();
+		var body = bodyTextarea();
+		var field = lastField && document.body.contains( lastField ) ? lastField : null;
 
-		if ( lastField && document.body.contains( lastField ) ) {
-			insertIntoField( lastField, token );
-			return;
-		}
-
-		if ( editor && ! editor.isHidden() ) {
+		// Correction 2: the visual editor owns the body while it is showing.
+		if ( editor && ( null === field || field === body ) ) {
 			editor.execCommand( 'mceInsertContent', false, token );
+			editor.focus();
 			return;
 		}
 
-		var textarea = editorId ? document.getElementById( editorId ) : null;
+		if ( field ) {
+			insertIntoField( field, token );
+			return;
+		}
 
-		if ( textarea ) {
-			insertIntoField( textarea, token );
+		// Nothing has been focused yet and the visual editor is not up: the body is
+		// the only field a placeholder is worth guessing at.
+		if ( body ) {
+			insertIntoField( body, token );
 		}
 	}
 
 	function bindPlaceholders() {
 		document.addEventListener( 'focusin', rememberField );
 
-		// The editor's own iframe steals focus, so a click inside it clears the
-		// "last plain field" memory and insertion falls through to TinyMCE.
 		document.addEventListener( 'click', function ( event ) {
 			var button = event.target.closest ? event.target.closest( '.extonify-wcep-insert' ) : null;
 
@@ -205,9 +303,25 @@
 			insertToken( button.getAttribute( 'data-extonify-wcep-token' ) || '' );
 		} );
 
-		if ( window.jQuery && window.jQuery( document ) ) {
-			window.jQuery( document ).on( 'tinymce-editor-init', function () {
+		/*
+		 * Correction 1, the reliable half.
+		 *
+		 * ⚠ `tinymce-editor-init` FIRES ONCE, AND TAB SWITCHING FIRES NOTHING. The
+		 * previous code cleared the memory only at init, which covered the first
+		 * Visual tab and nothing after it: Visual → Text → Visual left whatever the
+		 * merchant had touched in between as the insertion target. Binding the
+		 * editor's own `focus` event instead fires every time the caret enters the
+		 * iframe, for the life of the instance.
+		 */
+		if ( window.jQuery ) {
+			window.jQuery( document ).on( 'tinymce-editor-init', function ( event, editor ) {
 				lastField = null;
+
+				if ( editor && editor.on ) {
+					editor.on( 'focus', function () {
+						lastField = null;
+					} );
+				}
 			} );
 		}
 	}

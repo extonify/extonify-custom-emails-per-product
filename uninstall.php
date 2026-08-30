@@ -92,10 +92,10 @@ if ( $extonify_wcep_table_exists ) {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- uninstall cleanup of a plugin-owned table; the identifier is esc_sql'd and is not user input, and the repositories cannot be assumed loadable here.
 		$wpdb->query(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- the identifier is esc_sql'd above; every value is bound.
-				"UPDATE `{$extonify_wcep_deliveries}`
+				'UPDATE %i
 					SET final_status = %s, snapshot = NULL, lease_taken_at = NULL, last_seen_at = %s
-				WHERE final_status = %s",
+				WHERE final_status = %s',
+				$extonify_wcep_deliveries,
 				$extonify_wcep_move[1],
 				$extonify_wcep_now,
 				$extonify_wcep_move[0]
@@ -106,8 +106,8 @@ if ( $extonify_wcep_table_exists ) {
 	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- uninstall read of a plugin-owned table; a cached count would authorise removing jobs against a stale answer.
 	$extonify_wcep_count = $wpdb->get_var(
 		$wpdb->prepare(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- the identifier is esc_sql'd above; every value is bound.
-			"SELECT COUNT(*) FROM `{$extonify_wcep_deliveries}` WHERE final_status IN ( %s, %s )",
+			'SELECT COUNT(*) FROM %i WHERE final_status IN ( %s, %s )',
+			$extonify_wcep_deliveries,
 			'scheduled',
 			'executing'
 		)
@@ -177,8 +177,8 @@ $extonify_wcep_tables = array(
 );
 
 foreach ( $extonify_wcep_tables as $extonify_wcep_table ) {
-	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- uninstall cleanup of plugin-owned tables; the identifier is esc_sql'd above and is not user input.
-	$wpdb->query( "DROP TABLE IF EXISTS `{$extonify_wcep_table}`" );
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange -- uninstall cleanup of plugin-owned tables.
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $extonify_wcep_table ) );
 }
 
 /*

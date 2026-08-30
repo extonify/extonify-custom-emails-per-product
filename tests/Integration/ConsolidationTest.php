@@ -2887,7 +2887,12 @@ final class ConsolidationTest extends ScheduledDeliveryTestCase {
 			return array(
 				'total'   => count( $seen ),
 				// MATCHING: the one indexed rules fetch per trigger (ADR-0011 §7a).
-				'rules'   => $count( $seen, '/FROM\s+\S*extonify_wcep_rules\s+WHERE\s+status/i' ),
+				// ⚠ THE BACKTICKS ARE OPTIONAL BECAUSE THE TABLE IS BOUND WITH `%i` NOW
+				// (Prompt 13A item 6). `$wpdb->prepare()` renders an identifier
+				// placeholder as a BACKTICKED name, where the old interpolation produced
+				// a bare one — so a pattern that insisted on a bare name would count
+				// zero rule fetches and report the opposite of what it measures.
+				'rules'   => $count( $seen, '/FROM\s+`?\S*extonify_wcep_rules`?\s+WHERE\s+status/i' ),
 				// RESOLUTION: every read of the order's line items and their meta.
 				'items'   => $count( $seen, '/woocommerce_order_item(?:meta)?/i' ),
 				/*

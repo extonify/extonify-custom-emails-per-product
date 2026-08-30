@@ -343,7 +343,16 @@ abstract class PreviewTestCase extends DeliveryTestCase {
 			DeliveryActions::FIELD_ORDER    => $order_id,
 			DeliveryActions::FIELD_RULE     => $rule_id,
 			DeliveryActions::FIELD_ADDRESS  => $address,
-			DeliveryActions::FIELD_TOKEN    => '' !== $token ? $token : ConfirmationToken::issue(),
+			/*
+			 * ⚠ THE TOKEN COMES FROM THE CONFIRMATION SCREEN'S OWN BUILDER, because it
+			 * BINDS the action, the ids and the address it displayed (Prompt 13A item
+			 * 4). A bare `ConfirmationToken::issue()` is bound to nothing and would be
+			 * refused as `confirmation_changed` — which is the correct behaviour and
+			 * exactly why a browser can only ever carry a token the screen gave it.
+			 */
+			DeliveryActions::FIELD_TOKEN    => '' !== $token
+				? $token
+				: (string) ( DeliveryActions::confirmation( DeliveryActions::ACTION_TEST, 0, $order_id, $rule_id, $address )['token'] ?? '' ),
 			DeliveryActions::FIELD_NONCE    => '' !== $nonce
 				? $nonce
 				: wp_create_nonce( DeliveryActions::nonce_action( DeliveryActions::ACTION_TEST, $order_id, $rule_id ) ),
@@ -403,8 +412,17 @@ abstract class PreviewTestCase extends DeliveryTestCase {
 	protected function every_recipient_of( array $mail ): array {
 		$found = array();
 
+		/*
+		 * ⚠ THE `to` FIELD IS SPLIT ON COMMAS, NOT TAKEN WHOLE.
+		 * `WC_Email::get_recipient()` joins its addresses with `, ` and `wp_mail()`
+		 * accepts that, so a leak can arrive as a SECOND ADDRESS INSIDE THE SAME
+		 * STRING — which a whole-string comparison sees as one unfamiliar recipient
+		 * rather than as the customer's address being present.
+		 */
 		foreach ( (array) ( is_array( $mail['to'] ?? '' ) ? $mail['to'] : array( (string) ( $mail['to'] ?? '' ) ) ) as $to ) {
-			$found[] = (string) $to;
+			foreach ( explode( ',', (string) $to ) as $address ) {
+				$found[] = $address;
+			}
 		}
 
 		foreach ( preg_split( '/\r\n|\r|\n/', $this->headers_of( $mail ) ) as $line ) {

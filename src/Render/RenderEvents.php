@@ -487,9 +487,33 @@ class RenderEvents {
 	 * reservations, bindings and send frames on the request-shared singleton with
 	 * nothing left in the request able to clear them.
 	 *
+	 * ⚠ IT RETURNS BEFORE BUILDING ANYTHING WHEN NOTHING WAS EVER BUILT, AND THAT IS A
+	 * FIX RATHER THAN AN OPTIMISATION (Prompt 13C item 2, Tier 2). `self::context()` and
+	 * `self::ledger()` are LAZY constructors, so this method used to construct both on
+	 * every request that reached `shutdown` — including the request that has just
+	 * DELETED this plugin's files. `wp plugin uninstall <slug> --deactivate` does
+	 * deactivate, uninstall and directory removal in ONE process: the hook is still
+	 * registered from that process's own boot, so it fired after `src/` was gone and
+	 * died with `Class "Extonify\WCEP\Render\RenderContext" not found`, exit code 255,
+	 * AFTER the uninstall had correctly finished its data work.
+	 *
+	 * The admin path was never affected — `uninstall_plugin()` includes only
+	 * `uninstall.php`, never the bootstrap — and neither was `wp plugin uninstall` on an
+	 * already-inactive plugin, which is never booted.
+	 *
+	 * ⚠ THE GUARD IS "WAS ANYTHING EVER BUILT", NOT "IS THE FILE STILL THERE". Both
+	 * collaborators are null exactly when no render, no send observation and no
+	 * injection ever happened in this request — in which case there is provably nothing
+	 * to reconcile, so the early return costs no correctness. Asking about the
+	 * filesystem instead would be guessing at a symptom.
+	 *
 	 * @return void
 	 */
 	public static function on_shutdown(): void {
+		if ( null === self::$context && null === self::$ledger ) {
+			return;
+		}
+
 		self::context()->shutdown();
 
 		$open = self::ledger()->take_open();

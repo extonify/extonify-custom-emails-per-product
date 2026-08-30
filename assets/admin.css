@@ -63,6 +63,31 @@
 	opacity: 0.6;
 }
 
+/*
+ * Read-only-by-mode controls (ADR-0013 §2): the recipients of an insert rule, which
+ * WooCommerce does not read and this plugin does not discard. Styled from the
+ * ATTRIBUTE rather than a class so the state follows `admin.js` toggling
+ * `.readOnly` with nothing to keep in step, and reads as plainly out of play as the
+ * disabled controls above without being dropped from the submission.
+ */
+.extonify-wcep-field [readonly] {
+	background: #f0f0f1;
+	cursor: not-allowed;
+	opacity: 0.6;
+}
+
+/*
+ * A rule the plugin can see will never fire (ADR-0013 §2a) — an insert rule whose
+ * target renders no order details. Marked on the LIST, because that is the only
+ * screen a merchant sees such a rule on until they open it, and it otherwise reads
+ * exactly like a rule that works.
+ */
+.extonify-wcep-rule-broken {
+	color: #b32d2e;
+	display: inline-block;
+	margin-top: 2px;
+}
+
 /* Targeting ------------------------------------------------------------- */
 
 .extonify-wcep-side {
@@ -149,6 +174,13 @@
 
 /* Placeholders ---------------------------------------------------------- */
 
+/*
+ * THE STACKED FORM IS THE BASE, and it is what the screen looked like before
+ * Part G: fields, then a rule, then the reference underneath. The two-column form
+ * is an ENHANCEMENT layered on in the `min-width` block at the end of this file,
+ * so a narrow window — and any browser without grid — gets the stacked layout by
+ * doing nothing rather than by undoing something.
+ */
 .extonify-wcep-placeholders {
 	border-top: 1px solid #f0f0f1;
 	margin-top: 16px;
@@ -343,4 +375,97 @@
 	padding: 12px;
 	white-space: pre-wrap;
 	word-wrap: break-word;
+}
+
+/* ---------------------------------------------------------------------------
+ * The two-column content editor (Prompt 13C Part G item 2).
+ *
+ * ⚠ THE DOM ORDER IS NOT TOUCHED. `RuleEditor::section_content()` emits the
+ * fields and then the reference; this puts the reference in the right-hand
+ * COLUMN without moving it in the document, so tab order still runs
+ * subject → heading → body → placeholders and every `<label for>` and
+ * `aria-describedby` association from gate 33 is exactly where it was.
+ *
+ * ⚠ 960px IS WORDPRESS'S OWN BREAKPOINT, not a number chosen to look right.
+ * `wp-admin` auto-folds the menu and switches to its narrow layout at 960px, so
+ * the editor stacks at the same width the rest of the screen reflows at. The
+ * query is `min-width: 961px` rather than a `max-width` override because the
+ * stacked layout above must be the default, not a rollback.
+ *
+ * ⚠ FOLDING THE ADMIN MENU ONLY MAKES THE CONTENT AREA WIDER. Nothing here is
+ * measured against the viewport except the breakpoint and the sticky panel's
+ * height, so `body.folded` and `body.auto-fold` need no rule of their own —
+ * the grid is sized from its own container in every case.
+ * ------------------------------------------------------------------------ */
+
+@media screen and ( min-width: 961px ) {
+
+	.extonify-wcep-content-layout {
+		align-items: start;
+		display: grid;
+		gap: 0 20px;
+		grid-template-columns: minmax( 0, 1fr ) minmax( 240px, 340px );
+	}
+
+	/* `min-width: 0` or a grid item refuses to shrink below its content and the
+	   editor toolbar pushes the whole row wider than the screen. */
+	.extonify-wcep-content-fields {
+		min-width: 0;
+	}
+
+	.extonify-wcep-content-layout > .extonify-wcep-placeholders {
+		border-left: 1px solid #f0f0f1;
+		border-top: 0;
+		margin-top: 0;
+		padding: 0 0 0 20px;
+
+		/*
+		 * Sticky, but never a trap. The reference is 28 tokens in five groups —
+		 * about 2 000px — so it always carries its OWN scrollbar: the lower groups
+		 * stay reachable by scroll and by keyboard instead of being clipped off the
+		 * bottom of a stuck box. `top` clears the fixed admin bar (32px at these
+		 * widths) with a little air.
+		 *
+		 * ⚠ THE HEIGHT CAP IS WHAT MAKES `position: sticky` DO ANYTHING, AND THE
+		 * FIRST VERSION OF THIS RULE PROVED IT BY DOING NOTHING. A sticky element
+		 * can only slide inside its CONTAINING BLOCK, which for a grid item is its
+		 * grid AREA — and a grid row is as tall as its tallest item. With the cap at
+		 * `100vh - 56px` the reference WAS the tallest item (844px against 637px of
+		 * fields at 1440×900), so the row was exactly its own height, its travel was
+		 * zero, and it scrolled away with the page while reporting
+		 * `position: sticky` to anyone who asked. Measured, not reasoned about.
+		 *
+		 * Capping it BELOW the height of the fields column hands row sizing back to
+		 * the fields and gives the reference somewhere to travel: ~117px at
+		 * 1440 wide, ~281px at 1000 wide, ~213px on a 500px-high viewport. Bounded
+		 * by the section, because the section is the containing block — the
+		 * reference is pinned while the fields it belongs to are on screen and
+		 * leaves with them, which is the most any CSS can do without moving it out
+		 * of the section it documents.
+		 *
+		 * The plain `max-height` comes first on purpose: a browser that cannot parse
+		 * `min()` keeps 520px, which is correct everywhere except a very short
+		 * viewport.
+		 */
+		max-height: 520px;
+		max-height: min( 520px, calc( 100vh - 76px ) );
+		overflow-y: auto;
+		position: sticky;
+		top: 42px;
+	}
+
+	/* In a 340px column a token and its explanation do not fit on one line, and
+	   flexing them side by side leaves the note as a ragged two-word column. Below
+	   the breakpoint the base rule's side-by-side form applies again. */
+	.extonify-wcep-content-layout .extonify-wcep-placeholder-group > ul > li {
+		display: block;
+		margin: 0 0 8px;
+	}
+
+	.extonify-wcep-content-layout .extonify-wcep-placeholder-note {
+		display: block;
+		font-size: 12px;
+		line-height: 1.5;
+		margin: 2px 0 0;
+	}
 }

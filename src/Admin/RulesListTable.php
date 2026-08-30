@@ -10,6 +10,7 @@ namespace Extonify\WCEP\Admin;
 use Extonify\WCEP\Delivery\Consolidation;
 use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
+use Extonify\WCEP\Email\NativeEmailTargets;
 use Extonify\WCEP\Plugin;
 use Extonify\WCEP\Repository\RuleRepository;
 
@@ -380,16 +381,37 @@ final class RulesListTable extends \WP_List_Table {
 			// ADR-0013 §2: an insert rule has no trigger at all — `native_email_id` is
 			// the single source of truth for which email it belongs to, and showing a
 			// plausible-looking trigger would read as a promise nothing keeps.
-			$emails = FieldOptions::native_emails();
+			//
+			// ⚠ THE UNFILTERED DISPLAY MAP (Prompt 13C Part M). `native_emails()` now
+			// returns only the targets an insert rule can REACH, and the whole point of
+			// the marker below is a rule whose target is not among them — looking the
+			// name up there would print a raw id for exactly the row that most needs a
+			// readable one.
+			$emails = FieldOptions::native_email_titles();
 			$id     = (string) ( $item['native_email_id'] ?? '' );
 
-			return esc_html(
+			$cell = esc_html(
 				sprintf(
 					/* translators: %s: WooCommerce email name. */
 					__( 'Inside: %s', 'extonify-custom-emails-per-product' ),
 					$emails[ $id ] ?? $id
 				)
 			);
+
+			/*
+			 * ⚠ SILENCE IS THE ONE UNACCEPTABLE OUTCOME (ADR-0013 §2a). A rule whose
+			 * target never renders order details sends nothing and records nothing, so
+			 * the list is the only screen a merchant sees it on until they open it. It
+			 * reads as active, and until Prompt 13C Part M it looked identical to a rule
+			 * that works. The row now says so where the merchant is already looking.
+			 */
+			if ( '' !== $id && NativeEmailTargets::cannot_render( $id ) ) {
+				$cell .= '<br /><span class="extonify-wcep-rule-broken">'
+					. esc_html__( 'This email has no order details section, so this rule can never add anything to it.', 'extonify-custom-emails-per-product' )
+					. '</span>';
+			}
+
+			return $cell;
 		}
 
 		$type     = (string) ( $item['trigger_type'] ?? '' );

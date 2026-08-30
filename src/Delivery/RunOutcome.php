@@ -119,9 +119,17 @@ final class RunOutcome {
 	 * @param int    $rule_id     Rule id.
 	 * @param int    $delivery_id Tombstone id, or 0 when nothing was claimed.
 	 * @param array  $result      `DeliveryLogger`'s structured write result.
+	 * @param array  $messages    How many MESSAGES this delivery sent, failed and
+	 *                            skipped. One delivery is one decision but may be
+	 *                            several messages (ADR-0016 §3), and `$action` carries
+	 *                            only the aggregate — so a fan-out where two of three
+	 *                            products went out records `failed` here and would
+	 *                            otherwise be indistinguishable from one where nothing
+	 *                            went out at all. Omitted where no message was
+	 *                            attempted, which is its own answer.
 	 * @return void
 	 */
-	public function record( string $action, int $rule_id, int $delivery_id, array $result ): void {
+	public function record( string $action, int $rule_id, int $delivery_id, array $result, array $messages = array() ): void {
 		$this->records[] = array(
 			'action'        => $action,
 			'rule_id'       => $rule_id,
@@ -130,7 +138,117 @@ final class RunOutcome {
 			'rows_expected' => (int) ( $result['rows_expected'] ?? 0 ),
 			'rows_written'  => (int) ( $result['rows_written'] ?? 0 ),
 			'finalized'     => (bool) ( $result['finalized'] ?? false ),
+			'messages'      => array(
+				self::SENT    => max( 0, (int) ( $messages[ self::SENT ] ?? 0 ) ),
+				self::FAILED  => max( 0, (int) ( $messages[ self::FAILED ] ?? 0 ) ),
+				self::SKIPPED => max( 0, (int) ( $messages[ self::SKIPPED ] ?? 0 ) ),
+			),
 		);
+	}
+
+	/**
+	 * How many MESSAGES across this run ended in one outcome.
+	 *
+	 * @param string $outcome One of self::SENT, self::FAILED, self::SKIPPED.
+	 * @return int
+	 */
+	public function messages_of( string $outcome ): int {
+		$count = 0;
+
+		foreach ( $this->records as $record ) {
+			$count += (int) ( $record['messages'][ $outcome ] ?? 0 );
+		}
+
+		return $count;
+	}
+
+	/**
+	 * How many messages this run attempted, across every delivery.
+	 *
+	 * @return int
+	 */
+	public function message_count(): int {
+		return $this->messages_of( self::SENT )
+			+ $this->messages_of( self::FAILED )
+			+ $this->messages_of( self::SKIPPED );
+	}
+
+	/**
+	 * WHAT A MERCHANT MUST BE TOLD THIS RUN DID (Prompt 13A item 3, gate 18).
+	 *
+	 * ⚠ THIS EXISTS BECAUSE THE ADMIN ACTIONS USED TO THROW THE RUN AWAY AND REPORT
+	 * SUCCESS UNCONDITIONALLY. `TestDelivery::send()`, `ManualDelivery::send_manual()`
+	 * and the resend path each discarded the `RunOutcome` and returned `OK`, so a
+	 * failed mailer, a delivery-filter refusal, a partially failed fan-out and zero
+	 * messages sent ALL produced *"The email was sent."* The delivery history recorded
+	 * the truth the whole time; the one screen the merchant actually reads did not.
+	 *
+	 * FIVE ANSWERS, AND `sent` IS THE ONLY ONE THAT MAY RENDER AS A SUCCESS:
+	 *
+	 *   - `sent`    — every message this run attempted went out, and nothing failed,
+	 *                 was skipped or failed to claim;
+	 *   - `partial` — at least one message went out and at least one did not. A
+	 *                 fan-out is the only shape that produces this, and it is exactly
+	 *                 the shape a single aggregate status cannot express;
+	 *   - `failed`  — nothing went out and something was attempted or could not be
+	 *                 claimed;
+	 *   - `skipped` — nothing went out because a decision was taken not to send: the
+	 *                 per-delivery filter declining, or no deliverable recipient. NOT
+	 *                 folded into `failed`, for the ADR-0012 §5a reason — a deliberate
+	 *                 refusal is not transport breakage, and the two need different
+	 *                 responses from the merchant;
+	 *   - `none`    — the run recorded nothing at all. A consumed identity with no
+	 *                 evidence behind it must never be reported as a success.
+	 *
+	 * @return array{code:string, sent:int, total:int, recorded:bool}
+	 */
+	public function summarise(): array {
+		$sent  = $this->messages_of( self::SENT );
+		$total = $this->message_count();
+
+		return array(
+			'code'     => $this->summary_code( $sent, $total ),
+			'sent'     => $sent,
+			'total'    => $total,
+			'recorded' => $this->is_fully_recorded(),
+		);
+	}
+
+	/**
+	 * The five-way answer self::summarise() reports.
+	 *
+	 * @param int $sent  Messages sent.
+	 * @param int $total Messages attempted.
+	 * @return string
+	 */
+	private function summary_code( int $sent, int $total ): string {
+		$failed  = $this->count_of( self::FAILED ) + $this->count_of( self::CLAIM_FAILED );
+		$skipped = $this->count_of( self::SKIPPED );
+
+		if ( $sent > 0 && $sent < $total ) {
+			return 'partial';
+		}
+
+		if ( $this->count_of( self::SENT ) > 0 && 0 === $failed && 0 === $skipped ) {
+			return self::SENT;
+		}
+
+		// ⚠ A RUN THAT SENT SOMETHING BUT ALSO FAILED OR SKIPPED SOMETHING IS PARTIAL,
+		// even when the message tallies agree — two deliveries in one run can disagree
+		// where one delivery's messages cannot.
+		if ( $this->count_of( self::SENT ) > 0 ) {
+			return 'partial';
+		}
+
+		if ( $failed > 0 ) {
+			return self::FAILED;
+		}
+
+		if ( $skipped > 0 ) {
+			return self::SKIPPED;
+		}
+
+		return 'none';
 	}
 
 	/**

@@ -183,10 +183,21 @@ final class RuleFormInput {
 			$fields['trigger_status'] = $value;
 		}
 
-		// ⚠ THE DELAY IS SHOWN IN THE LARGEST UNIT THAT DIVIDES IT EXACTLY, so a rule
-		// stored as 604800 reads "7 days" rather than "604800 seconds". Exactness is
-		// what makes it lossless: a value no unit divides falls back to minutes and
-		// the seconds are preserved by self::delay_seconds().
+		/*
+		 * ⚠ THE DELAY IS SHOWN IN THE LARGEST UNIT THAT DIVIDES IT EXACTLY, so a rule
+		 * stored as 604800 reads "7 days" rather than "604800 seconds". Exactness is
+		 * what makes it lossless: a value no larger unit divides falls back to
+		 * `seconds`, whose multiplier is 1, so `self::delay_seconds()` reconstructs
+		 * the stored integer unchanged.
+		 *
+		 * ⚠ AND `seconds` MUST BE A UNIT `FieldOptions::delay_units()` OFFERS, which is
+		 * the whole point of it being there. This fallback has always named `seconds`;
+		 * while the vocabulary stopped at `minutes` the editor rendered a `<select>`
+		 * with no matching option, the browser selected the first one, and the next
+		 * save stored 90 seconds as 90 minutes — cancelling a queued delivery under
+		 * ADR-0015 §4 and consuming its identity for good under §1a. See
+		 * `FieldOptions::delay_units()`.
+		 */
 		$seconds = max( 0, (int) ( $rule['delay_seconds'] ?? 0 ) );
 
 		$fields['delay_value'] = $seconds;

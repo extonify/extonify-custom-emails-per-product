@@ -1,8 +1,8 @@
 # Excluded from the distributed release archive.
 #
 # Everything listed here is development-only or regenerable. The shipped zip
-# contains the plugin bootstrap, src/, uninstall.php, languages/, readme.txt
-# and the production vendor/ autoloader — nothing else.
+# contains the plugin bootstrap, src/, assets/, uninstall.php, languages/,
+# readme.txt, composer.json and the production vendor/ autoloader — nothing else.
 /.git
 /.github
 /docs
@@ -13,7 +13,10 @@
 /bin
 .gitignore
 .distignore
-composer.json
+# composer.json IS shipped. The Plugin Review Team's "Using composer but no
+# composer.json file" note asks for it even when it is only used for development,
+# so others can review, study and fork the build. composer.lock stays out, and
+# --no-dev keeps require-dev packages out of vendor/.
 composer.lock
 phpcs.xml.dist
 phpunit.xml.dist

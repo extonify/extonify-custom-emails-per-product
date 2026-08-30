@@ -1067,7 +1067,24 @@ class Orchestrator {
 			'test',
 			max( 0, (int) ( $rule['revision'] ?? 0 ) ),
 			$recipients,
-			$prefix
+			$prefix,
+			// ⚠ THE RECIPIENT LOCK, AND IT IS SET ON THIS PATH AND NO OTHER (gate 42).
+			// The override above is what keeps the rule's document, `{customer_email}`,
+			// the admin address and every `cc`/`bcc` channel out of the recipient set.
+			// It is not enough on its own: `Custom_Email::trigger()` passes
+			// `WC_Email::get_recipient()`, which applies
+			// `woocommerce_email_recipient_{id}`, and the header block goes through
+			// `woocommerce_email_headers` — so a store running an "email the manager a
+			// copy of everything" plugin would mail a REAL PERSON a test message about a
+			// REAL CUSTOMER's order. Gate 42 asks for the outcome, not the override.
+			// ⚠ DERIVED FROM `$recipients` RATHER THAN PASSED SEPARATELY, so the lock and
+			// the override cannot name two different addresses. `TestDelivery` built that
+			// set from the one address the merchant confirmed.
+			// ⚠ AND ONLY HERE. The automatic, delayed, manual and resend paths pass
+			// nothing, so they keep honouring those filters — a merchant's own recipient
+			// customisation is legitimate on a real send, and silently discarding it
+			// would be its own defect.
+			implode( ', ', $recipients->addresses( 'to' ) )
 		);
 	}
 
@@ -1104,6 +1121,9 @@ class Orchestrator {
 			'snapshot'   => array(),
 			'settled'    => false,
 			'prefix'     => '',
+			// A preview reaches no transport at all, so there is nothing to lock; the
+			// key is present so `$state` has ONE shape wherever it is built.
+			'lock'       => '',
 		);
 
 		/*
@@ -1148,9 +1168,14 @@ class Orchestrator {
 	 *                                                 rule's, or null to resolve the
 	 *                                                 rule's as every other path does.
 	 * @param string                  $prefix          Subject marker, or '' for none.
+	 * @param string                  $lock            The ONE address this delivery may
+	 *                                                 reach, enforced after every
+	 *                                                 filter; '' leaves the filters in
+	 *                                                 charge, which is what every path
+	 *                                                 but the test send wants.
 	 * @return RunOutcome
 	 */
-	private function execute_claimed( \WC_Order $order, Custom_Email $email, array $rule, array $matched_items, int $delivery_id, string $identity, array $snapshot, ?string $transition_from, string $type = 'auto', int $revision = 0, ?ResolvedRecipients $recipients = null, string $prefix = '' ): RunOutcome {
+	private function execute_claimed( \WC_Order $order, Custom_Email $email, array $rule, array $matched_items, int $delivery_id, string $identity, array $snapshot, ?string $transition_from, string $type = 'auto', int $revision = 0, ?ResolvedRecipients $recipients = null, string $prefix = '', string $lock = '' ): RunOutcome {
 		$decision = MatchDecision::create( (int) $rule['id'], MatchDecision::MATCHED, $identity, $matched_items );
 
 		// No `EvaluationResult`: this run EXECUTES a decision taken elsewhere rather
@@ -1177,6 +1202,13 @@ class Orchestrator {
 
 		if ( '' !== $prefix ) {
 			$claim['subject_prefix'] = $prefix;
+		}
+
+		if ( '' !== $lock ) {
+			// Rides on the claim exactly as `attempt_type`, `transition_from` and
+			// `subject_prefix` do (ADR-0019 §8's pattern), so the shared send body
+			// carries it without knowing which caller asked for it.
+			$claim['recipient_lock'] = $lock;
 		}
 
 		$this->send( $order, $email, $rule, $decision, $claim, $snapshot, $outcome );
@@ -1257,6 +1289,15 @@ class Orchestrator {
 			 * subject carries the marker as well as the sent one.
 			 */
 			'prefix'     => (string) ( $claim['subject_prefix'] ?? '' ),
+
+			/*
+			 * ⚠ THE RECIPIENT LOCK, READ OFF THE CLAIM AND SEEDED HERE (gate 42). It
+			 * travels in `$state` for the same reason the prefix does: `attempt()` and
+			 * `fan_out_message()` are the two places a message is handed to
+			 * `Custom_Email`, both already take `$state`, and one seeding covers both —
+			 * so a fan-out cannot lock its first message and leak its second.
+			 */
+			'lock'       => (string) ( $claim['recipient_lock'] ?? '' ),
 		);
 
 		try {
@@ -1481,7 +1522,15 @@ class Orchestrator {
 		 * out because resolution — not just transport — now runs third-party code.
 		 */
 		$subject = $composed['subject'];
-		$result  = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id ) );
+		$result  = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id, (string) $state['lock'] ) );
+
+		/*
+		 * ⚠ APPENDED AFTER THE SEND, BECAUSE IT IS AN OUTCOME OF ONE. `$notes` above is
+		 * everything known BEFORE the message went out; this is the one fact that only
+		 * exists afterwards. Empty on every path but a test send whose lock did not
+		 * reach `wp_mail()` — see self::lock_note().
+		 */
+		$notes = self::join_notes( $notes, self::lock_note( $email ) );
 
 		/*
 		 * THE PER-DELIVERY FILTER IS NOT A TRANSPORT FAILURE (ADR-0012 §5a).
@@ -1502,7 +1551,9 @@ class Orchestrator {
 					'disabled_by_filter: the ' . Custom_Email::enabled_filter() . ' filter returned false for this delivery'
 						. ( '' !== $notes ? '; ' . $notes : '' ),
 					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
-				)
+				),
+				// One message was composed and offered; a third party declined it.
+				array( RunOutcome::SKIPPED => 1 )
 			);
 			$state['settled'] = true;
 			return;
@@ -1525,7 +1576,8 @@ class Orchestrator {
 					'no recipient survived header sanitisation, so nothing was sent'
 						. ( '' !== $notes ? '; ' . $notes : '' ),
 					array() !== $snapshot ? array( 'snapshot' => $snapshot ) : array()
-				)
+				),
+				array( RunOutcome::SKIPPED => 1 )
 			);
 			$state['settled'] = true;
 			return;
@@ -1551,7 +1603,11 @@ class Orchestrator {
 				DeliveryLogger::transition_from( $claim ),
 				DeliveryLogger::attempt_type( $claim ),
 				DeliveryLogger::attempt_revision( $claim )
-			)
+			),
+			// Exactly one message, so the tally is the outcome. It is still RECORDED
+			// rather than inferred, so `RunOutcome::summarise()` has one rule for
+			// every shape instead of a special case for the single-message one.
+			array( ( $sent ? RunOutcome::SENT : RunOutcome::FAILED ) => 1 )
 		);
 
 		// ⚠ AFTER THE RECORD, NOT AFTER THE SEND. A throw from the recording itself
@@ -1635,7 +1691,17 @@ class Orchestrator {
 			// ADR-0015 §8.1: `executing -> …` for a delayed delivery, an unconditional
 			// write for an immediate one — unchanged by the fan-out, because there is
 			// still exactly one tombstone and exactly one terminal write.
-			$this->logger->record_fanout_outcome( $delivery_id, $result, DeliveryLogger::transition_from( $claim ) )
+			$this->logger->record_fanout_outcome( $delivery_id, $result, DeliveryLogger::transition_from( $claim ) ),
+			// ⚠ THE PER-MESSAGE TALLY, CARRIED PAST THE AGGREGATE. `run_action()` answers
+			// `failed` for a fan-out where two of three messages went out, which is
+			// correct for the tombstone and useless to a merchant: it cannot be told
+			// apart from a fan-out where nothing went out. The counts are what let the
+			// admin notice say "2 of 3" instead of guessing.
+			array(
+				RunOutcome::SENT    => $result->count_of( FanOutResult::SENT ),
+				RunOutcome::FAILED  => $result->count_of( FanOutResult::FAILED ),
+				RunOutcome::SKIPPED => $result->count_of( FanOutResult::SKIPPED ),
+			)
 		);
 
 		$state['settled'] = true;
@@ -1676,7 +1742,7 @@ class Orchestrator {
 
 		try {
 			$composed = $this->compose( $order, $rule, $decision, $message, $state );
-			$sent     = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id ) );
+			$sent     = $email->trigger( $this->send_args( $order, $decision, $recipients, $composed, $delivery_id, (string) $state['lock'] ) );
 
 			$this->logger->record_fanout_message(
 				$delivery_id,
@@ -1685,7 +1751,9 @@ class Orchestrator {
 				$recipients,
 				$composed['subject'],
 				self::message_outcome( $sent ),
-				self::message_reason( $sent, self::notes_for( $state ) ),
+				// The lock note is folded in LOCALLY rather than onto `$state`, which is
+				// delivery-scoped: written there, message 2 would inherit message 1's.
+				self::message_reason( $sent, self::join_notes( self::notes_for( $state ), self::lock_note( $email ) ) ),
 				Custom_Email::NOT_SENT === $sent ? 'the mailer reported the message as not sent' : null,
 				$snapshot
 			);
@@ -1964,20 +2032,24 @@ class Orchestrator {
 	 * @param ResolvedRecipients $recipients  Resolved recipients.
 	 * @param array              $composed    Output of self::compose().
 	 * @param int                $delivery_id Tombstone id.
+	 * @param string             $lock        The ONE address this delivery may reach,
+	 *                                        or '' to leave WooCommerce's recipient
+	 *                                        filters in charge (gate 42).
 	 * @return array
 	 */
-	private function send_args( \WC_Order $order, MatchDecision $decision, ResolvedRecipients $recipients, array $composed, int $delivery_id ): array {
+	private function send_args( \WC_Order $order, MatchDecision $decision, ResolvedRecipients $recipients, array $composed, int $delivery_id, string $lock = '' ): array {
 		return array(
-			'recipient'     => implode( ', ', $recipients->addresses( 'to' ) ),
-			'cc'            => implode( ', ', $recipients->addresses( 'cc' ) ),
-			'bcc'           => implode( ', ', $recipients->addresses( 'bcc' ) ),
-			'subject'       => $composed['subject'],
-			'heading'       => $composed['heading'],
-			'content'       => $composed['body']['html'],
-			'content_plain' => $composed['body']['plain'],
-			'matched_items' => $decision->matched_items(),
-			'delivery_id'   => $delivery_id,
-			'object'        => $order,
+			'recipient'        => implode( ', ', $recipients->addresses( 'to' ) ),
+			'cc'               => implode( ', ', $recipients->addresses( 'cc' ) ),
+			'bcc'              => implode( ', ', $recipients->addresses( 'bcc' ) ),
+			'locked_recipient' => $lock,
+			'subject'          => $composed['subject'],
+			'heading'          => $composed['heading'],
+			'content'          => $composed['body']['html'],
+			'content_plain'    => $composed['body']['plain'],
+			'matched_items'    => $decision->matched_items(),
+			'delivery_id'      => $delivery_id,
+			'object'           => $order,
 		);
 	}
 
@@ -2060,6 +2132,56 @@ class Orchestrator {
 		}
 
 		return $notes;
+	}
+
+	/**
+	 * What the recipient lock reports about the send that has just happened
+	 * (ADR-0020 §4b, Prompt 13C item 1).
+	 *
+	 * ⚠ SILENT ON THE ORDINARY CASE, AND THAT IS DELIBERATE. Every path but the test
+	 * send is `LOCK_NONE`, and a test send whose lock reached `wp_mail()`'s arguments is
+	 * `LOCK_APPLIED` — neither has anything to tell a merchant, so neither writes a
+	 * note. What is worth a note is the case where the plugin's LAST guarantee did not
+	 * reach the transport. That is normal on some stores and is not a failure — but a
+	 * merchant reading "who did this test actually reach" is entitled to know which
+	 * guarantee they got.
+	 *
+	 * ⚠ THE TWO WAYS THAT HAPPENS GET TWO SENTENCES, BECAUSE THEY SAY DIFFERENT THINGS
+	 * ABOUT A STORE (Part A2). `wp_mail()` never entered is a replacement transport and
+	 * is the common one; `wp_mail()` entered and no invocation carrying this message
+	 * means the message was altered before the lock could identify it, and that is worth
+	 * naming rather than collapsing into the first.
+	 *
+	 * ⚠ AND THE TWO SENTENCES END DIFFERENTLY, WHICH IS PART A3'S CORRECTION. When
+	 * `wp_mail()` was never entered, no `wp_mail` filter ran either, so the parameters
+	 * really were the last word. When it WAS entered and we could not identify the
+	 * message, they were not: those filters ran on a message we could not lock, and a
+	 * recipient one of them added is still on it. Telling a merchant "the lock still
+	 * governed the parameters" in that case would be true and misleading at once.
+	 *
+	 * @param Custom_Email $email The email object that performed the send.
+	 * @return string A note, or '' when there is nothing to say.
+	 */
+	private static function lock_note( Custom_Email $email ): string {
+		switch ( $email->lock_outcome() ) {
+			case Custom_Email::LOCK_UNFIRED:
+				return 'the test recipient lock was not applied at wp_mail(): this send never entered '
+					. 'wp_mail(), which is what a replacement woocommerce_mail_callback looks like. '
+					. 'The lock still governed the parameters the mailer was handed';
+
+			case Custom_Email::LOCK_UNMATCHED:
+				return 'the test recipient lock was not applied at wp_mail(): wp_mail() ran, and no call in this '
+					. 'send carried this message — it was already altered by the time wp_mail() was entered, which '
+					. 'is what a mail callback that rewrites a message before forwarding it looks like. The '
+					. 'parameters handed to that sender were locked, but a recipient added after them was not '
+					. 'removed';
+
+			case Custom_Email::LOCK_UNARMED:
+				return 'the test recipient lock was never armed: this send did not reach the mail callback';
+
+			default:
+				return '';
+		}
 	}
 
 	/**

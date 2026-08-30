@@ -30,6 +30,19 @@ final class Notices {
 	const ARG = 'message';
 
 	/**
+	 * How many messages a partly-successful delivery sent, and how many it planned.
+	 *
+	 * ⚠ TWO INTEGERS AND NOTHING ELSE. A merchant told "some of these were sent" needs
+	 * to know how many, and the recorded REASON is free text this plugin does not own —
+	 * it can hold a mailer's error string. Carrying that through a query argument would
+	 * reflect arbitrary content into the page; carrying two counts cannot, because
+	 * `absint()` is total. The reason itself lives on the delivery record, escaped, on
+	 * the screen the sentence sends the merchant to.
+	 */
+	const ARG_SENT  = 'wcep_sent';
+	const ARG_TOTAL = 'wcep_total';
+
+	/**
 	 * Render the notice this request's `message` argument asks for.
 	 *
 	 * @return void
@@ -50,7 +63,58 @@ final class Notices {
 			return;
 		}
 
-		self::render( $messages[ $code ][0], $messages[ $code ][1] );
+		$counted = self::counted_message( $code );
+
+		self::render( $messages[ $code ][0], null !== $counted ? $counted : $messages[ $code ][1] );
+	}
+
+	/**
+	 * The counted variant of one message, when this request carries usable counts.
+	 *
+	 * ⚠ AN ENRICHMENT, NEVER THE ONLY SENTENCE. `self::request_messages()` stays a
+	 * COMPLETE closed map — gate 38 walks it, `DeliveryConfirm` reads it, and a code
+	 * whose only sentence lived here would be a code with no sentence for either. So
+	 * every code answered here also has a count-free sentence in the map, and this
+	 * returns null the moment the counts are missing or do not describe a partial
+	 * outcome.
+	 *
+	 * @param string $code Notice code.
+	 * @return string|null Translated, unescaped; null to use the map's sentence.
+	 */
+	private static function counted_message( string $code ): ?string {
+		if ( 'wcep_partly_sent' !== $code ) {
+			return null;
+		}
+
+		$sent  = self::requested_count( self::ARG_SENT );
+		$total = self::requested_count( self::ARG_TOTAL );
+
+		// "3 of 2 sent" and "0 of 5 sent" are not partial outcomes; a request that
+		// claims one is not describing anything this plugin produced.
+		if ( $sent <= 0 || $total <= $sent ) {
+			return null;
+		}
+
+		return sprintf(
+			/* translators: 1: how many messages were sent, 2: how many were attempted. */
+			__(
+				'Only some of this rule\'s emails were sent: %1$d of %2$d went out. This rule sends one email per matched product, and the rest failed or were skipped. Open the delivery in the history to see what happened to each one.',
+				'extonify-custom-emails-per-product'
+			),
+			$sent,
+			$total
+		);
+	}
+
+	/**
+	 * One non-negative integer request argument.
+	 *
+	 * @param string $key Query argument.
+	 * @return int
+	 */
+	private static function requested_count( string $key ): int {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- reading two counts for a notice sentence on a read-only screen; absint() IS the sanitisation, and the state-changing POST that produced this redirect verified its own nonce and token.
+		return isset( $_GET[ $key ] ) ? absint( wp_unslash( $_GET[ $key ] ) ) : 0;
 	}
 
 	/**
@@ -101,7 +165,7 @@ final class Notices {
 		return array(
 			// --- successes ---------------------------------------------------
 			'wcep_resent'                       => array( 'success', __( 'The email was resent. It was rendered from this rule as it is now, not as it was when the delivery first ran.', 'extonify-custom-emails-per-product' ) ),
-			'wcep_sent_manual'                  => array( 'success', __( 'The email was sent. This was a one-off send and it does not replace the rule\'s automatic delivery, so the customer may receive it again if the rule\'s trigger fires later.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_sent_manual'                  => array( 'success', __( 'The email was sent. This was a one-off send and it does not replace the rule\'s automatic delivery, so it may be sent again, to the rule\'s own recipients, if the rule\'s trigger fires later.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_sent_now'                     => array( 'success', __( 'The email was sent immediately and the scheduled job was removed.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_cancelled'                    => array( 'success', __( 'The scheduled delivery was cancelled and its job removed. This rule will not send again for this order and trigger.', 'extonify-custom-emails-per-product' ) ),
 
@@ -111,8 +175,37 @@ final class Notices {
 			'wcep_send_now_cancelled'           => array( 'warning', __( 'Nothing was sent. When the delivery ran it no longer passed the checks it makes before sending — most often because the rule or the order changed after it was scheduled. Open the delivery to see the recorded reason.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_send_now_other'               => array( 'warning', __( 'The delivery ran but did not send. Open it to see the recorded outcome.', 'extonify-custom-emails-per-product' ) ),
 
+			/*
+			 * --- ⚠ WHAT A SEND ACTUALLY DID (Prompt 13A item 3, gate 18) ------------
+			 *
+			 * A sending action reports the outcome its `RunOutcome` recorded, and only
+			 * `sent` may render as a success. These four cover every other answer, and
+			 * every one of them is reachable: the mailer failing, another plugin's
+			 * `woocommerce_email_enabled_{id}` declining THIS delivery, a per-product
+			 * fan-out where some messages went out and some did not, and a run that
+			 * recorded nothing at all.
+			 *
+			 * ⚠ EACH SENDS THE MERCHANT TO THE DELIVERY RECORD, deliberately. That is
+			 * where the recorded reason lives — a mailer's own error string, which is
+			 * free text this plugin does not own and therefore does not put in a URL.
+			 */
+			'wcep_partly_sent'                  => array( 'warning', __( 'Only some of this rule\'s emails were sent. This rule sends one email per matched product, and the rest failed or were skipped. Open the delivery in the history to see what happened to each one.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_not_sent_failed'              => array( 'error', __( 'Nothing was sent. The delivery ran and the message did not go out — the mailer reported a failure, or the send raised an error. Open the delivery in the history for the recorded reason, and check the WooCommerce logs (source: extonify-wcep).', 'extonify-custom-emails-per-product' ) ),
+			'wcep_not_sent_skipped'             => array( 'warning', __( 'Nothing was sent, because this delivery was deliberately skipped rather than attempted. Either another plugin declined it, or the rule resolved to no address this store can send to. Open the delivery in the history for the recorded reason.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_not_sent_unknown'             => array( 'error', __( 'Nothing was sent, and this delivery recorded no outcome at all. Open the delivery in the history, and check the WooCommerce logs (source: extonify-wcep).', 'extonify-custom-emails-per-product' ) ),
+
 			// --- refusals, one sentence each ----------------------------------
 			'wcep_refused_replayed'             => array( 'warning', __( 'Nothing was sent, because this confirmation had already been used. Each confirmation runs once; open the delivery and confirm again if you meant to send a second email.', 'extonify-custom-emails-per-product' ) ),
+
+			/*
+			 * ⚠ TOLD APART FROM `replayed` DELIBERATELY (Prompt 13A item 4, gate 38).
+			 * "You already used this" and "what you approved is no longer what would
+			 * happen" send a merchant to two different places, and the second is the
+			 * one that matters: it means the recipients, the rule or the order moved
+			 * between the confirmation screen being drawn and the button being pressed.
+			 */
+			'wcep_refused_confirmation_changed' => array( 'warning', __( 'Nothing was sent. What this confirmation was for is no longer what would happen — the rule, the order or the addresses it would reach changed after the confirmation was opened. Open it again and check who it goes to before confirming.', 'extonify-custom-emails-per-product' ) ),
+			'wcep_refused_snapshot_unreadable'  => array( 'error', __( 'Nothing was sent. The stored copy of what this scheduled delivery would send cannot be read, so there is no way to show you who it would reach. Cancel it and send the rule by hand instead.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_refused_rule_deleted'         => array( 'error', __( 'This rule has been deleted, so there is no message left to send. A completed delivery does not keep a copy of what it sent.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_refused_rule_insert_mode'     => array( 'error', __( 'This rule adds its content to a WooCommerce email rather than sending one of its own, so there is no message to send on its own. Resend the WooCommerce email instead.', 'extonify-custom-emails-per-product' ) ),
 			'wcep_refused_rule_vocabulary'      => array( 'error', __( 'This rule has a setting this plugin no longer accepts, so it cannot be delivered. Open the rule, correct the setting and save it first.', 'extonify-custom-emails-per-product' ) ),
@@ -199,6 +292,9 @@ final class Notices {
 
 			case 'unregistered':
 				return __( 'The WooCommerce email this rule names is not one this store sends, so nothing was saved. Choose one from the list.', 'extonify-custom-emails-per-product' );
+
+			case 'no_order_details':
+				return __( 'That WooCommerce email has no order details section, so there is nowhere in it for this rule\'s content to go and it would never appear. Nothing was saved. Choose an email that shows the order, or send this rule as a separate email instead.', 'extonify-custom-emails-per-product' );
 
 			case 'required':
 				return __( 'Give this rule a name, so you can find it again in the list.', 'extonify-custom-emails-per-product' );

@@ -353,7 +353,7 @@ final class DeliveryPresenter {
 
 			$lines[] = esc_html(
 				sprintf(
-					/* translators: 1: recipient kind, e.g. "To", 2: an email address. */
+					/* translators: 1: recipient kind, e.g. "To", 2: one or more email addresses, comma-separated. */
 					__( '%1$s: %2$s', 'extonify-custom-emails-per-product' ),
 					$types_map[ $kind ] ?? $kind,
 					$recipient
@@ -401,6 +401,34 @@ final class DeliveryPresenter {
 
 			if ( '' === $value ) {
 				continue;
+			}
+
+			/*
+			 * ⚠ THE REASON IS TRANSLATED AT READ TIME, KEYED ON THE STORED CODE — and
+			 * ONLY the reason. `subject` and `failure_message` are a merchant's own words
+			 * and a mail server's response; neither is this plugin's sentence to restate.
+			 *
+			 * The stored `reason` is deliberately written in English and never wrapped in
+			 * `__()` at write time: it is a persisted audit record, and freezing the
+			 * cancelling request's locale into it would leave a history in a mixture of
+			 * languages. `Admin\ReasonText` therefore holds a SECOND, translated copy
+			 * keyed on `snapshot.cancelled.reason_code`, which
+			 * `DeliveryLogger::record_scheduled_cancellation()` already persists.
+			 *
+			 * ⚠ NO SCHEMA CHANGE WAS NEEDED, and Part D said one would be. That claim
+			 * rested on the code not being stored; it is, inside the snapshot column that
+			 * `DeliveryDetailRepository::hydrate()` has always decoded.
+			 *
+			 * A row with no code — written before the code was recorded, or one whose
+			 * snapshot the privacy eraser removed — falls through to the stored English.
+			 * An untranslated true sentence beats a translated guess.
+			 */
+			if ( 'reason' === $field ) {
+				$translated = ReasonText::for_code( ReasonText::code_for( $detail ) );
+
+				if ( '' !== $translated ) {
+					$value = $translated;
+				}
 			}
 
 			$class = 'failure_message' === $field ? ' class="extonify-wcep-failure"' : '';

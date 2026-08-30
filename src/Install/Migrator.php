@@ -313,8 +313,8 @@ class Migrator {
 			}
 
 			// --- columns, with the load-bearing types pinned -----------------
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- schema introspection of a plugin-owned table; {$table} is plugin-derived and SHOW COLUMNS takes no bindable parameters.
-			$columns = $wpdb->get_results( "SHOW COLUMNS FROM `{$table}`", ARRAY_A );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection of a plugin-owned table.
+			$columns = $wpdb->get_results( $wpdb->prepare( 'SHOW COLUMNS FROM %i', $table ), ARRAY_A );
 
 			$present = array();
 			foreach ( (array) $columns as $column ) {
@@ -350,8 +350,8 @@ class Migrator {
 			}
 
 			// --- indexes: exact name, ordered columns and uniqueness -----------
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- schema introspection of a plugin-owned table; {$table} is plugin-derived and SHOW INDEX takes no bindable parameters.
-			$rows = $wpdb->get_results( "SHOW INDEX FROM `{$table}`", ARRAY_A );
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- schema introspection of a plugin-owned table.
+			$rows = $wpdb->get_results( $wpdb->prepare( 'SHOW INDEX FROM %i', $table ), ARRAY_A );
 
 			// Rebuild each index from Seq_in_index so column ORDER is preserved.
 			$live = array();
@@ -557,6 +557,25 @@ class Migrator {
 	 * SILENTLY, so these follow its rules exactly: two spaces after
 	 * `PRIMARY KEY`, `KEY` rather than `INDEX`, lowercase column types, one
 	 * field per line, and a key name on every key.
+	 *
+	 * ⚠ THE ONLY PLACE IN THIS PLUGIN WHERE A TABLE NAME IS STILL INTERPOLATED, AND
+	 * `%i` GENUINELY CANNOT BE USED HERE — this is a specific reason, not the general
+	 * claim that "prepare() cannot bind identifiers", which WordPress 6.2 made false
+	 * and which this plugin's 6.6 floor puts well behind it. Everywhere else, the
+	 * identifier is bound with `%i`.
+	 *
+	 * `dbDelta()` does not execute what it is given. It PARSES the string: it splits
+	 * the input on `CREATE TABLE`, pulls the table name out with its own regular
+	 * expression, runs `DESCRIBE` and `SHOW INDEX` against that name, diffs the result
+	 * against the columns and keys it read out of the same string, and then issues
+	 * `ALTER TABLE` statements it composed itself. `$wpdb->prepare()` is never involved,
+	 * so a `%i` here would not be expanded — it would be taken literally as the table's
+	 * NAME, and `dbDelta()` would go looking for a table called `%i`.
+	 *
+	 * The names are safe by construction rather than by escaping: `self::table()` is
+	 * `$wpdb->prefix` plus one of three hardcoded literals, and the three call sites
+	 * directly above pass those literals. No caller-supplied value can reach this
+	 * string.
 	 *
 	 * @return string[]
 	 */

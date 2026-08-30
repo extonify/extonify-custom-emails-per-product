@@ -347,6 +347,26 @@ class ItemResolver {
 	 * for every product type rather than only variations, so the plugin does
 	 * not depend on which store threw today.
 	 *
+	 * ⚠ AND THE READ FLAG IS NOT ENOUGH AT THE DECLARED FLOOR. Measured directly on
+	 * both corners of the ADR-0006 matrix, after `delete( true )` on the PARENT of a
+	 * variation that an order still holds:
+	 *
+	 * |                                    | WC 9.6.0        | WC 11.0.1 |
+	 * |------------------------------------|-----------------|-----------|
+	 * | variation post survives the cascade | **yes**        | no        |
+	 * | `wc_get_product( $variation_id )`   | `WC_Product_Variation` | `false` |
+	 * | `get_object_read()`                 | **`true`**     | —         |
+	 * | `get_parent_id()`                   | **`0`**        | —         |
+	 * | `get_name()`                        | **`''`**       | —         |
+	 *
+	 * So at 9.6 the object passes every CRUD-level test and is still hollow, and the
+	 * plugin treated it as an ordinary variation that matched nothing — a delivery
+	 * about a product whose name renders empty, which is the silent miss again.
+	 * `self::is_orphaned_variation()` is the extra test, and it is a statement about
+	 * the DATA rather than about a WooCommerce version: a `WC_Product_Variation` with
+	 * no parent is not a product anyone can have bought. That makes ADR-0011 §4's
+	 * contract true at the floor instead of only at the current release.
+	 *
 	 * @param int $product_id Product or variation id.
 	 * @return \WC_Product|null Null when the product no longer exists.
 	 */
@@ -356,11 +376,34 @@ class ItemResolver {
 
 			$loaded = $product instanceof \WC_Product
 				&& $product->get_id() > 0
-				&& $product->get_object_read();
+				&& $product->get_object_read()
+				&& ! self::is_orphaned_variation( $product );
 
 			$this->products[ $product_id ] = $loaded ? $product : false;
 		}
 
 		return false === $this->products[ $product_id ] ? null : $this->products[ $product_id ];
+	}
+
+	/**
+	 * Whether a loaded object is a variation that has lost its parent.
+	 *
+	 * ⚠ NARROW ON PURPOSE. It fires only for `WC_Product_Variation`, and only when
+	 * the parent id is absent — the one shape a healthy variation can never have,
+	 * because a variation exists as a child of a variable product by definition.
+	 * A simple product legitimately has `parent_id === 0`, so widening this to every
+	 * product type would make the resolver refuse the entire catalogue.
+	 *
+	 * ⚠ IT IS NOT A DELETION TEST. It says the object in hand cannot answer the
+	 * questions targeting asks of it — the type slug, the flags, the terms all come
+	 * through a parent that is not there — which is the same conclusion whether the
+	 * parent was deleted, the row was truncated by an import, or a data store failed
+	 * half way. `product_unavailable` is the honest answer to all three.
+	 *
+	 * @param \WC_Product $product A product whose CRUD read completed.
+	 * @return bool
+	 */
+	private static function is_orphaned_variation( \WC_Product $product ): bool {
+		return $product instanceof \WC_Product_Variation && (int) $product->get_parent_id() <= 0;
 	}
 }

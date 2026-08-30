@@ -492,6 +492,26 @@ final class MatchingTargetingTest extends MatchingTestCase {
 	 * does, so the factory hands back a hollow WC_Product_Variation. Believing
 	 * it would report a deleted variation as one that simply matched nothing.
 	 *
+	 * ⚠ THE PIN BELOW USED TO ENCODE ONE WooCommerce RELEASE'S SHAPE AND FAILED AT
+	 * THE DECLARED FLOOR (Prompt 13A item 5a). Measured on both corners after
+	 * `delete( true )` on the parent:
+	 *
+	 * |                                  | WC 9.6.0                | WC 11.0.1 |
+	 * |----------------------------------|-------------------------|-----------|
+	 * | variation post survives          | **yes**                 | no        |
+	 * | `wc_get_product( $variation_id )`| `WC_Product_Variation`  | `false`   |
+	 * | `get_object_read()`              | **`true`**              | —         |
+	 * | `get_parent_id()`                | **`0`**                 | —         |
+	 *
+	 * So the old pin — "it constructs, and `get_object_read()` is false" — was true
+	 * at 11.0.1 and false at 9.6, and the PLUGIN was wrong at 9.6 as well: it took
+	 * the hollow object at face value. `ItemResolver` now also refuses a variation
+	 * with no parent, and the pin asserts what BOTH corners have in common: whatever
+	 * WooCommerce hands back must be recognisable as unusable by at least one of the
+	 * two signals. That is still a tripwire — a release where a deleted variation
+	 * loads as a complete, parented product fails it — without asserting that one
+	 * version's answer is the only answer.
+	 *
 	 * @return void
 	 */
 	public function test_deleted_variation_yields_product_unavailable() {
@@ -504,11 +524,21 @@ final class MatchingTargetingTest extends MatchingTestCase {
 
 		wc_get_product( $variable['parent'] )->delete( true );
 
-		// Pin the WooCommerce behaviour this test exists for: the object still
-		// constructs, and only the read flag reveals that it is hollow.
 		$hollow = wc_get_product( $variation_id );
-		$this->assertInstanceOf( \WC_Product_Variation::class, $hollow, 'WooCommerce changed: a deleted variation no longer constructs.' );
-		$this->assertFalse( $hollow->get_object_read(), 'WooCommerce changed: a deleted variation now reports itself as read.' );
+
+		if ( false !== $hollow ) {
+			$this->assertInstanceOf(
+				\WC_Product_Variation::class,
+				$hollow,
+				'WooCommerce returned something other than a variation for a deleted variation id.'
+			);
+
+			$this->assertTrue(
+				! $hollow->get_object_read() || (int) $hollow->get_parent_id() <= 0,
+				'⚠ WooCommerce changed: a deleted variation now loads as a fully read, parented product, so '
+					. 'neither signal ItemResolver relies on can tell it apart from a live one.'
+			);
+		}
 
 		$result = $this->matcher()->evaluate( wc_get_order( $order->get_id() ), $this->completed() );
 

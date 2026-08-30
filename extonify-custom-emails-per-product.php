@@ -1,20 +1,18 @@
 <?php
 /**
  * Plugin Name: Extonify Custom Emails Per Product for WooCommerce
- * Plugin URI: https://extonify.com/custom-emails-per-product-for-woocommerce
  * Description: Send custom WooCommerce emails per product — either inserted into a native WooCommerce email or delivered as a separate message.
  * Version: 1.0.0
  * Author: Extonify
- * Author URI: https://extonify.com
  * Text Domain: extonify-custom-emails-per-product
  * Domain Path: /languages
  * License: GPLv2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
- * Requires at least: 6.5
+ * Requires at least: 6.6
  * Requires PHP: 8.0
  * Requires Plugins: woocommerce
- * WC requires at least: 8.2
- * WC tested up to: 10.9.4
+ * WC requires at least: 9.6
+ * WC tested up to: 11.0.1
  *
  * @package Extonify\WCEP
  *
@@ -30,19 +28,31 @@ define( 'EXTONIFY_WCEP_DIR', __DIR__ );
 define( 'EXTONIFY_WCEP_URL', plugin_dir_url( __FILE__ ) );
 define( 'EXTONIFY_WCEP_VERSION', '1.0.0' );
 define( 'EXTONIFY_WCEP_MIN_PHP', '8.0' );
-define( 'EXTONIFY_WCEP_MIN_WP', '6.5' );
+define( 'EXTONIFY_WCEP_MIN_WP', '6.6' );
 
 /**
  * Minimum supported WooCommerce version.
  *
- * ADR-0006: this floor is PROVISIONAL. POC-E recommended 8.2 from a SINGLE
- * runtime observation (HPOS on, email_improvements on, block editor off) and
- * the ADR forbids advertising a tested compatibility claim until the release
- * matrix runs. It is a single named constant precisely so the matrix outcome —
- * including the open option to align with the sibling Extonify Address Book
- * plugin's floor — is a one-line change here.
+ * ADR-0006: SETTLED at 9.6 by the Prompt 13 release matrix, replacing POC-E's
+ * provisional 8.2.
+ *
+ * ⚠ 9.6 IS A HARD FLOOR, NOT A CAUTIOUS ONE. `WC_Email::$placeholders` is
+ * `protected` up to WooCommerce 9.5 and `public` from 9.6, and
+ * `Delivery\RulePreview::render_insert()` reads and writes it on the live
+ * registered native email object. Below 9.6 that access throws, and previewing an
+ * insert-mode rule refuses with `render_failed`. Verified by running the suite at
+ * WooCommerce 8.9.0, not by reading source. Delivery is unaffected — the property
+ * is touched in that one file only — but a refusing screen is not a feature this
+ * plugin may claim.
+ *
+ * It is also the version at which core's own email preview (`EmailPreview`,
+ * `woocommerce_is_email_preview`) appears, which is not a coincidence: making the
+ * property public is what core needed for it.
+ *
+ * ⚠ Raising this constant is not sufficient on its own — WooCommerce 9.6 requires
+ * WordPress 6.6, which is why EXTONIFY_WCEP_MIN_WP moved with it.
  */
-define( 'EXTONIFY_WCEP_MIN_WC', '8.2' );
+define( 'EXTONIFY_WCEP_MIN_WC', '9.6' );
 
 /**
  * Print an admin error notice. Dismissible, translated, escaped, never fatal.

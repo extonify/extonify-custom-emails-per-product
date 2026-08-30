@@ -13,6 +13,7 @@ use Extonify\WCEP\Domain\Json;
 use Extonify\WCEP\Domain\RecipientsDocument;
 use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
+use Extonify\WCEP\Email\NativeEmailTargets;
 use Extonify\WCEP\Install\Migrator;
 
 defined( 'ABSPATH' ) || exit;
@@ -81,6 +82,12 @@ class RuleRepository {
 	 * An insert rule left `native_email_id` empty, so it targets no email at all.
 	 */
 	const REFUSED_REQUIRED_FOR_INSERT = 'required_for_insert';
+
+	/**
+	 * The named email is registered, but it never renders order details, so insert
+	 * mode can never reach it (ADR-0013 §2a).
+	 */
+	const REFUSED_NO_ORDER_DETAILS = 'no_order_details';
 
 	/**
 	 * The named WooCommerce email is not one this store has.
@@ -332,8 +339,7 @@ class RuleRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key read of the plugin-owned rules table.
 		$row = $wpdb->get_row(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $rule_id ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE id = %d', $table, $rule_id ),
 			ARRAY_A
 		);
 
@@ -386,8 +392,8 @@ class RuleRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- batched label read of the plugin-owned rules table for one admin page render.
 			$rows = $wpdb->get_results(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "SELECT id, name FROM {$table} WHERE id IN ( {$placeholders} )", $chunk ),
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT id, name FROM %i WHERE id IN ( {$placeholders} )", array_merge( array( $table ), $chunk ) ),
 				ARRAY_A
 			);
 
@@ -422,8 +428,7 @@ class RuleRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- two-column read of the plugin-owned rules table for one admin filter control.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier; the ORDER BY names a hardcoded column and the limit is bound.
-			$wpdb->prepare( "SELECT id, name FROM {$table} ORDER BY name ASC, id ASC LIMIT %d", max( 1, $limit ) ),
+			$wpdb->prepare( 'SELECT id, name FROM %i ORDER BY name ASC, id ASC LIMIT %d', $table, max( 1, $limit ) ),
 			ARRAY_A
 		);
 
@@ -470,8 +475,8 @@ class RuleRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned rules table.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; an identifier cannot be bound by prepare().
-				"SELECT * FROM {$table} WHERE status = %s AND trigger_type = %s AND trigger_value = %s ORDER BY priority ASC, id ASC",
+				'SELECT * FROM %i WHERE status = %s AND trigger_type = %s AND trigger_value = %s ORDER BY priority ASC, id ASC',
+				$table,
 				'active',
 				$trigger['type'],
 				$trigger['value']
@@ -547,11 +552,11 @@ class RuleRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned rules table.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; an identifier cannot be bound by prepare().
-				"SELECT * FROM {$table}
+				'SELECT * FROM %i
 				WHERE status = %s AND delivery_mode = %s AND native_email_id = %s
 					AND delay_seconds = %d AND consolidation = %s
-				ORDER BY priority ASC, id ASC",
+				ORDER BY priority ASC, id ASC',
+				$table,
 				'active',
 				'insert',
 				$native_email_id,
@@ -801,6 +806,27 @@ class RuleRepository {
 			return self::refusal( 'native_email_id', self::REFUSED_UNREGISTERED );
 		}
 
+		/*
+		 * ⚠ REGISTERED IS NOT THE SAME AS REACHABLE (ADR-0013 §2a, Prompt 13C Part M).
+		 * `customer_new_account`, `customer_reset_password`, `customer_verify_email` and
+		 * `admin_payment_gateway_enabled` are all real, registered, sending emails whose
+		 * templates never fire `woocommerce_email_order_details` — the ONE action
+		 * `Render\RenderEvents` binds. A rule pointed at one of them opens no frame, so
+		 * it evaluates nothing, records nothing and sends nothing, and there is no
+		 * delivery row anywhere to explain the silence. The editor no longer offers
+		 * them; this is the same answer at the WRITE BOUNDARY, for the import, the
+		 * WP-CLI call and the direct SQL edit that never saw the editor.
+		 *
+		 * ⚠ AND IT IS CAPABILITY-DETECTED LIKE THE CHECK ABOVE IT. When the mailer has
+		 * not booted, `NativeEmailTargets` classifies nothing, every id reads `unknown`
+		 * and this refuses nothing — because ADR-0013 §2 already settled that refusing a
+		 * valid rule for want of a booted mailer is the worse failure. An email it
+		 * cannot classify is likewise never refused: the editor warns instead.
+		 */
+		if ( NativeEmailTargets::cannot_render( $native ) ) {
+			return self::refusal( 'native_email_id', self::REFUSED_NO_ORDER_DETAILS );
+		}
+
 		return array();
 	}
 
@@ -970,8 +996,7 @@ class RuleRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- listing read of the plugin-owned rules table.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} ORDER BY id DESC LIMIT %d OFFSET %d", max( 1, $limit ), max( 0, $offset ) ),
+			$wpdb->prepare( 'SELECT * FROM %i ORDER BY id DESC LIMIT %d OFFSET %d', $table, max( 1, $limit ), max( 0, $offset ) ),
 			ARRAY_A
 		);
 
@@ -1025,13 +1050,25 @@ class RuleRepository {
 		$limit  = max( 1, (int) ( $args['limit'] ?? 20 ) );
 		$offset = max( 0, (int) ( $args['offset'] ?? 0 ) );
 
-		$sql = "SELECT * FROM {$table} {$where['sql']} ORDER BY {$orderby} {$order}, id {$order} LIMIT %d OFFSET %d";
+		/*
+		 * ⚠ THE ORDER-BY COLUMN IS AN IDENTIFIER TOO, AND `%i` BINDS IT (Prompt 13A
+		 * item 6). It was already allowlisted through `self::ORDERABLE_COLUMNS`, so
+		 * nothing was reachable — but "allowlisted" is a property of the code around
+		 * the statement and `%i` is a property of the statement itself, which is the
+		 * stronger of the two and costs nothing here.
+		 *
+		 * The DIRECTION stays interpolated because it is not an identifier: `%i` would
+		 * render `ASC` as `` `ASC` `` and MySQL would reject it. It is one of two
+		 * literals chosen by a comparison directly above, which is the whole of its
+		 * input space.
+		 */
+		$sql = "SELECT * FROM %i {$where['sql']} ORDER BY %i {$order}, id {$order} LIMIT %d OFFSET %d";
 
-		$params = array_merge( $where['params'], array( $limit, $offset ) );
+		$params = array_merge( array( $table ), $where['params'], array( $orderby, $limit, $offset ) );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- paged listing read of the plugin-owned rules table.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table}, {$orderby} and {$order} are plugin-derived identifiers from self::ORDERABLE_COLUMNS and a two-literal direction; every VALUE is bound through $params.
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- the table AND the ORDER BY column are bound as identifiers with %i; {$order} is one of two literals chosen above; {$where['sql']} is built from the filter allowlist; every VALUE is bound through $params.
 			$wpdb->prepare( $sql, $params ),
 			ARRAY_A
 		);
@@ -1055,16 +1092,17 @@ class RuleRepository {
 
 		$where = $this->where_clause( $args );
 
-		// A no-filter count carries no values at all, and prepare() with an empty
-		// argument list is a deprecation rather than a no-op — so the unfiltered
-		// clause, which is a constant plus a plugin-derived identifier, is issued
-		// directly and the filtered one is always bound.
-		$sql = "SELECT COUNT(*) FROM {$table} {$where['sql']}";
+		/*
+		 * ⚠ ALWAYS PREPARED NOW, AND `%i` IS WHY. A no-filter count used to carry no
+		 * values at all, and `prepare()` with an empty argument list is a deprecation
+		 * rather than a no-op — so the unfiltered form was issued unprepared. Binding
+		 * the table as an IDENTIFIER gives every form of this statement at least one
+		 * placeholder, so the branch, and the unprepared path with it, is gone.
+		 */
+		$sql = "SELECT COUNT(*) FROM %i {$where['sql']}";
 
-		if ( array() !== $where['params'] ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$table} is a plugin-derived identifier; every value is bound through $params.
-			$sql = $wpdb->prepare( $sql, $where['params'] );
-		}
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$where['sql']} is built from the filter allowlist above; every value is bound through $params, and the table is bound as an identifier with %i.
+		$sql = $wpdb->prepare( $sql, array_merge( array( $table ), $where['params'] ) );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- count for the pager over the plugin-owned rules table; see above.
 		return (int) $wpdb->get_var( $sql );

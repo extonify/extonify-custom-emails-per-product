@@ -54,12 +54,18 @@ final class DeliveryHistory {
 
 		echo '<div class="wrap extonify-wcep extonify-wcep-history">';
 
-		echo '<h1 class="wp-heading-inline">' . esc_html__( 'Custom Email History', 'extonify-custom-emails-per-product' ) . '</h1>';
-
-		echo '<a href="' . esc_url( Menu::url() ) . '" class="page-title-action">'
-			. esc_html__( 'Manage rules', 'extonify-custom-emails-per-product' ) . '</a>';
+		echo '<h1 class="wp-heading-inline">' . esc_html__( 'Delivery History', 'extonify-custom-emails-per-product' ) . '</h1>';
 
 		echo '<hr class="wp-header-end" />';
+
+		/*
+		 * ⚠ THE "Manage rules" BUTTON WENT WITH THE SUBMENU ROW (ADR-0018 §1a). It
+		 * existed because this screen was a sibling row with no other way back to the
+		 * rules list. The `Rules` tab below is that way back, and is where a merchant
+		 * now looks for it; keeping both would give one destination two controls a few
+		 * pixels apart.
+		 */
+		Tabs::render( Menu::HISTORY_PAGE );
 
 		// The outcome of a manual action that redirected back here (ADR-0019 §6).
 		Notices::render_request_notice();

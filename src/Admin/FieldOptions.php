@@ -11,6 +11,7 @@ use Extonify\WCEP\Delivery\Consolidation;
 use Extonify\WCEP\Domain\Recipient;
 use Extonify\WCEP\Domain\Targeting;
 use Extonify\WCEP\Domain\TriggerEvent;
+use Extonify\WCEP\Email\NativeEmailTargets;
 use Extonify\WCEP\Matching\OrderStatuses;
 use Extonify\WCEP\Render\Injector;
 use Extonify\WCEP\Repository\DeliveryDetailRepository;
@@ -151,9 +152,47 @@ final class FieldOptions {
 	 * WooCommerce had not booted yet would be a worse failure than an empty select
 	 * whose stored value is preserved.
 	 *
+	 * ⚠ ONLY THE EMAILS AN INSERT RULE CAN ACTUALLY REACH (ADR-0013 §2a, Prompt 13C
+	 * Part M). An email whose template never fires `woocommerce_email_order_details`
+	 * opens no render frame, so a rule pointed at it evaluates nothing, records
+	 * nothing and sends nothing — with no delivery row and no notice anywhere to
+	 * explain the silence. This method used to return every registered email, which
+	 * is how the editor came to offer `customer_new_account`, `customer_reset_password`,
+	 * `customer_verify_email`, `admin_payment_gateway_enabled` and this plugin's own
+	 * `extonify_wcep_custom` as targets that can never fire.
+	 * `NativeEmailTargets` decides by reading the template each email actually renders
+	 * through, and anything it CANNOT classify is offered with a warning rather than
+	 * hidden.
+	 *
 	 * @return array<string,string>
 	 */
 	public static function native_emails(): array {
+		$out = array();
+
+		foreach ( self::native_email_titles() as $id => $title ) {
+			if ( ! NativeEmailTargets::cannot_render( $id ) ) {
+				$out[ $id ] = $title;
+			}
+		}
+
+		return $out;
+	}
+
+	/**
+	 * EVERY registered WooCommerce email, id => title, whether or not an insert rule
+	 * can reach it.
+	 *
+	 * ⚠ THIS IS THE DISPLAY MAP AND self::native_emails() IS THE CHOICE. They were one
+	 * method until Prompt 13C Part M, and merging the two questions is exactly how the
+	 * editor came to offer targets that can never fire. Split, both answers stay
+	 * honest: the dropdown offers only what can work, while the rules list can still
+	 * put a human name on a stored rule whose target has since become unusable — where
+	 * falling back to a raw id would read like corruption rather than like a
+	 * misconfiguration the merchant can fix.
+	 *
+	 * @return array<string,string> Email id => human title, sorted by id.
+	 */
+	public static function native_email_titles(): array {
 		if ( ! function_exists( 'WC' ) || ! is_object( WC()->mailer() ) ) {
 			return array();
 		}
@@ -329,10 +368,36 @@ final class FieldOptions {
 	/**
 	 * Delay units => seconds in one unit.
 	 *
+	 * ⚠ `seconds` IS IN THIS LIST BECAUSE THE STORAGE LAYER CAN PRODUCE IT, NOT
+	 * BECAUSE ANYONE WANTED A SECONDS CONTROL. `delay_seconds` is an arbitrary
+	 * non-negative integer, and `RuleFormInput::from_rule()` falls back to `seconds`
+	 * for any value no larger unit divides exactly. While this vocabulary stopped at
+	 * `minutes`, that fallback named a unit the `<select>` did not offer: the browser
+	 * selected the first option instead, and an unrelated save rewrote 90 SECONDS as
+	 * 90 MINUTES — 5,400 seconds.
+	 *
+	 * ⚠ THAT WAS NOT COSMETIC, AND THE COST LANDED ON A CUSTOMER. ADR-0015 §4
+	 * re-validates that a queued delivery's delay is unchanged, so the rewritten value
+	 * CANCELS an already-queued delivery; ADR-0015 §1a then makes its identity
+	 * permanently consumed. A legitimate customer email is silently lost and can never
+	 * be re-sent automatically. A sub-minute delay cannot be produced by the editor —
+	 * it arrives by import, WP-CLI or direct SQL — but "the UI cannot create it" is not
+	 * "the UI may destroy it".
+	 *
+	 * THE INVARIANT THIS RESTORES: every value `delay_seconds` can hold survives a
+	 * load-edit-save cycle byte-identically, because the unit the editor falls back to
+	 * is always a unit the editor offers. `DelayVocabularyTest` asserts the round trip
+	 * over a corpus of 30, 59, 61, 90, 120, 3600 and 604800 seconds.
+	 *
 	 * @return array<string,int>
 	 */
 	public static function delay_units(): array {
 		return array(
+			// Smallest first, so `from_rule()`'s `array_reverse()` still walks from
+			// the LARGEST unit down and 604800 reads "7 days" rather than "7 weeks
+			// of seconds". `seconds` is therefore the last candidate, and it always
+			// divides — which is exactly what makes the fallback total.
+			'seconds' => 1,
 			'minutes' => MINUTE_IN_SECONDS,
 			'hours'   => HOUR_IN_SECONDS,
 			'days'    => DAY_IN_SECONDS,
@@ -346,6 +411,7 @@ final class FieldOptions {
 	 */
 	public static function delay_unit_labels(): array {
 		return array(
+			'seconds' => __( 'seconds', 'extonify-custom-emails-per-product' ),
 			'minutes' => __( 'minutes', 'extonify-custom-emails-per-product' ),
 			'hours'   => __( 'hours', 'extonify-custom-emails-per-product' ),
 			'days'    => __( 'days', 'extonify-custom-emails-per-product' ),

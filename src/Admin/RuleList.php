@@ -52,12 +52,14 @@ final class RuleList {
 
 		echo '<div class="wrap extonify-wcep">';
 
-		echo '<h1 class="wp-heading-inline">' . esc_html__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ) . '</h1>';
+		echo '<h1 class="wp-heading-inline">' . esc_html__( 'Email Rules', 'extonify-custom-emails-per-product' ) . '</h1>';
 
 		echo '<a href="' . esc_url( Menu::url( array( 'action' => Menu::ACTION_NEW ) ) ) . '" class="page-title-action">'
-			. esc_html__( 'Add rule', 'extonify-custom-emails-per-product' ) . '</a>';
+			. esc_html__( 'Add Email Rule', 'extonify-custom-emails-per-product' ) . '</a>';
 
 		echo '<hr class="wp-header-end" />';
+
+		Tabs::render( Menu::PAGE );
 
 		Notices::render_request_notice();
 

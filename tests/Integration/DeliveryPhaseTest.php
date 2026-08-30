@@ -488,7 +488,9 @@ final class DeliveryPhaseTest extends DeliveryTestCase {
 				return $query;
 			}
 
-			if ( 1 === preg_match( '/SELECT \* FROM \S*extonify_wcep_rules WHERE status/i', (string) $query ) ) {
+			// The backticks are optional: `%i` renders a backticked identifier, the old
+			// interpolation rendered a bare one (Prompt 13A item 6).
+			if ( 1 === preg_match( '/SELECT \* FROM `?\S*extonify_wcep_rules`? WHERE status/i', (string) $query ) ) {
 				$armed = true;
 			}
 

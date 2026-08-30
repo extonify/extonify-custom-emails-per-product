@@ -1,0 +1,1862 @@
+# Copyright (C) 2026 Extonify
+# This file is distributed under the GPLv2 or later.
+msgid ""
+msgstr ""
+"Project-Id-Version: Extonify Custom Emails Per Product for WooCommerce 1.0.0\n"
+"Report-Msgid-Bugs-To: https://extonify.com/custom-emails-per-product-for-woocommerce\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"POT-Creation-Date: 2026-08-27T00:57:12+00:00\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"X-Generator: WP-CLI 2.12.0\n"
+"X-Domain: extonify-custom-emails-per-product\n"
+
+#. Plugin Name of the plugin
+#: extonify-custom-emails-per-product.php
+#: extonify-custom-emails-per-product.php:66
+#: src/Plugin.php:288
+#: src/Plugin.php:326
+msgid "Extonify Custom Emails Per Product for WooCommerce"
+msgstr ""
+
+#. Description of the plugin
+#: extonify-custom-emails-per-product.php
+msgid "Send custom WooCommerce emails per product — either inserted into a native WooCommerce email or delivered as a separate message."
+msgstr ""
+
+#. Author of the plugin
+#: extonify-custom-emails-per-product.php
+msgid "Extonify"
+msgstr ""
+
+#: extonify-custom-emails-per-product.php:103
+msgid "does not support network activation in this version. Please network-deactivate it and activate it individually on each site that needs custom product emails. No data was created or modified."
+msgstr ""
+
+#. translators: 1: required PHP version, 2: current PHP version.
+#: extonify-custom-emails-per-product.php:113
+#, php-format
+msgid "requires PHP %1$s or newer. This site runs PHP %2$s. The plugin is inactive until PHP is updated."
+msgstr ""
+
+#: extonify-custom-emails-per-product.php:124
+msgid "is missing its built files (vendor/autoload.php). Please install a release build, or run \"composer install\" in the plugin directory."
+msgstr ""
+
+#: src/Admin/Assets.php:163
+msgid "Searching…"
+msgstr ""
+
+#: src/Admin/Assets.php:164
+msgid "Nothing found."
+msgstr ""
+
+#: src/Admin/Assets.php:165
+msgid "The search could not be completed. Try again."
+msgstr ""
+
+#: src/Admin/Assets.php:166
+msgid "Already added."
+msgstr ""
+
+#: src/Admin/Assets.php:167
+msgid "Added."
+msgstr ""
+
+#: src/Admin/Assets.php:168
+msgid "Removed."
+msgstr ""
+
+#. translators: %d: WooCommerce order id.
+#: src/Admin/DeliveriesListTable.php:106
+#: src/Admin/DeliveryConfirm.php:93
+#: src/Admin/PlaceholderReference.php:94
+#: src/Admin/RulePreviewScreen.php:162
+#: src/Privacy/Exporter.php:322
+msgid "Order"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:107
+#: src/Admin/DeliveryConfirm.php:91
+#: src/Admin/OrderPanel.php:355
+msgid "Rule"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:108
+#: src/Admin/Notices.php:335
+#: src/Admin/OrderPanel.php:356
+#: src/Admin/RuleEditor.php:180
+#: src/Admin/RulesListTable.php:93
+#: src/Privacy/Exporter.php:166
+msgid "Status"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:109
+#: src/Admin/OrderPanel.php:357
+msgid "When"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:110
+#: src/Admin/OrderPanel.php:358
+msgid "Attempts"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:111
+#: src/Admin/OrderPanel.php:359
+msgid "Actions"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:160
+msgid "No deliveries match these filters."
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:164
+msgid "No custom product emails have been delivered yet. Deliveries appear here as soon as a rule sends one."
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:298
+msgid "Order id"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:302
+msgid "Filter by rule"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:303
+msgid "All rules"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:310
+#: src/Admin/RulesListTable.php:247
+msgid "Filter by status"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:311
+#: src/Admin/RulesListTable.php:247
+msgid "All statuses"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:318
+#: src/Admin/RulesListTable.php:249
+msgid "Filter by delivery mode"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:319
+#: src/Admin/RulesListTable.php:249
+msgid "All modes"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:324
+msgid "Delivered on or after"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:325
+msgid "Delivered on or before"
+msgstr ""
+
+#: src/Admin/DeliveriesListTable.php:327
+#: src/Admin/RulesListTable.php:251
+msgid "Filter"
+msgstr ""
+
+#. translators: %d: rule id.
+#: src/Admin/DeliveriesListTable.php:352
+#: src/Admin/OrderPanel.php:264
+#: src/Admin/RulesListTable.php:319
+#, php-format
+msgid "Rule #%d (no name)"
+msgstr ""
+
+#: src/Admin/DeliveryActions.php:154
+#: src/Admin/Notices.php:222
+msgid "You are not allowed to send custom product emails."
+msgstr ""
+
+#: src/Admin/DeliveryActions.php:158
+#: src/Admin/RuleActions.php:134
+msgid "Unknown action."
+msgstr ""
+
+#: src/Admin/DeliveryActions.php:164
+msgid "This action can only be run from its confirmation form."
+msgstr ""
+
+#: src/Admin/DeliveryActions.php:177
+msgid "This confirmation has expired. Open the delivery again and confirm once more."
+msgstr ""
+
+#. translators: %d: WooCommerce order id.
+#: src/Admin/DeliveryConfirm.php:93
+#: src/Admin/DeliveryPresenter.php:112
+#: src/Admin/RulePreviewScreen.php:164
+#, php-format
+msgid "Order #%d"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:136
+#: src/Admin/DeliveryPresenter.php:516
+msgid "Cancel"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:186
+msgid "Not named"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:197
+msgid "Will be sent to"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:203
+msgid "Nobody — this rule resolves to no deliverable address for this order, so nothing would be sent."
+msgstr ""
+
+#. translators: 1: recipient kind, e.g. "To", 2: one or more email addresses, comma-separated.
+#: src/Admin/DeliveryConfirm.php:213
+#: src/Admin/DeliveryPresenter.php:357
+#, php-format
+msgid "%1$s: %2$s"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:242
+msgid "This is a one-off send. It does not replace or switch off the rule's automatic delivery, so if the rule's trigger fires later this email is sent again, to the rule's own recipients."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:276
+msgid "This is a real email, and it goes to the address above. The rule's own recipients are not used at all — not its To, Cc or Bcc, and not the \"customer\" entry if it has one."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:277
+msgid "Its subject is marked as a test. It does not use up the rule's automatic delivery, so the rule still sends normally when its trigger fires."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:281
+msgid "The email will be rendered from this rule as it is now, and from the order as it is now — not as they were when the delivery first ran."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:286
+msgid "Cancelling is permanent. This rule will never send again for this order and this trigger, even if the same trigger fires a second time."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:290
+msgid "The remaining delay is skipped and the queued job is removed. The delivery still runs the checks it would have run later, so if the rule or the order has changed it may be cancelled instead of sent."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:294
+msgid "This rule is currently disabled. Sending it here does not enable it; it stays disabled for every other order."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:298
+msgid "This delivery was itself sent by hand rather than by the rule's trigger."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:312
+msgid "Resend this email?"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:313
+msgid "Send this email now?"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:314
+msgid "Cancel this scheduled email?"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:315
+msgid "Send this email for this order?"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:316
+msgid "Send a test of this email?"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:319
+#: src/Admin/DeliveryConfirm.php:355
+msgid "Confirm"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:330
+msgid "This sends the rule's email for this order again. Check who it is going to before you confirm."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:331
+msgid "This sends the scheduled email straight away instead of waiting for its delay."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:332
+msgid "This stops the scheduled email from being sent. Nothing is emailed to anyone."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:333
+msgid "This sends the rule's email for this order even though the rule has not fired for it."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:334
+msgid "This sends the rule's email to the address you chose, rendered from this order, so you can see how it arrives. Check the address before you confirm."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:348
+msgid "Resend the email"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:349
+msgid "Send it now"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:350
+msgid "Cancel the delivery"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:351
+msgid "Send the email"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:352
+msgid "Send the test"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:369
+msgid "This cannot be done"
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:375
+msgid "This action is not available for this delivery."
+msgstr ""
+
+#: src/Admin/DeliveryConfirm.php:379
+msgid "Back to the delivery history"
+msgstr ""
+
+#: src/Admin/DeliveryHistory.php:57
+#: src/Admin/Menu.php:231
+#: src/Admin/Menu.php:232
+#: src/Admin/Tabs.php:65
+msgid "Delivery History"
+msgstr ""
+
+#: src/Admin/DeliveryHistory.php:73
+msgid "Every custom product email this store has delivered, newest first. Sending, resending and cancelling are done from a delivery's own confirmation screen."
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:108
+msgid "No order recorded"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:144
+msgid "No rule recorded"
+msgstr ""
+
+#. translators: %d: rule id.
+#: src/Admin/DeliveryPresenter.php:148
+#, php-format
+msgid "Rule #%d"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:156
+msgid "This rule has been deleted."
+msgstr ""
+
+#. translators: %s: order status, as recorded on the delivery.
+#: src/Admin/DeliveryPresenter.php:194
+#, php-format
+msgid "Order reached %s"
+msgstr ""
+
+#. translators: 1: source order status, 2: destination order status.
+#: src/Admin/DeliveryPresenter.php:201
+#, php-format
+msgid "Order moved from %1$s to %2$s"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:208
+msgid "Order was refunded"
+msgstr ""
+
+#. translators: %s: WooCommerce email id the rule inserts into.
+#: src/Admin/DeliveryPresenter.php:213
+#, php-format
+msgid "Inside the WooCommerce email %s"
+msgstr ""
+
+#. translators: %s: a date and time.
+#: src/Admin/DeliveryPresenter.php:272
+#, php-format
+msgid "Last activity %s"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:300
+msgid "This delivery was recorded, but its details have been removed. See the retention note below."
+msgstr ""
+
+#. translators: 1: attempt number, 2: how the attempt was made, e.g. "Automatic", 3: what happened, e.g. "Sent".
+#: src/Admin/DeliveryPresenter.php:329
+#, php-format
+msgid "Attempt %1$d — %2$s — %3$s"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:344
+msgid "The details of this attempt were removed in response to a personal-data erasure request. The delivery itself is unchanged."
+msgstr ""
+
+#. translators: %s: an email subject line.
+#: src/Admin/DeliveryPresenter.php:390
+#, php-format
+msgid "Subject: %s"
+msgstr ""
+
+#. translators: %s: why the delivery ended the way it did.
+#: src/Admin/DeliveryPresenter.php:392
+#, php-format
+msgid "Reason: %s"
+msgstr ""
+
+#. translators: %s: the failure detail the mail server reported.
+#: src/Admin/DeliveryPresenter.php:394
+#, php-format
+msgid "Failure: %s"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:510
+msgid "Send now"
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:523
+#: src/Admin/FieldOptions.php:352
+msgid "Resend"
+msgstr ""
+
+#. translators: 1: days a normal delivery's details are kept, 2: days a failed delivery's are kept, 3: days a debug entry's are kept.
+#: src/Admin/DeliveryPresenter.php:568
+#, php-format
+msgid "Delivery details are kept for %1$d days, or %2$d days for a failed delivery, and %3$d days for debug entries."
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:575
+msgid "Automatic clearing is not scheduled yet, so details are currently removed only by a personal-data erasure request."
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:577
+msgid "The record that a delivery happened is always kept, so the same automatic email is never sent twice for one order."
+msgstr ""
+
+#: src/Admin/DeliveryPresenter.php:625
+msgid "Not recorded"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:63
+msgid "Send as a separate email"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:64
+msgid "Insert into a WooCommerce email"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:78
+msgid "Order reaches a status"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:79
+msgid "Order moves between two statuses"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:80
+#: src/Admin/RulesListTable.php:422
+msgid "Order is refunded"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:94
+msgid "One email for the whole order"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:95
+msgid "One email per matched product"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:109
+msgid "Before the order table"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:110
+msgid "After the order table"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:111
+msgid "With the order details"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:112
+msgid "With the customer details"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:113
+msgid "Beside each matched product"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:248
+msgid "Virtual (any type)"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:249
+msgid "Downloadable (any type)"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:264
+msgid "Variations"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:265
+msgid "Products"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:266
+msgid "Categories"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:267
+msgid "Tags"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:268
+msgid "Product types"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:280
+msgid "To"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:281
+msgid "Cc"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:282
+msgid "Bcc"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:307
+msgid "In progress"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:308
+#: src/Admin/FieldOptions.php:329
+msgid "Scheduled"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:309
+msgid "Sending now"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:310
+#: src/Admin/FieldOptions.php:330
+msgid "Sent"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:311
+#: src/Admin/FieldOptions.php:331
+msgid "Failed"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:312
+#: src/Admin/FieldOptions.php:332
+msgid "Cancelled"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:313
+#: src/Admin/FieldOptions.php:333
+msgid "Skipped"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:314
+#: src/Admin/FieldOptions.php:335
+msgid "Outcome unknown"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:315
+#: src/Admin/FieldOptions.php:336
+msgid "Not sent"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:334
+msgid "Suppressed as a duplicate"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:350
+msgid "Automatic"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:351
+msgid "Sent by hand"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:353
+msgid "Test"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:354
+msgid "Debug"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:414
+msgid "seconds"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:415
+msgid "minutes"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:416
+msgid "hours"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:417
+msgid "days"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:429
+msgid "Active"
+msgstr ""
+
+#: src/Admin/FieldOptions.php:430
+msgid "Inactive"
+msgstr ""
+
+#: src/Admin/Menu.php:160
+msgid "Settings"
+msgstr ""
+
+#: src/Admin/Menu.php:174
+#: src/Admin/Menu.php:175
+#: src/Admin/Menu.php:465
+#: src/Admin/Menu.php:482
+msgid "Product Emails"
+msgstr ""
+
+#: src/Admin/Menu.php:464
+#: src/Admin/RuleActions.php:126
+msgid "You are not allowed to manage custom product emails."
+msgstr ""
+
+#. translators: 1: how many messages were sent, 2: how many were attempted.
+#: src/Admin/Notices.php:100
+#, php-format
+msgid "Only some of this rule's emails were sent: %1$d of %2$d went out. This rule sends one email per matched product, and the rest failed or were skipped. Open the delivery in the history to see what happened to each one."
+msgstr ""
+
+#: src/Admin/Notices.php:140
+msgid "Rule created."
+msgstr ""
+
+#: src/Admin/Notices.php:141
+msgid "Rule saved."
+msgstr ""
+
+#: src/Admin/Notices.php:142
+msgid "Rule duplicated. The copy is inactive until you enable it."
+msgstr ""
+
+#: src/Admin/Notices.php:143
+msgid "Rule deleted."
+msgstr ""
+
+#: src/Admin/Notices.php:144
+msgid "Rule enabled."
+msgstr ""
+
+#: src/Admin/Notices.php:145
+msgid "Rule disabled."
+msgstr ""
+
+#: src/Admin/Notices.php:146
+#: src/Admin/RuleActions.php:160
+#: src/Admin/RuleEditor.php:68
+#: src/Admin/RulePreviewScreen.php:80
+msgid "That rule no longer exists."
+msgstr ""
+
+#: src/Admin/Notices.php:147
+msgid "The rule could not be deleted, so nothing was changed."
+msgstr ""
+
+#: src/Admin/Notices.php:148
+msgid "The rule could not be duplicated. Open it and check its settings — a setting this plugin no longer accepts stops the copy being created."
+msgstr ""
+
+#: src/Admin/Notices.php:149
+msgid "This rule could not be enabled or disabled because one of its settings is no longer accepted. Correct the setting below and save."
+msgstr ""
+
+#: src/Admin/Notices.php:167
+msgid "The email was resent. It was rendered from this rule as it is now, not as it was when the delivery first ran."
+msgstr ""
+
+#: src/Admin/Notices.php:168
+msgid "The email was sent. This was a one-off send and it does not replace the rule's automatic delivery, so it may be sent again, to the rule's own recipients, if the rule's trigger fires later."
+msgstr ""
+
+#: src/Admin/Notices.php:169
+msgid "The email was sent immediately and the scheduled job was removed."
+msgstr ""
+
+#: src/Admin/Notices.php:170
+msgid "The scheduled delivery was cancelled and its job removed. This rule will not send again for this order and trigger."
+msgstr ""
+
+#: src/Admin/Notices.php:175
+msgid "Nothing was sent. When the delivery ran it no longer passed the checks it makes before sending — most often because the rule or the order changed after it was scheduled. Open the delivery to see the recorded reason."
+msgstr ""
+
+#: src/Admin/Notices.php:176
+msgid "The delivery ran but did not send. Open it to see the recorded outcome."
+msgstr ""
+
+#: src/Admin/Notices.php:192
+msgid "Only some of this rule's emails were sent. This rule sends one email per matched product, and the rest failed or were skipped. Open the delivery in the history to see what happened to each one."
+msgstr ""
+
+#: src/Admin/Notices.php:193
+msgid "Nothing was sent. The delivery ran and the message did not go out — the mailer reported a failure, or the send raised an error. Open the delivery in the history for the recorded reason, and check the WooCommerce logs (source: extonify-wcep)."
+msgstr ""
+
+#: src/Admin/Notices.php:194
+msgid "Nothing was sent, because this delivery was deliberately skipped rather than attempted. Either another plugin declined it, or the rule resolved to no address this store can send to. Open the delivery in the history for the recorded reason."
+msgstr ""
+
+#: src/Admin/Notices.php:195
+msgid "Nothing was sent, and this delivery recorded no outcome at all. Open the delivery in the history, and check the WooCommerce logs (source: extonify-wcep)."
+msgstr ""
+
+#: src/Admin/Notices.php:198
+msgid "Nothing was sent, because this confirmation had already been used. Each confirmation runs once; open the delivery and confirm again if you meant to send a second email."
+msgstr ""
+
+#: src/Admin/Notices.php:207
+msgid "Nothing was sent. What this confirmation was for is no longer what would happen — the rule, the order or the addresses it would reach changed after the confirmation was opened. Open it again and check who it goes to before confirming."
+msgstr ""
+
+#: src/Admin/Notices.php:208
+msgid "Nothing was sent. The stored copy of what this scheduled delivery would send cannot be read, so there is no way to show you who it would reach. Cancel it and send the rule by hand instead."
+msgstr ""
+
+#: src/Admin/Notices.php:209
+msgid "This rule has been deleted, so there is no message left to send. A completed delivery does not keep a copy of what it sent."
+msgstr ""
+
+#: src/Admin/Notices.php:210
+msgid "This rule adds its content to a WooCommerce email rather than sending one of its own, so there is no message to send on its own. Resend the WooCommerce email instead."
+msgstr ""
+
+#: src/Admin/Notices.php:211
+msgid "This rule has a setting this plugin no longer accepts, so it cannot be delivered. Open the rule, correct the setting and save it first."
+msgstr ""
+
+#: src/Admin/Notices.php:212
+msgid "This delivery has not finished yet, so it cannot be resent. Wait for it to finish, or cancel it."
+msgstr ""
+
+#: src/Admin/Notices.php:213
+msgid "This delivery is no longer scheduled, so it cannot be sent early or cancelled. Something else has already run or cancelled it."
+msgstr ""
+
+#: src/Admin/Notices.php:214
+msgid "Nothing was sent, because this exact send had already been recorded. Reload the delivery history to see it."
+msgstr ""
+
+#: src/Admin/Notices.php:215
+msgid "That delivery no longer exists."
+msgstr ""
+
+#: src/Admin/Notices.php:216
+msgid "That order no longer exists, so there is nothing to send an email about."
+msgstr ""
+
+#: src/Admin/Notices.php:217
+msgid "Nothing on this order matches what this rule targets, so there is nothing to send about. Check the rule's products, categories and tags."
+msgstr ""
+
+#: src/Admin/Notices.php:218
+msgid "Nothing was changed, because something else was already running this delivery. Reload the delivery history to see what it did."
+msgstr ""
+
+#: src/Admin/Notices.php:219
+msgid "Nothing was sent and nothing was changed, because the delivery record could not be written. Check the WooCommerce logs (source: extonify-wcep) and try again."
+msgstr ""
+
+#: src/Admin/Notices.php:220
+msgid "Nothing was sent, because custom product emails are switched off in WooCommerce settings, or WooCommerce has not registered this plugin's email. Nothing was recorded against this order."
+msgstr ""
+
+#: src/Admin/Notices.php:221
+msgid "Nothing was sent, because this plugin's database tables are unavailable. Deactivate and reactivate the plugin, then try again."
+msgstr ""
+
+#: src/Admin/Notices.php:225
+msgid "The test email was sent to the address you chose. Its subject is marked as a test, and the rule's automatic delivery is untouched — it still sends normally when its trigger fires."
+msgstr ""
+
+#: src/Admin/Notices.php:226
+msgid "Nothing was sent, because that is not an email address this store can send to. Type a valid address, or leave the field empty to send the test to yourself."
+msgstr ""
+
+#: src/Admin/Notices.php:247
+msgid "This rule cannot be previewed, because this plugin's database tables are unavailable. Deactivate and reactivate the plugin, then try again."
+msgstr ""
+
+#: src/Admin/Notices.php:248
+msgid "That rule no longer exists, so there is nothing to preview."
+msgstr ""
+
+#: src/Admin/Notices.php:249
+msgid "This rule has a setting this plugin no longer accepts, so it could not be delivered and cannot be previewed. Open the rule, correct the setting and save it first."
+msgstr ""
+
+#: src/Admin/Notices.php:250
+msgid "That order does not exist. Type an order number from this store, or clear the field to use the most recent matching order."
+msgstr ""
+
+#: src/Admin/Notices.php:251
+msgid "This store has no orders yet, and a preview is rendered against a real one so that you see real customer and product values. Place a test order, then preview this rule against it."
+msgstr ""
+
+#: src/Admin/Notices.php:252
+msgid "The WooCommerce email this rule adds its content to is not one this store sends, so there is nothing to render it inside. Open the rule and choose an email from the list."
+msgstr ""
+
+#: src/Admin/Notices.php:253
+msgid "WooCommerce has not registered this plugin's email, so the store's email wrapper cannot be rendered around the preview. Check that WooCommerce is active and try again."
+msgstr ""
+
+#: src/Admin/Notices.php:254
+msgid "This rule could not be rendered. Something in the email templates or in another plugin raised an error part way through. Check the WooCommerce logs (source: extonify-wcep) for the details."
+msgstr ""
+
+#. translators: %s: the name of the field that was refused, e.g. "Status".
+#: src/Admin/Notices.php:272
+#, php-format
+msgid "%s was sent with a value this plugin does not accept, so nothing was saved. Choose one of the options offered."
+msgstr ""
+
+#. translators: %s: the name of the field that was refused.
+#: src/Admin/Notices.php:279
+#, php-format
+msgid "%s is not in a form this plugin can store, so nothing was saved. Correct it and save again."
+msgstr ""
+
+#. translators: %s: the name of the field that was refused, e.g. "Delay".
+#: src/Admin/Notices.php:286
+#, php-format
+msgid "%s cannot be used by a rule that adds its content to a WooCommerce email, so nothing was saved. Clear it, or send this rule as a separate email instead."
+msgstr ""
+
+#: src/Admin/Notices.php:291
+msgid "Choose which WooCommerce email this rule adds its content to. Nothing was saved."
+msgstr ""
+
+#: src/Admin/Notices.php:294
+msgid "The WooCommerce email this rule names is not one this store sends, so nothing was saved. Choose one from the list."
+msgstr ""
+
+#: src/Admin/Notices.php:297
+msgid "That WooCommerce email has no order details section, so there is nowhere in it for this rule's content to go and it would never appear. Nothing was saved. Choose an email that shows the order, or send this rule as a separate email instead."
+msgstr ""
+
+#: src/Admin/Notices.php:300
+msgid "Give this rule a name, so you can find it again in the list."
+msgstr ""
+
+#: src/Admin/Notices.php:303
+msgid "A delay cannot be negative. Use zero to send straight away."
+msgstr ""
+
+#: src/Admin/Notices.php:306
+msgid "Choose a unit for the delay."
+msgstr ""
+
+#: src/Admin/Notices.php:309
+msgid "The rule could not be saved, and nothing was changed. Check the WooCommerce logs (source: extonify-wcep) for details."
+msgstr ""
+
+#: src/Admin/Notices.php:324
+msgid "A setting on this rule"
+msgstr ""
+
+#: src/Admin/Notices.php:334
+#: src/Admin/RuleEditor.php:172
+#: src/Admin/RulesListTable.php:92
+msgid "Name"
+msgstr ""
+
+#: src/Admin/Notices.php:336
+#: src/Admin/RuleEditor.php:212
+#: src/Admin/RulesListTable.php:94
+msgid "Trigger"
+msgstr ""
+
+#: src/Admin/Notices.php:337
+msgid "Trigger details"
+msgstr ""
+
+#: src/Admin/Notices.php:338
+msgid "How this rule is delivered"
+msgstr ""
+
+#: src/Admin/Notices.php:339
+msgid "WooCommerce email"
+msgstr ""
+
+#: src/Admin/Notices.php:340
+msgid "Position in the email"
+msgstr ""
+
+#: src/Admin/Notices.php:341
+#: src/Admin/RulesListTable.php:97
+msgid "Delay"
+msgstr ""
+
+#: src/Admin/Notices.php:342
+msgid "How many emails"
+msgstr ""
+
+#: src/Admin/Notices.php:343
+#: src/Admin/RulePreviewScreen.php:254
+#: src/Privacy/Exporter.php:179
+msgid "Subject"
+msgstr ""
+
+#: src/Admin/Notices.php:344
+msgid "Heading"
+msgstr ""
+
+#: src/Admin/Notices.php:345
+msgid "Body"
+msgstr ""
+
+#: src/Admin/Notices.php:346
+#: src/Admin/RulesListTable.php:99
+msgid "Priority"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:106
+msgid "Custom product emails"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:179
+msgid "You are not allowed to view custom product email deliveries."
+msgstr ""
+
+#: src/Admin/OrderPanel.php:186
+msgid "This order has not been saved yet, so it has no delivery history."
+msgstr ""
+
+#: src/Admin/OrderPanel.php:199
+msgid "No custom emails have been sent for this order."
+msgstr ""
+
+#. translators: 1: how many deliveries are shown, 2: how many this order has in total.
+#: src/Admin/OrderPanel.php:213
+#, php-format
+msgid "Showing the %1$d most recent of %2$d delivery for this order."
+msgid_plural "Showing the %1$d most recent of %2$d deliveries for this order."
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/Admin/OrderPanel.php:227
+msgid "View this order in the full delivery history"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:273
+msgid "Send one of these emails for this order"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:282
+msgid "Choose which email to send"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:292
+msgid "Choose…"
+msgstr ""
+
+#: src/Admin/OrderPanel.php:297
+msgid "You will be shown who the email would go to, and asked to confirm, before anything is sent."
+msgstr ""
+
+#: src/Admin/OrderPanel.php:351
+msgid "Custom product emails sent for this order"
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:88
+msgid "Customer"
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:100
+msgid "Store"
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:106
+msgid "Matched products"
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:107
+msgid "A rule can match several products. The single-product placeholders below use the first one; the all-products placeholders use every one."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:115
+msgid "Custom fields"
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:116
+msgid "Replace \"key\" with the custom field name. Fields whose name starts with an underscore are private and are refused unless the site owner allows that field in code."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:174
+msgid "A custom field stored on the order."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:180
+msgid "A custom field stored on the matched order line — the first matched product, or the product beside it when the rule is placed beside each product."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:193
+msgid "Billing first name."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:194
+msgid "Billing last name."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:195
+msgid "Billing full name."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:196
+msgid "Billing email address."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:197
+msgid "Billing phone number."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:198
+msgid "The order's display number, not its internal ID."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:199
+msgid "Order date, in this store's date format."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:200
+msgid "Order status, by its readable name."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:201
+msgid "Order total, in this store's currency format."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:202
+msgid "Payment method title."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:203
+msgid "Shipping method title."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:204
+msgid "Formatted billing address."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:205
+msgid "Formatted shipping address."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:206
+msgid "Link to the order in the customer's account."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:207
+msgid "This store's name."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:208
+msgid "The address this store sends email from."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:209
+msgid "This store's home page."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:210
+msgid "Link to the My Account page."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:211
+msgid "Name of the first matched product, as it appears on the order."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:212
+msgid "SKU of the first matched product."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:213
+msgid "Quantity ordered of the first matched product."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:214
+msgid "Link to the first matched product."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:215
+msgid "Variation name of the first matched product. Empty when it is not a variation."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:216
+msgid "Variation attributes of the first matched product, for example \"Colour: Blue, Size: L\"."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:217
+msgid "Every matched product, comma-separated."
+msgstr ""
+
+#: src/Admin/PlaceholderReference.php:218
+msgid "Every matched product, one per line, with quantities."
+msgstr ""
+
+#: src/Admin/ReasonText.php:56
+msgid "the rule was deleted during the delay, so there is nothing left to send"
+msgstr ""
+
+#: src/Admin/ReasonText.php:57
+msgid "the rule was disabled during the delay"
+msgstr ""
+
+#: src/Admin/ReasonText.php:58
+msgid "the rule no longer belongs to the delayed separate-mode phase (its mode, delay or consolidation changed during the delay)"
+msgstr ""
+
+#: src/Admin/ReasonText.php:59
+msgid "the order no longer exists, or was moved to the trash, during the delay"
+msgstr ""
+
+#: src/Admin/ReasonText.php:60
+msgid "the order was cancelled, failed or fully refunded during the delay"
+msgstr ""
+
+#: src/Admin/ReasonText.php:61
+msgid "every matched line item was removed or fully refunded during the delay"
+msgstr ""
+
+#: src/Admin/ReasonText.php:62
+msgid "the stored snapshot could not be read, so the message this delivery would send is unknown"
+msgstr ""
+
+#: src/Admin/ReasonText.php:63
+msgid "the rule's consolidation setting is not one this plugin recognises, so it was not delivered; set it to \"none\" or \"per_product\""
+msgstr ""
+
+#: src/Admin/ReasonText.php:64
+msgid "this plugin's database tables were unavailable when the delayed delivery came due, and it could not be re-queued"
+msgstr ""
+
+#: src/Admin/ReasonText.php:65
+msgid "the queued job named a different order from the delivery record it points at, so neither was trusted"
+msgstr ""
+
+#: src/Admin/ReasonText.php:66
+msgid "the custom email class was not registered with WooCommerce when the delayed delivery came due"
+msgstr ""
+
+#: src/Admin/ReasonText.php:67
+msgid "delivery was not operational when the delayed delivery came due"
+msgstr ""
+
+#: src/Admin/ReasonText.php:68
+msgid "this delayed delivery could not be armed for sending, so nothing was queued"
+msgstr ""
+
+#: src/Admin/ReasonText.php:69
+msgid "the execution lease for this delayed delivery could not be written and it could not be re-queued, so no worker was able to take it"
+msgstr ""
+
+#: src/Admin/ReasonText.php:70
+msgid "a store administrator cancelled this delivery before it was sent"
+msgstr ""
+
+#: src/Admin/ReasonText.php:71
+msgid "the worker running this delayed delivery never reported back, so whether the message was sent is not known"
+msgstr ""
+
+#: src/Admin/ReasonText.php:72
+msgid "the queued job for this delayed delivery no longer exists and it could not be re-queued"
+msgstr ""
+
+#: src/Admin/ReasonText.php:73
+msgid "the plugin was deactivated while this delayed delivery was still queued"
+msgstr ""
+
+#: src/Admin/ReasonText.php:74
+msgid "the plugin was shut down while a worker was running this delayed delivery, so whether the message was sent is not known"
+msgstr ""
+
+#: src/Admin/RuleActions.php:68
+msgid "(copy)"
+msgstr ""
+
+#: src/Admin/RuleActions.php:150
+#: src/Admin/TargetSearch.php:80
+msgid "This page has expired. Reload it and try again."
+msgstr ""
+
+#: src/Admin/RuleActions.php:241
+msgid "This link has expired. Reload the list and try again."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:67
+#: src/Admin/RuleList.php:55
+msgid "Email Rules"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:69
+#: src/Admin/RuleEditor.php:84
+#: src/Admin/RulePreviewScreen.php:73
+msgid "Back to all rules"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:80
+msgid "Edit Email Rule"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:81
+#: src/Admin/RuleList.php:58
+msgid "Add Email Rule"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:115
+msgid "Save rule"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:116
+msgid "Create rule"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:132
+msgid "This rule was not saved, and nothing was changed."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:168
+msgid "Name and status"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:174
+msgid "Only you see this. It is how the rule appears in the list."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:183
+msgid "An inactive rule is never evaluated and sends nothing."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:202
+msgid "When it sends"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:207
+msgid "A rule that adds its content to a WooCommerce email has no trigger of its own — WooCommerce decides when that email sends. These settings apply to a rule sent as a separate email."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:224
+msgid "Order status"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:227
+msgid "The rule is considered each time an order reaches this status."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:234
+msgid "Moves from"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:244
+msgid "Moves to"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:247
+msgid "The rule is considered only on this exact move, not on every arrival at the second status."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:262
+msgid "Which products"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:266
+msgid "Every product in the order"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:268
+msgid "Anything you exclude below still wins: an excluded product is never matched, whatever else says otherwise."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:286
+msgid "Include"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:287
+msgid "Exclude"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:314
+msgid "How it is delivered"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:332
+msgid "Which WooCommerce email this rule adds its content to."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:335
+msgid "— Choose an email —"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:343
+msgid "Where in that email the content appears."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:395
+msgid "Who receives it"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:400
+msgid "These recipients apply to a rule sent as a separate email. A rule that adds its content to a WooCommerce email has no recipients of its own: the content goes into the email WooCommerce is already sending, to whoever that email is addressed to: the customer for a customer email, the store's administrators for an admin one. For such a rule these boxes are read-only, and whatever they hold is kept in case it is switched back."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:404
+msgid "One recipient per line. Write \"customer\" for the billing address on the order, \"admin\" for the site administrator, or any email address. The placeholders {customer_email} and {store_email} also work here — no others do, because a recipient becomes part of the email header."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:415
+msgid "A rule sent as a separate email with no \"To\" recipient sends nothing, and says so in its delivery record."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:432
+msgid "What it says"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:465
+msgid "Used as the subject of a separate email. Ignored when the content is added to a WooCommerce email — WooCommerce's own subject is used."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:474
+msgid "Shown at the top of a separate email. Ignored when the content is added to a WooCommerce email."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:572
+msgid "The message body. Use the Placeholders panel to include order and product details."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:593
+msgid "Order of evaluation"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:604
+msgid "Lower numbers are considered first."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:610
+msgid "Stop after this rule"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:612
+msgid "When this rule matches an order, no lower-priority rule is considered for it."
+msgstr ""
+
+#: src/Admin/RuleEditor.php:664
+msgid "Delay unit"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:677
+msgid "Zero sends straight away. A rule that adds its content to a WooCommerce email cannot be delayed, so this is switched off for it."
+msgstr ""
+
+#. translators: %s: the unrecognised value stored on the rule.
+#: src/Admin/RuleEditor.php:726
+#, php-format
+msgid "%s — no longer supported, choose another"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:735
+msgid "A rule that adds its content to a WooCommerce email cannot choose this — WooCommerce already decided how many emails to send."
+msgstr ""
+
+#. translators: %s: the kind being searched, e.g. "Products".
+#: src/Admin/RuleEditor.php:785
+#, php-format
+msgid "Search %s to add"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:793
+msgid "Type to search…"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:823
+msgid "(no longer available)"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:867
+msgid "Placeholders"
+msgstr ""
+
+#: src/Admin/RuleEditor.php:869
+msgid "Put the cursor in a field, then choose a placeholder to insert it there. Placeholders work in the subject, the heading and the body."
+msgstr ""
+
+#. translators: %s: the unrecognised value stored on the rule.
+#: src/Admin/RuleEditor.php:1074
+#, php-format
+msgid "%s — not available, choose another"
+msgstr ""
+
+#: src/Admin/RuleList.php:72
+msgid "Search rules"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:58
+#: src/Admin/RulePreviewScreen.php:136
+#: src/Admin/RulesListTable.php:330
+msgid "Preview"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:69
+msgid "Edit this rule"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:125
+msgid "Preview against order"
+msgstr ""
+
+#. translators: %d: how many recent orders are searched for a match.
+#: src/Admin/RulePreviewScreen.php:142
+#, php-format
+msgid "Leave this alone to use the most recent of the last %d orders that this rule matches. Type any order number to preview against that order instead."
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:168
+msgid "Delivered as"
+msgstr ""
+
+#. translators: %s: the WooCommerce email this rule adds its content to.
+#: src/Admin/RulePreviewScreen.php:172
+#, php-format
+msgid "Content added to the WooCommerce email \"%s\""
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:175
+msgid "A separate email of its own"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:189
+msgid "Messages"
+msgstr ""
+
+#. translators: %d: how many messages this delivery would send.
+#: src/Admin/RulePreviewScreen.php:192
+#, php-format
+msgid "This rule would send %d separate email for this order. One representative message — the first — is shown below."
+msgid_plural "This rule would send %d separate emails for this order. One representative message — the first — is shown below."
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/Admin/RulePreviewScreen.php:214
+msgid "This rule's targeting does not match anything on this order, so every placeholder about matched products is empty below. The rule would not send for this order at all. Choose an order that contains a targeted product to see the real content."
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:221
+msgid "This rule is currently disabled, so it does not send automatically. The preview below shows what it would produce if it were enabled."
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:230
+msgid "Custom product emails are currently switched off in WooCommerce settings. Nothing would be sent, and a test send from this screen will be refused. The preview is still accurate."
+msgstr ""
+
+#. translators: %s: one or more notes about placeholders that could not be resolved.
+#: src/Admin/RulePreviewScreen.php:239
+#, php-format
+msgid "While rendering this preview: %s"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:258
+msgid "HTML"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:269
+msgid "A preview of the HTML email"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:272
+msgid "Plain text"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:290
+msgid "Send a test email"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:293
+msgid "This sends a real email, through this store's own mail settings, to the address you type below. The rule's own recipients are not used. Its subject is marked as a test, and it does not stop the rule sending normally."
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:304
+msgid "Send the test to"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:310
+msgid "Send a test…"
+msgstr ""
+
+#: src/Admin/RulePreviewScreen.php:340
+msgid "This rule could not be previewed."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:95
+msgid "Targets"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:96
+msgid "Mode"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:98
+msgid "Emails"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:145
+msgid "No rules match these filters."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:150
+msgid "No custom product emails yet"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:151
+msgid "A rule decides which products get an extra email, when it is sent, and what it says. It can send a separate message, or add its content to an email WooCommerce already sends."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:153
+msgid "Create your first rule"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:248
+msgid "All triggers"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:248
+msgid "Filter by trigger"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:324
+msgid "Edit"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:332
+msgid "Duplicate"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:336
+msgid "Disable"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:337
+msgid "Enable"
+msgstr ""
+
+#. translators: %s: rule name.
+#: src/Admin/RulesListTable.php:346
+#, php-format
+msgid "Delete the rule \"%s\"? Any emails it has queued but not yet sent are cancelled. This cannot be undone."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:350
+msgid "Delete"
+msgstr ""
+
+#. translators: %s: WooCommerce email name.
+#: src/Admin/RulesListTable.php:396
+#, php-format
+msgid "Inside: %s"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:410
+msgid "This email has no order details section, so this rule can never add anything to it."
+msgstr ""
+
+#. translators: 1: source order status, 2: destination order status.
+#: src/Admin/RulesListTable.php:433
+#, php-format
+msgid "%1$s → %2$s"
+msgstr ""
+
+#. translators: %s: order status name.
+#: src/Admin/RulesListTable.php:443
+#, php-format
+msgid "Reaches %s"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:460
+msgid "Targeting is unreadable — open the rule and set it again."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:467
+msgid "All products"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:479
+msgid "Except:"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:485
+msgid "Nothing yet — this rule matches no products."
+msgstr ""
+
+#: src/Admin/RulesListTable.php:514
+msgid "Immediately"
+msgstr ""
+
+#. translators: %s: a human-readable duration, e.g. "2 days".
+#: src/Admin/RulesListTable.php:520
+#, php-format
+msgid "After %s"
+msgstr ""
+
+#: src/Admin/RulesListTable.php:540
+msgid "Unrecognised — this rule will not send."
+msgstr ""
+
+#. translators: %d: how many further targets are not listed.
+#: src/Admin/RulesListTable.php:605
+#, php-format
+msgid "+%d more"
+msgid_plural "+%d more"
+msgstr[0] ""
+msgstr[1] ""
+
+#: src/Admin/Tabs.php:64
+msgid "Rules"
+msgstr ""
+
+#: src/Admin/Tabs.php:69
+msgid "Product Emails screens"
+msgstr ""
+
+#. translators: %d: post id of a product with no title.
+#: src/Admin/TargetLabels.php:181
+#: src/Admin/TargetSearch.php:162
+#, php-format
+msgid "Untitled (#%d)"
+msgstr ""
+
+#: src/Admin/TargetSearch.php:70
+msgid "You are not allowed to search products here."
+msgstr ""
+
+#: src/Admin/TargetSearch.php:99
+msgid "Unknown search type."
+msgstr ""
+
+#. translators: 1: comma-separated list of placeholders used, e.g. "{product_name}", 2: comma-separated list of suggested placeholders.
+#: src/Admin/Warnings.php:105
+#, php-format
+msgid "This rule can match more than one product, but its content uses %1$s. Those resolve against the first matched product only. To name every matched product, use %2$s."
+msgstr ""
+
+#. translators: %d: the maximum number of emails one rule sends for one order.
+#: src/Admin/Warnings.php:125
+#, php-format
+msgid "One email per matched product sends at most %d email for a single order. Past that limit one email is sent instead: it carries the full content for the first matched product and only names the rest. The limit applies to this rule on its own, not to the order — several rules set this way multiply."
+msgid_plural "One email per matched product sends at most %d emails for a single order. Past that limit one email is sent instead: it carries the full content for the first matched products and only names the rest. The limit applies to this rule on its own, not to the order — several rules set this way multiply."
+msgstr[0] ""
+msgstr[1] ""
+
+#. translators: %s: comma-separated list of field labels left empty.
+#: src/Admin/Warnings.php:143
+#, php-format
+msgid "Left empty, %s renders as nothing at all — which looks exactly like a placeholder that resolved to nothing. Fill it in if something should appear there."
+msgstr ""
+
+#. translators: %s: the name of the chosen WooCommerce email.
+#: src/Admin/Warnings.php:158
+#, php-format
+msgid "This rule adds its content to %s, but that email has no order details section — which is the only place this plugin can add anything. Nothing will be added and nothing will be sent, and no delivery will be recorded to tell you so. Choose a WooCommerce email that shows the order, or send this rule as a separate email."
+msgstr ""
+
+#. translators: %s: the name of the chosen WooCommerce email.
+#: src/Admin/Warnings.php:169
+#, php-format
+msgid "This plugin could not confirm that %s shows the order details, which is the only place it can add content. The rule is saved and offered anyway — send yourself a test order to check it arrives. If nothing appears, that email does not show order details and this rule cannot use it."
+msgstr ""
+
+#: src/Admin/Warnings.php:177
+msgid "An inserted rule adds its content to an email WooCommerce is already sending. WooCommerce decides who receives that email, what its subject says and when it goes out — so the recipients, the delay and the choice of how many emails to send are switched off below."
+msgstr ""
+
+#: src/Admin/Warnings.php:267
+msgid "the body"
+msgstr ""
+
+#: src/Admin/Warnings.php:275
+msgid "the subject"
+msgstr ""
+
+#: src/Admin/Warnings.php:276
+msgid "the heading"
+msgstr ""
+
+#: src/Delivery/TestDelivery.php:241
+msgid "[Test] "
+msgstr ""
+
+#: src/Email/Custom_Email.php:357
+msgid "Custom emails per product"
+msgstr ""
+
+#: src/Email/Custom_Email.php:358
+msgid "Global on/off switch for every custom product email. Subject, content and recipients are set on each rule, not here."
+msgstr ""
+
+#: src/Email/Custom_Email.php:396
+msgid "Enable/Disable"
+msgstr ""
+
+#: src/Email/Custom_Email.php:398
+msgid "Enable custom product emails (global switch)"
+msgstr ""
+
+#: src/Email/Custom_Email.php:402
+msgid "Email type"
+msgstr ""
+
+#: src/Email/Custom_Email.php:404
+msgid "Applies to every custom product email."
+msgstr ""
+
+#: src/Install/Migrator.php:434
+msgid "The custom-email database is not in the expected state."
+msgstr ""
+
+#: src/Install/Migrator.php:486
+msgid "The custom-email database is being prepared. Please try again in a moment."
+msgstr ""
+
+#: src/Install/Migrator.php:748
+msgid "The custom-email database could not be prepared. The plugin has safely disabled its features. See the WooCommerce logs for details."
+msgstr ""
+
+#: src/Plugin.php:297
+msgid "When this site sends you a product-specific order email, it records the delivery locally in this site&#8217;s database so that unintended duplicate automatic deliveries are prevented. The record of what was sent — the recipient address, subject line and any delivery failure details — is kept for a limited retention period and is included in personal-data export and erasure requests. A smaller record that the email was already delivered for your order, holding no address or message content, is kept for longer, so that a later change to your order does not trigger the same automatic email again. Where the store has set up an email to be sent to you after a delay, that smaller record also temporarily holds the store&#8217;s own unsent template text and recipient settings for that message, until the email is sent or cancelled. A store administrator can still deliberately resend an email to you."
+msgstr ""
+
+#: src/Plugin.php:322
+msgid "the custom-email database could not be prepared. Custom product emails are disabled; the rest of your store, including checkout and native WooCommerce emails, is unaffected. See the WooCommerce logs (source: extonify-wcep) for details, then deactivate and reactivate the plugin to retry."
+msgstr ""
+
+#: src/Plugin.php:323
+msgid "the custom-email database tables are missing. Custom product emails are disabled; the rest of your store, including checkout and native WooCommerce emails, is unaffected. Deactivate and reactivate the plugin to recreate them."
+msgstr ""
+
+#: src/Privacy/Eraser.php:84
+#: src/Privacy/Exporter.php:82
+msgid "Extonify Custom Emails Per Product"
+msgstr ""
+
+#: src/Privacy/Eraser.php:146
+msgid "Personal details of product email deliveries were removed: recipient address, subject, delivery snapshot, reason and any failure message."
+msgstr ""
+
+#: src/Privacy/Eraser.php:149
+msgid "Some of these emails were also addressed to other people, for example a copy sent to staff. Their contact details belong to them and have been left in place; only the message content that may relate to you was removed."
+msgstr ""
+
+#: src/Privacy/Eraser.php:160
+msgid "A minimal delivery record has been retained for each affected order. It contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries. Where a delayed email is still waiting to be sent, that record also temporarily holds the store's own unsent template text and recipient settings; this is released as soon as the email is sent or cancelled."
+msgstr ""
+
+#: src/Privacy/Exporter.php:162
+msgid "Date (UTC)"
+msgstr ""
+
+#: src/Privacy/Exporter.php:170
+msgid "Type"
+msgstr ""
+
+#: src/Privacy/Exporter.php:176
+msgid "Recipient"
+msgstr ""
+
+#: src/Privacy/Exporter.php:177
+msgid "Recipient type"
+msgstr ""
+
+#: src/Privacy/Exporter.php:178
+msgid "Recipient (as addressed)"
+msgstr ""
+
+#: src/Privacy/Exporter.php:180
+msgid "Reason"
+msgstr ""
+
+#: src/Privacy/Exporter.php:181
+msgid "Failure message"
+msgstr ""
+
+#: src/Privacy/Exporter.php:182
+msgid "Delivery snapshot"
+msgstr ""
+
+#: src/Privacy/Exporter.php:221
+msgid "Note"
+msgstr ""
+
+#: src/Privacy/Exporter.php:222
+msgid "This email was addressed to someone else (for example a copy sent to staff). Only the parts that may relate to you are shown; the other recipient's contact details are not included."
+msgstr ""
+
+#: src/Privacy/Exporter.php:228
+msgid "Product email deliveries"
+msgstr ""
+
+#: src/Privacy/Exporter.php:326
+msgid "Delivery mode"
+msgstr ""
+
+#: src/Privacy/Exporter.php:330
+msgid "Triggered by"
+msgstr ""
+
+#: src/Privacy/Exporter.php:334
+msgid "Outcome"
+msgstr ""
+
+#: src/Privacy/Exporter.php:338
+msgid "First recorded (UTC)"
+msgstr ""
+
+#: src/Privacy/Exporter.php:342
+msgid "Why this is kept"
+msgstr ""
+
+#: src/Privacy/Exporter.php:355
+msgid "This record contains no direct contact or message-content fields, but remains linked to an order and is retained to prevent unintended duplicate automatic deliveries. While a delayed email for this order is still waiting to be sent, the record also temporarily holds the store's own unsent template text and recipient settings for that message; this is released as soon as the email is sent or cancelled."
+msgstr ""
+
+#: src/Privacy/Exporter.php:361
+msgid "Product email delivery records"
+msgstr ""
+
+#. translators: 1: required WordPress version, 2: current WordPress version.
+#: src/Requirements.php:41
+#, php-format
+msgid "requires WordPress %1$s or newer. This site runs WordPress %2$s. The plugin is inactive until WordPress is updated."
+msgstr ""
+
+#: src/Requirements.php:48
+msgid "requires WooCommerce to be installed and active. The plugin is inactive until WooCommerce is activated."
+msgstr ""
+
+#. translators: 1: required WooCommerce version, 2: current WooCommerce version.
+#: src/Requirements.php:52
+#, php-format
+msgid "requires WooCommerce %1$s or newer. This site runs WooCommerce %2$s. The plugin is inactive until WooCommerce is updated."
+msgstr ""

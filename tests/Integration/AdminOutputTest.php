@@ -743,6 +743,195 @@ final class AdminOutputTest extends AdminTestCase {
 	}
 
 	/**
+	 * GATE 33e. THE PLACEHOLDER REFERENCE STILL FOLLOWS THE CONTENT FIELDS IN
+	 *           DOCUMENT ORDER.
+	 *
+	 * ⚠ THE TWO-COLUMN LAYOUT IS CSS, AND THIS IS THE ASSERTION THAT KEEPS IT CSS.
+	 * Part G puts the reference in a right-hand column beside the fields. The
+	 * tempting way to do that is to move the markup; doing so would put the
+	 * reference BEFORE the fields in the document and hand a keyboard user thirty
+	 * placeholder buttons to tab through on the way to the subject line. Grid
+	 * columns reorder the picture, not the document — and only an assertion on the
+	 * document keeps a later "just swap the divs" from undoing it silently.
+	 *
+	 * @return void
+	 */
+	public function test_the_placeholder_reference_follows_the_content_fields() {
+		$this->become_manager();
+		$this->use_our_screen();
+
+		$markup = $this->capture(
+			static function () {
+				RuleEditor::render();
+			}
+		);
+
+		$path = new \DOMXPath( self::parse( $markup ) );
+
+		// An XPath node list is in DOCUMENT order, which is the property under test.
+		$nodes = $path->query(
+			'//*[@data-extonify-wcep-insertable or @data-extonify-wcep-placeholders]'
+		);
+
+		$order = array();
+
+		foreach ( $nodes as $node ) {
+			$order[] = $node->hasAttribute( 'data-extonify-wcep-placeholders' )
+				? 'the placeholder reference'
+				: $node->getAttribute( 'name' );
+		}
+
+		$this->assertSame(
+			array(
+				RuleFormInput::FIELD . '[subject]',
+				RuleFormInput::FIELD . '[heading]',
+				RuleFormInput::FIELD . '[content]',
+				'the placeholder reference',
+			),
+			$order,
+			'⚠ tab order no longer runs fields → reference.'
+		);
+
+		fwrite(
+			STDERR,
+			"\n[P9 gate 33] DOM order: subject → heading → body → placeholder reference; the two-column "
+			. 'layout is CSS grid, so tab order is unchanged'
+		);
+	}
+
+	/**
+	 * ⚠ TIER 1 REGRESSION GUARD. THE INSERTABLE SURFACE IS PINNED AS A COMPLETE
+	 *   MAP — EVERY FIELD THAT TAKES A PLACEHOLDER, AND EVERY FIELD THAT DOES NOT.
+	 *
+	 * This is the assertion whose absence allowed the Part G defect, and it failed
+	 * in BOTH directions when it was first written.
+	 *
+	 * ⚠ MISSING. Until Part G `data-extonify-wcep-insertable` was emitted at one
+	 * site, `RuleEditor::text_row()`, so the subject and the heading had it and the
+	 * `wp_editor()` body did not. Focusing the body therefore never updated
+	 * `assets/admin.js`'s "last focused field", and a placeholder clicked while the
+	 * merchant was writing the body was inserted into the HEADING — silently, with
+	 * the token sitting in a field the merchant was not looking at.
+	 *
+	 * ⚠ AND SPURIOUS. The same single site gave the marker to the rule NAME, whose
+	 * own description reads "Only you see this": a private label no email ever
+	 * renders, placed above the fold, where a token could land unseen for exactly
+	 * the same reason. The attribute is now a per-field argument, so it is a
+	 * decision rather than a side effect of which helper drew the row.
+	 *
+	 * ⚠ ASSERTED AS A MAP, NOT AS THREE `assertContains()` CALLS. The failure mode
+	 * is an ADDED field, not a changed one. `assertSame()` over every text-entry
+	 * field this plugin renders means a new one cannot appear without someone
+	 * writing down, here, whether a placeholder belongs in it.
+	 *
+	 * ⚠ WHAT THIS TEST CANNOT PROVE. The insertion itself is JavaScript and no PHP
+	 * assertion reaches it — see `docs/testing.md` § *Placeholder insertion — the
+	 * seven manual cases*, which carries the browser verification instead. What PHP
+	 * can prove is that the marker the script keys on is on every surface that
+	 * should have it and on nothing else, which is precisely the half that was
+	 * wrong.
+	 *
+	 * @return void
+	 */
+	public function test_every_placeholder_target_is_marked_and_nothing_else_is() {
+		$this->become_manager();
+		$this->use_our_screen();
+
+		// ⚠ BOTH EDITOR PATHS. The marker reaches the body through `the_editor`, and
+		// `wp_editor()` builds its markup differently depending on `user_can_richedit()`
+		// — false for every merchant who ticked "Disable the visual editor when
+		// writing", and on that path the textarea is the ONLY editing surface. A marker
+		// present on one path only would leave those merchants with the defect this
+		// test exists to prevent.
+		foreach ( array( true, false ) as $rich ) {
+			$filter = $rich ? '__return_true' : '__return_false';
+
+			add_filter( 'user_can_richedit', $filter, 999 );
+
+			try {
+				$this->assertInsertableMap( $rich ? 'visual (TinyMCE)' : 'text-only (quicktags)' );
+			} finally {
+				remove_filter( 'user_can_richedit', $filter, 999 );
+			}
+		}
+
+		fwrite(
+			STDERR,
+			"\n[P13G] insertable surfaces: 9 text-entry fields scanned on BOTH editor paths, exactly 3 "
+			. 'marked (subject, heading, body) — the body through the `the_editor` filter, since '
+			. 'wp_editor() takes no attribute arguments'
+		);
+	}
+
+	/**
+	 * Assert the insertable map for whichever editor path is currently active.
+	 *
+	 * @param string $path_name Human name of the path, for the failure message.
+	 * @return void
+	 */
+	private function assertInsertableMap( string $path_name ): void {
+		$markup = $this->capture(
+			static function () {
+				RuleEditor::render();
+			}
+		);
+
+		$path = new \DOMXPath( self::parse( $markup ) );
+		$map  = array();
+
+		foreach ( array( 'input', 'textarea' ) as $tag ) {
+			foreach ( $path->query( '//' . $tag ) as $control ) {
+				$name = $control->getAttribute( 'name' );
+
+				// Scoped to this plugin's own value-bearing fields. `wp_editor()`
+				// emits quicktag buttons and a media button of its own, and the
+				// targeting chips are checkboxes — none of them is somewhere a
+				// placeholder can go, and the chip set is not fixed.
+				if ( 0 !== strpos( $name, RuleFormInput::FIELD ) ) {
+					continue;
+				}
+
+				$type = 'input' === $tag ? $control->getAttribute( 'type' ) : 'textarea';
+
+				if ( in_array( $type, array( 'hidden', 'checkbox', 'radio' ), true ) ) {
+					continue;
+				}
+
+				$map[ $name ] = $control->hasAttribute( 'data-extonify-wcep-insertable' );
+			}
+		}
+
+		// Keyed comparison, not an ordered one: DOM order is the OTHER test's claim,
+		// and this one must keep holding when a field moves between sections.
+		ksort( $map );
+
+		$this->assertSame(
+			array(
+				// One of the three the placeholder reference's own copy names.
+				RuleFormInput::FIELD . '[content]'         => true,
+				// A delay is a number; a placeholder is not a number.
+				RuleFormInput::FIELD . '[delay_value]'     => false,
+				RuleFormInput::FIELD . '[heading]'         => true,
+				// A private label — its own description reads "Only you see this".
+				RuleFormInput::FIELD . '[name]'            => false,
+				RuleFormInput::FIELD . '[priority]'        => false,
+				// Recipients accept {customer_email} and {store_email} only, typed
+				// rather than clicked: the reference offers ~30 tokens and all but
+				// those two would produce an invalid header.
+				RuleFormInput::FIELD . '[recipients][bcc]' => false,
+				RuleFormInput::FIELD . '[recipients][cc]'  => false,
+				RuleFormInput::FIELD . '[recipients][to]'  => false,
+				RuleFormInput::FIELD . '[subject]'         => true,
+			),
+			$map,
+			'⚠ TIER 1 on the ' . $path_name . ' path: the set of fields a clicked placeholder can '
+			. 'land in is not the set that should accept one. A field with the marker the merchant '
+			. 'cannot see, and a content field without one, both put a token somewhere they did not '
+			. 'intend.'
+		);
+	}
+
+	/**
 	 * GATE 33d. EVERY USER-FACING STRING IN `src/Admin/` IS TRANSLATABLE WITH THIS
 	 *           PLUGIN'S TEXT DOMAIN, and no sentence is built by concatenation.
 	 *

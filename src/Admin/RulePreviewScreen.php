@@ -176,11 +176,25 @@ final class RulePreviewScreen {
 		);
 
 		if ( (int) $preview['messages'] > 1 ) {
+			/*
+			 * ⚠ WORDED TO AGREE WITH `readme.txt` (Prompt 13B, item 4), which says a
+			 * per-product rule "shows one representative message and states how many
+			 * would be sent in total". Both halves have to be on the screen: the count
+			 * alone would let a merchant read the single document below as THE email,
+			 * and "the first one" alone says which message without saying that the
+			 * others exist. `Orchestrator::compose_preview()` renders `messages[0]`, so
+			 * naming it as the first is accurate as well as representative.
+			 */
 			self::fact(
 				__( 'Messages', 'extonify-custom-emails-per-product' ),
 				sprintf(
 					/* translators: %d: how many messages this delivery would send. */
-					__( 'This rule would send %d separate emails for this order. The first one is shown below.', 'extonify-custom-emails-per-product' ),
+					_n(
+						'This rule would send %d separate email for this order. One representative message — the first — is shown below.',
+						'This rule would send %d separate emails for this order. One representative message — the first — is shown below.',
+						(int) $preview['messages'],
+						'extonify-custom-emails-per-product'
+					),
 					(int) $preview['messages']
 				)
 			);
@@ -276,7 +290,7 @@ final class RulePreviewScreen {
 		echo '<h3>' . esc_html__( 'Send a test email', 'extonify-custom-emails-per-product' ) . '</h3>';
 
 		echo '<p class="description" id="extonify-wcep-test-help">'
-			. esc_html__( 'This sends a real email, through this store\'s own mail settings, to an address you choose. It never goes to the customer. Its subject is marked as a test, and it does not stop the rule sending normally.', 'extonify-custom-emails-per-product' )
+			. esc_html__( 'This sends a real email, through this store\'s own mail settings, to the address you type below. The rule\'s own recipients are not used. Its subject is marked as a test, and it does not stop the rule sending normally.', 'extonify-custom-emails-per-product' )
 			. '</p>';
 
 		echo '<form method="get" action="' . esc_url( admin_url( 'admin.php' ) ) . '" class="extonify-wcep-preview-test">';

@@ -210,7 +210,12 @@ final class OrderPanel {
 			echo '<p class="description">' . esc_html(
 				sprintf(
 					/* translators: 1: how many deliveries are shown, 2: how many this order has in total. */
-					__( 'Showing the %1$d most recent of %2$d deliveries for this order.', 'extonify-custom-emails-per-product' ),
+					_n(
+						'Showing the %1$d most recent of %2$d delivery for this order.',
+						'Showing the %1$d most recent of %2$d deliveries for this order.',
+						(int) $page['total'],
+						'extonify-custom-emails-per-product'
+					),
 					count( $page['deliveries'] ),
 					$page['total']
 				)

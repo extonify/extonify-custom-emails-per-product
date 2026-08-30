@@ -192,14 +192,14 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- atomic claim against the plugin-owned tombstone table; the UNIQUE constraint IS the race protection and a cached read would defeat it.
 		$affected = $wpdb->query(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is built from $wpdb->prefix plus a hardcoded literal in Migrator::table(); it is never user input and an identifier cannot be bound by prepare().
-				"INSERT INTO {$table}
+				'INSERT INTO %i
 					(identity_hash, order_id, rule_id, mode, trigger_identity, first_claimed_at, last_seen_at, final_status, suppressed_count, rule_revision_sent)
 				VALUES (%s, %d, %d, %s, %s, %s, %s, %s, 0, %d)
 				ON DUPLICATE KEY UPDATE
 					suppressed_count = suppressed_count + 1,
 					last_seen_at     = VALUES(last_seen_at),
-					id               = LAST_INSERT_ID(id)",
+					id               = LAST_INSERT_ID(id)',
+				$table,
 				$hash,
 				$order_id,
 				$rule_id,
@@ -298,8 +298,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- single indexed read of the plugin-owned tombstone table; caching a claim state would risk a duplicate send.
 		$row = $wpdb->get_row(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE identity_hash = %s", $hash ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE identity_hash = %s', $table, $hash ),
 			ARRAY_A
 		);
 
@@ -318,8 +317,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned tombstone table.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE order_id = %d ORDER BY id ASC", $order_id ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE order_id = %d ORDER BY id ASC', $table, $order_id ),
 			ARRAY_A
 		);
 
@@ -360,8 +358,8 @@ class DeliveryRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned tombstone table; results must be live.
 			$rows = $wpdb->get_results(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "SELECT * FROM {$table} WHERE order_id IN ( {$placeholders} ) ORDER BY id ASC", $chunk ),
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT * FROM %i WHERE order_id IN ( {$placeholders} ) ORDER BY id ASC", array_merge( array( $table ), $chunk ) ),
 				ARRAY_A
 			);
 			foreach ( (array) $rows as $row ) {
@@ -403,8 +401,8 @@ class DeliveryRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- privacy request over the plugin-owned tombstone table; results must be live.
 			$rows = $wpdb->get_results(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
-				$wpdb->prepare( "SELECT * FROM {$table} WHERE id IN ( {$placeholders} ) ORDER BY id ASC", $chunk ),
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above.
+				$wpdb->prepare( "SELECT * FROM %i WHERE id IN ( {$placeholders} ) ORDER BY id ASC", array_merge( array( $table ), $chunk ) ),
 				ARRAY_A
 			);
 			foreach ( (array) $rows as $row ) {
@@ -528,9 +526,9 @@ class DeliveryRepository {
 		$updated = $wpdb->query(
 			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- the replacements arrive as one $values array, which the sniff cannot count through; it is built beside the assignments above so the two are always the same length.
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier; {$set} is assembled from the hardcoded literal fragments directly above, every one of which binds its value through the $values array. No caller input reaches the SQL text.
-				"UPDATE {$table} SET {$set} WHERE id = %d AND final_status = %s",
-				$values
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$set} is assembled from the hardcoded literal fragments directly above, every one of which binds its value through the $values array. No caller input reaches the SQL text.
+				"UPDATE %i SET {$set} WHERE id = %d AND final_status = %s",
+				array_merge( array( $table ), $values )
 			)
 		);
 
@@ -697,10 +695,10 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- guarded primary-key update of the plugin-owned tombstone table; the final_status predicate IS the concurrency guard and a cached read would defeat it.
 		$updated = $wpdb->query(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"UPDATE {$table}
+				'UPDATE %i
 					SET snapshot = %s, final_status = %s, last_seen_at = %s
-				WHERE id = %d AND final_status = %s",
+				WHERE id = %d AND final_status = %s',
+				$table,
 				DeliverySnapshot::encode( $snapshot ),
 				self::SCHEDULED,
 				current_time( 'mysql', true ),
@@ -758,8 +756,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key read of the plugin-owned tombstone table; a cached read would report a state another actor has already moved on from, which is the one thing this method exists to answer accurately.
 		$row = $wpdb->get_row(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT id, order_id, final_status FROM {$table} WHERE id = %d", $delivery_id ),
+			$wpdb->prepare( 'SELECT id, order_id, final_status FROM %i WHERE id = %d', $table, $delivery_id ),
 			ARRAY_A
 		);
 
@@ -823,8 +820,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed read of the plugin-owned tombstone table; a cached read would let a just-scheduled delivery escape eager cancellation.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE rule_id = %d AND final_status = %s ORDER BY id ASC", $rule_id, self::SCHEDULED ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE rule_id = %d AND final_status = %s ORDER BY id ASC', $table, $rule_id, self::SCHEDULED ),
 			ARRAY_A
 		);
 
@@ -869,10 +865,10 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would re-sweep rows a previous pass already recovered.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"SELECT * FROM {$table}
+				'SELECT * FROM %i
 					WHERE final_status = %s AND COALESCE(lease_taken_at, last_seen_at) <= %s AND id > %d
-					ORDER BY id ASC LIMIT %d",
+					ORDER BY id ASC LIMIT %d',
+				$table,
 				self::EXECUTING,
 				$cutoff_utc,
 				max( 0, $after_id ),
@@ -941,10 +937,10 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would act on a delivery another pass has already finalised.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"SELECT * FROM {$table}
+				'SELECT * FROM %i
 					WHERE final_status = %s AND last_seen_at <= %s AND id > %d AND id <= %d
-					ORDER BY id ASC LIMIT %d",
+					ORDER BY id ASC LIMIT %d',
+				$table,
 				self::SCHEDULED,
 				$cutoff_utc,
 				max( 0, $after_id ),
@@ -992,8 +988,8 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- indexed maintenance read of the plugin-owned tombstone table; a cached read would freeze a cycle against a stale view of the queue.
 		$max = $wpdb->get_var(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"SELECT MAX(id) FROM {$table} WHERE final_status = %s AND last_seen_at <= %s",
+				'SELECT MAX(id) FROM %i WHERE final_status = %s AND last_seen_at <= %s',
+				$table,
 				self::SCHEDULED,
 				$cutoff_utc
 			)
@@ -1046,10 +1042,10 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle read of the plugin-owned tombstone table; a cached read would let a just-scheduled delivery escape deactivation.
 		$rows = $wpdb->get_results(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"SELECT * FROM {$table}
+				'SELECT * FROM %i
 					WHERE final_status IN ( %s, %s ) AND id > %d
-					ORDER BY id ASC LIMIT %d",
+					ORDER BY id ASC LIMIT %d',
+				$table,
 				self::SCHEDULED,
 				self::EXECUTING,
 				max( 0, $after_id ),
@@ -1081,8 +1077,8 @@ class DeliveryRepository {
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle aggregate over the plugin-owned tombstone table; a cached read would authorise a hook-wide unschedule against a stale answer.
 		$count = $wpdb->get_var(
 			$wpdb->prepare(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-				"SELECT COUNT(*) FROM {$table} WHERE final_status IN ( %s, %s )",
+				'SELECT COUNT(*) FROM %i WHERE final_status IN ( %s, %s )',
+				$table,
 				self::SCHEDULED,
 				self::EXECUTING
 			)
@@ -1107,8 +1103,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned tombstone table.
 		return (int) $wpdb->get_var(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE final_status = %s", DeliveryIdentity::normalize( $status ) )
+			$wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE final_status = %s', $table, DeliveryIdentity::normalize( $status ) )
 		);
 	}
 
@@ -1208,13 +1203,13 @@ class DeliveryRepository {
 		$limit  = max( 1, (int) ( $args['limit'] ?? self::HISTORY_PER_PAGE ) );
 		$offset = max( 0, (int) ( $args['offset'] ?? 0 ) );
 
-		$sql = "SELECT * FROM {$table} {$where['sql']} ORDER BY first_claimed_at DESC, id DESC LIMIT %d OFFSET %d";
+		$sql = "SELECT * FROM %i {$where['sql']} ORDER BY first_claimed_at DESC, id DESC LIMIT %d OFFSET %d";
 
-		$params = array_merge( $where['params'], array( $limit, $offset ) );
+		$params = array_merge( array( $table ), $where['params'], array( $limit, $offset ) );
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- paged listing read of the plugin-owned tombstone table; a cached page would show a merchant a delivery state another request has already moved on from, which is the one thing this screen exists to report accurately.
 		$rows = $wpdb->get_results(
-			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier and {$where['sql']} is assembled ONLY from the HISTORY_*_FILTERS class constants plus hardcoded date predicates; every VALUE is bound through $params.
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$where['sql']} is assembled ONLY from the HISTORY_*_FILTERS class constants plus hardcoded date predicates; every VALUE is bound through $params, and the table is bound as an identifier with %i.
 			$wpdb->prepare( $sql, $params ),
 			ARRAY_A
 		);
@@ -1244,16 +1239,19 @@ class DeliveryRepository {
 		$table = $this->table();
 		$where = $this->history_where( $args );
 
-		$sql = "SELECT COUNT(*) FROM {$table} {$where['sql']}";
+		$sql = "SELECT COUNT(*) FROM %i {$where['sql']}";
 
-		if ( array() !== $where['params'] ) {
-			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$table} is a plugin-derived identifier and {$where['sql']} is built from the filter allowlists above; every value is bound.
-			$sql = $wpdb->prepare( $sql, $where['params'] );
-		}
+		/*
+		 * ⚠ ALWAYS PREPARED NOW, AND `%i` IS WHY. This used to branch: an UNFILTERED
+		 * count carried no values at all, and `prepare()` with an empty argument list
+		 * is a deprecation rather than a no-op, so that form was issued unprepared.
+		 * Binding the table as an IDENTIFIER means every form of this statement has at
+		 * least one placeholder, so the branch — and the unprepared path with it — is
+		 * gone.
+		 */
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- {$where['sql']} is built from the filter allowlists above; every value is bound, and the table is bound as an identifier with %i.
+		$sql = $wpdb->prepare( $sql, array_merge( array( $table ), $where['params'] ) );
 
-		// An unfiltered count carries no values at all, and prepare() with an empty
-		// argument list is a deprecation rather than a no-op — so that form is issued
-		// directly and the filtered one is always bound.
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- pager count over the plugin-owned tombstone table; see above.
 		return (int) $wpdb->get_var( $sql );
 	}
@@ -1324,8 +1322,7 @@ class DeliveryRepository {
 
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- primary-key read of the plugin-owned tombstone table; caching a claim state would risk a duplicate send.
 		$row = $wpdb->get_row(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $delivery_id ),
+			$wpdb->prepare( 'SELECT * FROM %i WHERE id = %d', $table, $delivery_id ),
 			ARRAY_A
 		);
 
@@ -1376,8 +1373,7 @@ class DeliveryRepository {
 		$wpdb->last_error = '';
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle cleanup of the plugin-owned tombstone table; the row lock is the point of this read.
 		$locked = $wpdb->get_col(
-			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input.
-			$wpdb->prepare( "SELECT id FROM {$table} WHERE order_id = %d ORDER BY id ASC FOR UPDATE", $order_id )
+			$wpdb->prepare( 'SELECT id FROM %i WHERE order_id = %d ORDER BY id ASC FOR UPDATE', $table, $order_id )
 		);
 
 		if ( '' !== (string) $wpdb->last_error ) {
@@ -1419,8 +1415,8 @@ class DeliveryRepository {
 
 			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- lifecycle cleanup of the plugin-owned tombstone table.
 			$deleted = $wpdb->query(
-				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$table} is a plugin-derived identifier; {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above, so every value is bound by prepare(). The sniff cannot see placeholders that arrive via a variable.
-				$wpdb->prepare( "DELETE FROM {$table} WHERE id IN ( {$placeholders} )", $chunk )
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- {$placeholders} is a generated run of %d tokens counted from $chunk, whose members are all int-cast above, so every value is bound by prepare(). The sniff cannot see placeholders that arrive via a variable.
+				$wpdb->prepare( "DELETE FROM %i WHERE id IN ( {$placeholders} )", array_merge( array( $table ), $chunk ) )
 			);
 
 			if ( false === $deleted ) {
@@ -1465,9 +1461,12 @@ class DeliveryRepository {
 		global $wpdb;
 		$table = $this->table();
 
+		// ⚠ ONE LINE, NOT TWO STACKED. `phpcs:ignore` applies to the NEXT line, so a
+		// second annotation below it consumes the first — which is how the
+		// DirectQuery/NoCaching half of this suppression was silently inert until
+		// Plugin Check reported it (Prompt 13).
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- aggregate over the plugin-owned tombstone table.
-		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- {$table} is a plugin-derived identifier, not user input; the statement takes no parameters.
-		return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table}" );
+		return (int) $wpdb->get_var( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
 	}
 
 	/**

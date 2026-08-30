@@ -67,18 +67,41 @@ abstract class ManualDeliveryTestCase extends DeliveryTestCase {
 		$order_id    = (int) ( $fields['order'] ?? 0 );
 		$rule_id     = (int) ( $fields['rule'] ?? 0 );
 
-		$subject = DeliveryActions::ACTION_MANUAL === $action ? $order_id : $delivery_id;
+		$subject = DeliveryActions::is_order_scoped( $action ) ? $order_id : $delivery_id;
 
 		return array(
 			'action'                        => $action,
 			DeliveryActions::FIELD_DELIVERY => $delivery_id,
 			DeliveryActions::FIELD_ORDER    => $order_id,
 			DeliveryActions::FIELD_RULE     => $rule_id,
-			DeliveryActions::FIELD_TOKEN    => '' !== $token ? $token : ConfirmationToken::issue(),
+			DeliveryActions::FIELD_TOKEN    => '' !== $token ? $token : $this->confirmation_token( $action, $delivery_id, $order_id, $rule_id ),
 			DeliveryActions::FIELD_NONCE    => '' !== $nonce
 				? $nonce
 				: wp_create_nonce( DeliveryActions::nonce_action( $action, $subject, $rule_id ) ),
 		);
+	}
+
+	/**
+	 * A token minted the way the confirmation SCREEN mints it.
+	 *
+	 * ⚠ THROUGH `DeliveryActions::confirmation()`, NOT `ConfirmationToken::issue()`.
+	 * The token binds the action, the subject ids and the RECIPIENTS THE SCREEN SHOWED
+	 * (Prompt 13A item 4), so a bare `issue()` would produce a token bound to nothing
+	 * and every submission would be refused as `confirmation_changed`. Going through
+	 * the screen's own builder is also the point of these tests: they submit what a
+	 * browser would submit, and a browser only ever has a token the screen gave it.
+	 *
+	 * @param string $action      The action.
+	 * @param int    $delivery_id Delivery id.
+	 * @param int    $order_id    Order id.
+	 * @param int    $rule_id     Rule id.
+	 * @param string $address     Test address, for the test action.
+	 * @return string The token, or '' when the confirmation itself refuses.
+	 */
+	protected function confirmation_token( string $action, int $delivery_id, int $order_id, int $rule_id, string $address = '' ): string {
+		$context = DeliveryActions::confirmation( $action, $delivery_id, $order_id, $rule_id, $address );
+
+		return (string) ( $context['token'] ?? '' );
 	}
 
 	/**

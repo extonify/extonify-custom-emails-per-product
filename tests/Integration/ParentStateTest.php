@@ -588,6 +588,31 @@ final class ParentStateTest extends DeliveryTestCase {
 			'sanitized_fields',
 		);
 
+		/*
+		 * ⚠ A THIRD CATEGORY, AND IT IS NEITHER OF THE OTHER TWO ON PURPOSE (ADR-0012
+		 * §11c, ADR-0020 §4b-i). These are OUTCOMES of one `WC_Email::send()` rather than
+		 * inputs to one delivery or configuration set once per request:
+		 *
+		 *   - they are written in `Custom_Email::send()`'s `finally`, which runs AFTER
+		 *     `trigger()` would restore a captured frame — so a `RUNTIME_FIELDS` entry
+		 *     would be wiped before the caller could read it;
+		 *   - and `trigger()` therefore clears them on ENTRY instead, so a delivery that
+		 *     returns before reaching `send()` cannot report the PREVIOUS delivery's
+		 *     answer. That is the same state-bleed rule the framed fields obey, applied
+		 *     at the other end of the call.
+		 *
+		 * Last write wins, which is correct under nesting rather than in spite of it: an
+		 * inner send completes — and writes — before the outer send's `finally` writes
+		 * its own.
+		 *
+		 * ⚠ THIS LIST IS WHY THE TEST IS STILL A COMPLETENESS GUARD. Adding a property
+		 * here is a decision somebody has to write down; leaving one out is a red test.
+		 */
+		$per_send_outcome = array(
+			'lock_outcome',
+			'lock_stack_residue',
+		);
+
 		$unclassified = array();
 
 		foreach ( ( new \ReflectionClass( Custom_Email::class ) )->getProperties() as $property ) {
@@ -597,7 +622,9 @@ final class ParentStateTest extends DeliveryTestCase {
 
 			$name = $property->getName();
 
-			if ( in_array( $name, $framed, true ) || in_array( $name, $per_request, true ) ) {
+			if ( in_array( $name, $framed, true )
+				|| in_array( $name, $per_request, true )
+				|| in_array( $name, $per_send_outcome, true ) ) {
 				continue;
 			}
 
@@ -610,8 +637,9 @@ final class ParentStateTest extends DeliveryTestCase {
 			array(),
 			$unclassified,
 			"Unclassified propert(ies) on the shared email object: " . implode( ', ', $unclassified )
-			. '. Each must be added to Custom_Email::RUNTIME_FIELDS (per delivery) or to this'
-			. ' test\'s per-request allow-list, with the reason recorded in ADR-0012 §11c.'
+			. '. Each must be added to Custom_Email::RUNTIME_FIELDS (per delivery), to this'
+			. ' test\'s per-request allow-list, or to its per-send-outcome allow-list, with the'
+			. ' reason recorded in ADR-0012 §11c.'
 		);
 
 		// Every framed field must actually exist, so a typo in RUNTIME_FIELDS

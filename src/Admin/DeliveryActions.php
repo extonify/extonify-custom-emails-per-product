@@ -10,6 +10,7 @@ namespace Extonify\WCEP\Admin;
 use Extonify\WCEP\Delivery\ManualDelivery;
 use Extonify\WCEP\Delivery\TestDelivery;
 use Extonify\WCEP\Domain\DeliveryIdentity;
+use Extonify\WCEP\Domain\DeliverySnapshot;
 use Extonify\WCEP\Plugin;
 use Extonify\WCEP\Repository\DeliveryRepository;
 
@@ -176,16 +177,45 @@ final class DeliveryActions {
 			return self::denied( __( 'This confirmation has expired. Open the delivery again and confirm once more.', 'extonify-custom-emails-per-product' ) );
 		}
 
-		// 4. ⚠ THE TOKEN, CONSUMED ATOMICALLY, AND ONLY NOW (ADR-0019 §5, gate 37).
+		$address = self::submitted_address( $post );
+
+		/*
+		 * 4. ⚠ THE CONTEXT IS REBUILT BEFORE THE TOKEN IS CONSUMED, AND IT IS A READ
+		 * (Prompt 13A item 4).
+		 *
+		 * It resolves who this action would reach RIGHT NOW, from the same builder the
+		 * confirmation screen used — including, for a scheduled delivery, the SNAPSHOT
+		 * the send will run from. That answer is what the token is checked against, so
+		 * a confirmation whose subject moved underneath the merchant is refused rather
+		 * than executed against people they never saw.
+		 *
+		 * ⚠ IT IS BEFORE THE CONSUME BECAUSE THE CONSUME NEEDS IT, and it is safe to be
+		 * there because it writes nothing — the same reasoning that puts the nonce
+		 * before the token. A request refused here has not burnt the confirmation, so
+		 * a merchant whose order was momentarily unreadable can simply submit again.
+		 */
+		$context = self::confirmation_context( $action, $delivery_id, $order_id, $rule_id, $address );
+
+		if ( '' !== (string) $context['refusal'] ) {
+			return self::refused( (string) $context['refusal'], $delivery_id, $order_id, $action, $rule_id );
+		}
+
+		// 5. ⚠ THE TOKEN, CONSUMED ATOMICALLY, AND ONLY NOW (ADR-0019 §5, gate 37).
 		// Whoever wins this single statement owns the one execution of this
 		// confirmation; everybody else is a replay and sends nothing.
 		$token = isset( $post[ self::FIELD_TOKEN ] ) ? sanitize_text_field( wp_unslash( $post[ self::FIELD_TOKEN ] ) ) : '';
 
-		if ( ! ConfirmationToken::consume( $token ) ) {
-			return self::refused( 'replayed', $delivery_id, $order_id );
+		$consumed = ConfirmationToken::consume( $token, self::fingerprint_of( $context ) );
+
+		if ( ConfirmationToken::OK !== $consumed ) {
+			// ⚠ THE TWO REFUSALS ARE TOLD APART. `replayed` means this confirmation has
+			// already run; `confirmation_changed` means it was for something else — a
+			// different action, a different subject, or a different set of people —
+			// and those need different responses from the merchant (gate 38).
+			return self::refused( $consumed, $delivery_id, $order_id, $action, $rule_id );
 		}
 
-		return self::dispatch( $action, $delivery_id, $order_id, $rule_id, $token, self::submitted_address( $post ) );
+		return self::dispatch( $action, $delivery_id, $order_id, $rule_id, $token, $address );
 	}
 
 	/**
@@ -261,17 +291,37 @@ final class DeliveryActions {
 			return self::refused( $code, $delivery_id, $order_id, $action, $rule_id );
 		}
 
-		return self::redirect( self::success_message( $action, $code ), $delivery_id, $order_id, $action, $rule_id );
+		return self::redirect(
+			self::outcome_message( $action, $code ),
+			$delivery_id,
+			$order_id,
+			$action,
+			$rule_id,
+			// ⚠ THE COUNTS TRAVEL ONLY FOR A PARTIAL OUTCOME, because that is the only
+			// sentence that names them. Two integers, `absint()`-ed on the way back in;
+			// the recorded REASON deliberately does not travel, because it can hold a
+			// mailer's own error string and a URL is not the place for free text this
+			// plugin does not own. See `Notices::counted_message()`.
+			ManualDelivery::RESULT_PARTIAL === $code
+				? array( (int) ( $result['sent'] ?? 0 ), (int) ( $result['total'] ?? 0 ) )
+				: array()
+		);
 	}
 
 	/**
-	 * The notice code one successful action reports.
+	 * The notice code one EXECUTED action reports.
+	 *
+	 * ⚠ RENAMED FROM `success_message()`, AND THE RENAME IS THE POINT (Prompt 13A item
+	 * 3, gate 18). It never only returned successes — `send_now` has reported a warning
+	 * since Prompt 11 — and now none of the sending actions does either. An action that
+	 * ran is not an action that sent, and the method that names the notice is where
+	 * that distinction has to be made or it is made nowhere.
 	 *
 	 * @param string $action The action.
 	 * @param string $code   The result's own code.
 	 * @return string
 	 */
-	private static function success_message( string $action, string $code ): string {
+	private static function outcome_message( string $action, string $code ): string {
 		if ( self::ACTION_SEND_NOW === $action ) {
 			// ⚠ THE TOMBSTONE'S OWN STATUS, NOT "sent". `send_now()` runs the scheduler's
 			// full re-validation (ADR-0019 §7), so a delivery whose rule was disabled
@@ -281,7 +331,19 @@ final class DeliveryActions {
 		}
 
 		if ( self::ACTION_CANCEL === $action ) {
+			// Cancel sends nothing by definition, so it has no send outcome to report.
 			return 'wcep_cancelled';
+		}
+
+		/*
+		 * ⚠ THE THREE SENDING ACTIONS SHARE ONE OUTCOME VOCABULARY, and only
+		 * `RESULT_SENT` reaches an action-specific success sentence. The other four
+		 * answers are the same fact whichever button produced them — nothing went out,
+		 * or only some of it did — and giving each action its own wording for that would
+		 * be four more sentences to keep true.
+		 */
+		if ( ManualDelivery::RESULT_SENT !== $code ) {
+			return self::not_sent_message( $code );
 		}
 
 		if ( self::ACTION_TEST === $action ) {
@@ -289,6 +351,26 @@ final class DeliveryActions {
 		}
 
 		return self::ACTION_MANUAL === $action ? 'wcep_sent_manual' : 'wcep_resent';
+	}
+
+	/**
+	 * The notice for a send that did not fully happen.
+	 *
+	 * ⚠ AN UNRECOGNISED CODE FALLS TO `wcep_not_sent_unknown`, NEVER TO A SUCCESS. That
+	 * is the direction this whole item is about: the safe default when the plugin does
+	 * not know what happened is to say so.
+	 *
+	 * @param string $code A `ManualDelivery::RESULT_*` code.
+	 * @return string
+	 */
+	private static function not_sent_message( string $code ): string {
+		$messages = array(
+			ManualDelivery::RESULT_PARTIAL => 'wcep_partly_sent',
+			ManualDelivery::RESULT_FAILED  => 'wcep_not_sent_failed',
+			ManualDelivery::RESULT_SKIPPED => 'wcep_not_sent_skipped',
+		);
+
+		return $messages[ $code ] ?? 'wcep_not_sent_unknown';
 	}
 
 	/**
@@ -329,14 +411,15 @@ final class DeliveryActions {
 	 * @param int    $order_id    Order id.
 	 * @param string $action      The action, which decides where the merchant lands.
 	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
+	 * @param int[]  $counts      `[ sent, total ]` for a partial outcome, else empty.
 	 * @return array
 	 */
-	private static function redirect( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0 ): array {
+	private static function redirect( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0, array $counts = array() ): array {
 		return array(
 			'outcome'     => RuleActions::OUTCOME_REDIRECT,
 			'refusal'     => '',
 			'delivery_id' => $delivery_id,
-			'url'         => self::return_url( $message, $delivery_id, $order_id, $action, $rule_id ),
+			'url'         => self::return_url( $message, $delivery_id, $order_id, $action, $rule_id, $counts ),
 		);
 	}
 
@@ -368,9 +451,19 @@ final class DeliveryActions {
 	 * @param int    $order_id    Order id.
 	 * @param string $action      The action, which decides where the merchant lands.
 	 * @param int    $rule_id     Rule id, for the actions that return to a rule screen.
+	 * @param int[]  $counts      `[ sent, total ]` for a partial outcome, else empty.
 	 * @return string
 	 */
-	private static function return_url( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0 ): string {
+	private static function return_url( string $message, int $delivery_id, int $order_id, string $action = '', int $rule_id = 0, array $counts = array() ): string {
+		$tally = array();
+
+		if ( 2 === count( $counts ) ) {
+			$tally = array(
+				Notices::ARG_SENT  => max( 0, (int) $counts[0] ),
+				Notices::ARG_TOTAL => max( 0, (int) $counts[1] ),
+			);
+		}
+
 		if ( self::ACTION_TEST === $action ) {
 			return Menu::url(
 				array(
@@ -378,11 +471,11 @@ final class DeliveryActions {
 					'rule'            => $rule_id,
 					self::FIELD_ORDER => $order_id,
 					Notices::ARG      => $message,
-				)
+				) + $tally
 			);
 		}
 
-		$args = array( Notices::ARG => $message );
+		$args = array( Notices::ARG => $message ) + $tally;
 
 		if ( $order_id > 0 ) {
 			$args[ DeliveriesListTable::ARG_ORDER ] = $order_id;
@@ -418,6 +511,45 @@ final class DeliveryActions {
 	 * @return array
 	 */
 	public static function confirmation( string $action, int $delivery_id, int $order_id, int $rule_id, string $address = '' ): array {
+		$context = self::confirmation_context( $action, $delivery_id, $order_id, $rule_id, $address );
+
+		if ( '' !== (string) $context['refusal'] ) {
+			return $context;
+		}
+
+		/*
+		 * ⚠ THE TOKEN IS BOUND TO THE CONTEXT THIS SCREEN IS ABOUT TO DISPLAY
+		 * (Prompt 13A item 4). Issuing it here — after the context is built, from the
+		 * context itself — is what makes "the merchant confirmed THIS" checkable at
+		 * the other end, rather than "the merchant confirmed SOMETHING".
+		 */
+		$context['token'] = ConfirmationToken::issue( self::fingerprint_of( $context ) );
+
+		return $context;
+	}
+
+	/**
+	 * Everything the confirmation screen shows, WITHOUT issuing a token.
+	 *
+	 * ⚠ SPLIT OUT BECAUSE THE HANDLER NEEDS IT TOO, AND ISSUING IS A WRITE. The POST
+	 * handler has to rebuild the same context to check the token against it; calling
+	 * `confirmation()` there would mint a second token on every submission — an
+	 * unbounded write on the send path, and a fresh valid confirmation nobody asked
+	 * for.
+	 *
+	 * ⚠ AND BECAUSE ONE BUILDER IS THE POINT. The screen and the handler must agree
+	 * about what is being confirmed; two implementations of "who would this reach"
+	 * would be two answers, which is the defect this item is fixing rather than a
+	 * shape to reproduce.
+	 *
+	 * @param string $action      The action.
+	 * @param int    $delivery_id Delivery id.
+	 * @param int    $order_id    Order id.
+	 * @param int    $rule_id     Rule id.
+	 * @param string $address     Test address the merchant typed, for the test action.
+	 * @return array
+	 */
+	public static function confirmation_context( string $action, int $delivery_id, int $order_id, int $rule_id, string $address = '' ): array {
 		$deliveries = Plugin::instance()->deliveries();
 
 		$tombstone = $delivery_id > 0 ? $deliveries->find_by_id( $delivery_id ) : null;
@@ -469,8 +601,15 @@ final class DeliveryActions {
 		} else {
 			// ⚠ RESOLVED, NOT THE RULE'S DEFINITION (ADR-0019 §6). A merchant shown
 			// `{customer_email}` has not been told who is about to be emailed.
-			$resolved   = '';
-			$recipients = self::preview_recipients( $order, (array) $rule );
+			$resolved = '';
+
+			$source = self::recipient_source( $delivery_id, $rule_id, (array) $rule, (array) $tombstone );
+
+			if ( '' !== (string) $source['refusal'] ) {
+				return array( 'refusal' => (string) $source['refusal'] );
+			}
+
+			$recipients = self::preview_recipients( $order, (array) $source['rule'] );
 		}
 
 		return array(
@@ -483,7 +622,77 @@ final class DeliveryActions {
 			'tombstone'  => (array) $tombstone,
 			'recipients' => $recipients,
 			'address'    => $resolved,
-			'token'      => ConfirmationToken::issue(),
+			'token'      => '',
+		);
+	}
+
+	/**
+	 * WHICH RULE ROW THE CONFIRMATION MUST RESOLVE RECIPIENTS FROM.
+	 *
+	 * ⚠ A SCHEDULED DELIVERY SENDS FROM ITS SNAPSHOT, SO ITS CONFIRMATION MUST READ
+	 * THE SNAPSHOT (Prompt 13A item 4, ADR-0015 §2).
+	 *
+	 * This was the real defect. Send Now's confirmation resolved the CURRENT rule while
+	 * `ScheduledDelivery::run()` sends from the row it snapshotted when the delivery was
+	 * queued. A merchant who edited the rule's recipients during the delay was therefore
+	 * shown one set of addresses and mailed another — with nothing on any screen saying
+	 * so, and no attacker involved. Reading the same source the send reads makes the
+	 * screen and the send agree BY CONSTRUCTION; the token fingerprint then catches the
+	 * case where the world moves between rendering and confirming.
+	 *
+	 * ⚠ RESEND AND MANUAL KEEP THE LIVE RULE, deliberately. ADR-0019 §3: a resend
+	 * renders from the rule AS IT IS NOW — that is the whole reason to resend — and
+	 * ADR-0015 §2 releases the snapshot at the terminal state, so there is nothing else
+	 * to read. A manual send has never had a snapshot at all.
+	 *
+	 * @param int   $delivery_id Delivery id.
+	 * @param int   $rule_id     Rule id.
+	 * @param array $rule        The LIVE rule row.
+	 * @param array $tombstone   The tombstone row, if any.
+	 * @return array{refusal:string, rule:array}
+	 */
+	private static function recipient_source( int $delivery_id, int $rule_id, array $rule, array $tombstone ): array {
+		if ( DeliveryRepository::SCHEDULED !== (string) ( $tombstone['final_status'] ?? '' ) ) {
+			return array(
+				'refusal' => '',
+				'rule'    => $rule,
+			);
+		}
+
+		$snapshot = Plugin::instance()->deliveries()->snapshot_of( $delivery_id );
+
+		if ( null === $snapshot ) {
+			/*
+			 * ⚠ REFUSED, NOT SILENTLY FALLEN BACK TO THE LIVE RULE. An unreadable
+			 * snapshot is exactly what `ScheduledDelivery` cancels the delivery for
+			 * (`REASON_NO_SNAPSHOT`), so showing a confirmation built from a different
+			 * source would promise a send that is about to be cancelled.
+			 */
+			return array(
+				'refusal' => ManualDelivery::REFUSED_NO_SNAPSHOT,
+				'rule'    => array(),
+			);
+		}
+
+		return array(
+			'refusal' => '',
+			'rule'    => DeliverySnapshot::as_rule_row( $snapshot, $rule_id ),
+		);
+	}
+
+	/**
+	 * The fingerprint one confirmation context binds its token to.
+	 *
+	 * @param array $context Result of self::confirmation_context().
+	 * @return string
+	 */
+	private static function fingerprint_of( array $context ): string {
+		return ConfirmationToken::fingerprint(
+			(string) $context['action'],
+			(int) $context['delivery'],
+			(int) $context['order'],
+			(int) $context['rule'],
+			(array) $context['recipients']
 		);
 	}
 

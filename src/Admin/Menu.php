@@ -42,8 +42,14 @@ final class Menu {
 	 * ADR-0018 §1 GRANTS HERE. The editor is the same subject matter as the list,
 	 * reached from it, so an `action` parameter was enough. History is a peer
 	 * destination with its own subject — deliveries, not rules — and a merchant asking
-	 * "did this customer get their email" is not editing anything. It costs one
-	 * submenu row under a menu this plugin already appears in, not a top-level slot.
+	 * "did this customer get their email" is not editing anything.
+	 *
+	 * ⚠ IT NO LONGER COSTS A SUBMENU ROW (ADR-0018 §1a). This docblock used to end
+	 * "it costs one submenu row under a menu this plugin already appears in, not a
+	 * top-level slot" — true when written, and superseded in Prompt 13C Part F. The
+	 * page is still separately registered for the reason above; it is now reached by a
+	 * TAB on the rules screen, and `add_history_page()` parents it to the RULES page so
+	 * that WordPress never draws a row for it.
 	 */
 	const HISTORY_PAGE = 'extonify-wcep-history';
 
@@ -111,8 +117,50 @@ final class Menu {
 		add_action( 'admin_menu', array( self::class, 'add_page' ) );
 		add_action( 'admin_enqueue_scripts', array( Assets::class, 'enqueue' ) );
 
+		/*
+		 * ⚠ `Settings`, NOT THE PLUGIN'S NAME. WooCommerce's extension guidance asks for
+		 * no branding and no self-promotion in the interface, and the plugins list
+		 * already prints the plugin's name on the same row — a second copy of it as the
+		 * action link is the redundancy the guidance names.
+		 *
+		 * ⚠ AND IT POINTS AT THE RULES SCREEN, which is where a merchant who clicks
+		 * "Settings" from the plugins list expects to land: the thing they configure.
+		 * The global on/off switch lives under WooCommerce → Settings → Emails and stays
+		 * there; it is one checkbox in WooCommerce's own settings surface, and moving it
+		 * here to justify the link's name would be the wrong way round.
+		 */
+		add_filter(
+			'plugin_action_links_' . plugin_basename( EXTONIFY_WCEP_FILE ),
+			array( self::class, 'plugin_action_links' )
+		);
+
 		TargetSearch::register();
 		OrderPanel::register();
+	}
+
+	/**
+	 * Prepend a `Settings` link to this plugin's row in the plugins list.
+	 *
+	 * ⚠ NO CAPABILITY CHECK IS NEEDED OR WANTED HERE, and that is worth stating so it
+	 * is not "fixed" later. This filter only runs while WordPress is rendering the
+	 * plugins list, which already requires `activate_plugins`; and the link is a link —
+	 * following it reaches `load()`/`render()`, both of which call
+	 * `require_capability()`. Adding a check here would guard the DRAWING of a link,
+	 * which is precisely the mistake the class docblock above warns about.
+	 *
+	 * @param mixed $links Existing action links, as WordPress passes them.
+	 * @return array
+	 */
+	public static function plugin_action_links( $links ): array {
+		$links = is_array( $links ) ? $links : array();
+
+		array_unshift(
+			$links,
+			'<a href="' . esc_url( self::url() ) . '">'
+				. esc_html__( 'Settings', 'extonify-custom-emails-per-product' ) . '</a>'
+		);
+
+		return $links;
 	}
 
 	/**
@@ -123,8 +171,8 @@ final class Menu {
 	public static function add_page(): void {
 		$hook = add_submenu_page(
 			self::PARENT,
-			__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ),
-			__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ),
+			__( 'Product Emails', 'extonify-custom-emails-per-product' ),
+			__( 'Product Emails', 'extonify-custom-emails-per-product' ),
 			self::CAPABILITY,
 			self::PAGE,
 			array( self::class, 'render' )
@@ -151,13 +199,37 @@ final class Menu {
 	 * authorisation, because `admin.php?page=…` is reachable by URL whether the menu
 	 * rendered it or not.
 	 *
+	 * ⚠ ITS PARENT IS THE RULES PAGE, NOT `woocommerce`, AND THAT IS THE WHOLE TRICK
+	 * (ADR-0018 §1a). WordPress renders a submenu only for slugs that appear in the
+	 * top-level `$menu`. `extonify-wcep-rules` is itself a submenu of `woocommerce`, so
+	 * `$submenu['extonify-wcep-rules']` is registered, resolvable and **never walked by
+	 * the menu renderer** — the page exists and no row is drawn for it.
+	 *
+	 * ⚠ `remove_submenu_page()` WAS TRIED FIRST AND IS WRONG. It deletes the row from
+	 * `$submenu`, and `$submenu` is exactly where WordPress looks up a plugin page's
+	 * parent. With the row gone `get_admin_page_parent()` returns empty,
+	 * `get_plugin_page_hookname()` then computes `admin_page_…` instead of the
+	 * `woocommerce_page_…` that `add_submenu_page()` registered, `get_plugin_page_hook()`
+	 * finds no action under that name, and `wp-admin/admin.php` dies with
+	 * **"Cannot load extonify-wcep-history."** — a 403, then a 500, for an administrator.
+	 * Part F shipped that briefly and caught it by fetching the page over HTTP; no unit
+	 * test saw it, because they all call `render_history()` directly and never traverse
+	 * `admin.php`. Keeping a real `$submenu` entry under a non-rendered parent keeps
+	 * WordPress's own routing intact instead of re-implementing it.
+	 *
+	 * ⚠ THE CAPABILITY IS STILL CHECKED TWICE, AND THE SECOND ONE IS THE REAL ONE.
+	 * `user_can_access_admin_page()` reads the capability out of this `$submenu` entry,
+	 * so a hidden page is protected by WordPress exactly as a visible one is; and
+	 * `load_history()`/`render_history()` still call `require_capability()` first,
+	 * because a menu entry has never been this plugin's authority on access.
+	 *
 	 * @return void
 	 */
 	private static function add_history_page(): void {
 		$hook = add_submenu_page(
-			self::PARENT,
-			__( 'Custom Email History', 'extonify-custom-emails-per-product' ),
-			__( 'Custom Email History', 'extonify-custom-emails-per-product' ),
+			self::PAGE,
+			__( 'Delivery History', 'extonify-custom-emails-per-product' ),
+			__( 'Delivery History', 'extonify-custom-emails-per-product' ),
 			self::CAPABILITY,
 			self::HISTORY_PAGE,
 			array( self::class, 'render_history' )
@@ -390,7 +462,7 @@ final class Menu {
 
 		wp_die(
 			esc_html__( 'You are not allowed to manage custom product emails.', 'extonify-custom-emails-per-product' ),
-			esc_html__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ),
+			esc_html__( 'Product Emails', 'extonify-custom-emails-per-product' ),
 			array( 'response' => 403 )
 		);
 	}
@@ -407,7 +479,7 @@ final class Menu {
 		if ( RuleActions::OUTCOME_DENIED === $outcome ) {
 			wp_die(
 				esc_html( (string) ( $result['message'] ?? '' ) ),
-				esc_html__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ),
+				esc_html__( 'Product Emails', 'extonify-custom-emails-per-product' ),
 				array( 'response' => 403 )
 			);
 		}

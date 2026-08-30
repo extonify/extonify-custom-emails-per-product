@@ -56,10 +56,39 @@ final class ManualDelivery {
 	const REFUSED_EMAIL_MISSING    = 'email_unavailable';
 
 	/**
+	 * A scheduled delivery whose stored snapshot cannot be read (Prompt 13A item 4).
+	 *
+	 * ⚠ IT IS A CONFIRMATION-SCREEN REFUSAL, and it exists because the screen now
+	 * resolves recipients from the SAME snapshot the send will use (ADR-0015 §2). A
+	 * snapshot that will not read is exactly what `ScheduledDelivery` cancels the
+	 * delivery for, so building the confirmation from anything else would show a
+	 * merchant a send that is about to be cancelled.
+	 */
+	const REFUSED_NO_SNAPSHOT = 'snapshot_unreadable';
+
+	/**
 	 * Outcome codes.
 	 */
 	const OK      = 'ok';
 	const REFUSED = 'refused';
+
+	/**
+	 * WHAT A COMPLETED SEND ACTUALLY DID (Prompt 13A item 3, gate 18).
+	 *
+	 * ⚠ THESE ARE NOT REFUSALS AND MUST NOT BE READ AS ONE. A refusal means nothing
+	 * was attempted; these describe an action that RAN. `OK` still means "the request
+	 * was accepted and executed" — it is `code` that says whether an email went out,
+	 * and only `RESULT_SENT` may render as a success notice.
+	 *
+	 * ⚠ THE VALUES ARE `RunOutcome::summarise()`'s, NOT A PARALLEL VOCABULARY. Two
+	 * spellings of the same five answers is two things to keep in step, and the one
+	 * that drifts is the one nobody is looking at.
+	 */
+	const RESULT_SENT       = 'sent';
+	const RESULT_PARTIAL    = 'partial';
+	const RESULT_FAILED     = 'failed';
+	const RESULT_SKIPPED    = 'skipped';
+	const RESULT_NO_OUTCOME = 'none';
 
 	/**
 	 * Resend a delivery that already reached a terminal state (ADR-0019 §3).
@@ -297,12 +326,17 @@ final class ManualDelivery {
 
 		$delivery_id = (int) $claim['delivery_id'];
 
-		$orchestrator->send_manual( $order, (array) $rule, $items, $delivery_id, $identity, 'manual' );
+		// ⚠ THE RETURN VALUE IS THE OUTCOME AND IS NOT DISCARDED. See self::report_of().
+		$report = self::report_of(
+			$orchestrator->send_manual( $order, (array) $rule, $items, $delivery_id, $identity, 'manual' )
+		);
 
 		return array(
 			'outcome'     => self::OK,
-			'code'        => self::ACTION_MANUAL,
+			'code'        => $report['code'],
 			'delivery_id' => $delivery_id,
+			'sent'        => $report['sent'],
+			'total'       => $report['total'],
 		);
 	}
 
@@ -374,12 +408,16 @@ final class ManualDelivery {
 		// ⚠ TYPED `resend`, DECLARED BY THE ACTION (ADR-0019 §8). This path is only
 		// reached for a tombstone that already reached a terminal state, so the delivery
 		// genuinely has history behind it.
-		$orchestrator->send_manual( $order, $rule, $items, $delivery_id, $identity, 'resend' );
+		$report = self::report_of(
+			$orchestrator->send_manual( $order, $rule, $items, $delivery_id, $identity, 'resend' )
+		);
 
 		return array(
 			'outcome'     => self::OK,
-			'code'        => self::ACTION_RESEND,
+			'code'        => $report['code'],
 			'delivery_id' => $delivery_id,
+			'sent'        => $report['sent'],
+			'total'       => $report['total'],
 		);
 	}
 
@@ -446,6 +484,38 @@ final class ManualDelivery {
 		$order = wc_get_order( $order_id );
 
 		return $order instanceof \WC_Order ? $order : null;
+	}
+
+	/**
+	 * WHAT ONE COMPLETED RUN DID, as the admin layer needs to report it.
+	 *
+	 * ⚠ THE `RunOutcome` USED TO BE DISCARDED, AND THAT WAS THE DEFECT. Every sending
+	 * path — `send_manual()`, `execute()` and `TestDelivery::send()` — called the
+	 * orchestrator, ignored what it returned and reported `OK` with a fixed code. So a
+	 * failed mailer, a delivery-filter refusal, a partially failed fan-out and zero
+	 * messages sent all reached the merchant as *"The email was sent."* Gate 18 exists
+	 * precisely so a delivery never reports an outcome it did not have, and the admin
+	 * notice is the one place a merchant reads that outcome.
+	 *
+	 * ⚠ A `null` RUN IS `none`, NOT A SUCCESS. `send_manual()`, `send_test()` and
+	 * `send_scheduled()` all return null when orchestration was inert — the schema went
+	 * away, the email class vanished, a preview signal was in force. The identity is
+	 * claimed by then, so something DID happen; what did not happen is a send.
+	 *
+	 * @param RunOutcome|null $run What the orchestrator reported.
+	 * @return array{code:string, sent:int, total:int, recorded:bool}
+	 */
+	public static function report_of( ?RunOutcome $run ): array {
+		if ( null === $run ) {
+			return array(
+				'code'     => self::RESULT_NO_OUTCOME,
+				'sent'     => 0,
+				'total'    => 0,
+				'recorded' => false,
+			);
+		}
+
+		return $run->summarise();
 	}
 
 	/**

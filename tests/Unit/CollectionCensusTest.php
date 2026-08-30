@@ -101,6 +101,7 @@ final class CollectionCensusTest extends UnitTestCase {
 		'RenderLedger::$slots[*][rules][*][notes]' => 'cap: MAX_RULE_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in the entry\'s dropped_notes',
 		'PlaceholderValues::$notes'               => 'cap: MAX_NOTES entries, each capped at Text::MAX_NOTE_LENGTH bytes; overflow counted in $dropped_notes',
 		'PlaceholderResolver::render_sectioned_body() merged notes' => 'cap: PlaceholderValues::MAX_NOTES entries via fold_notes(), de-duplicated across the cap fallback\'s sections so one authoring mistake is one note however many units met it; overflow counted and reported by folded_notes() (ADR-0016 §7a)',
+		'Custom_Email::send() $shot[matches]'      => 'depth: one entry per wp_mail() invocation open inside one locked send, KEYED BY that invocation\'s own wp_mail nesting depth (written at PHP_INT_MIN, consumed at PHP_INT_MAX), so it is bounded by wp_mail() nesting depth and an abandoned invocation cannot add a second entry at the same key; the send\'s finally resets it to empty and COUNTS what it discarded (Custom_Email::lock_stack_residue())',
 	);
 
 	/**

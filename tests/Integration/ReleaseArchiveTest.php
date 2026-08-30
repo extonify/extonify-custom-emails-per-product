@@ -113,6 +113,43 @@ final class ReleaseArchiveTest extends TestCase {
 	}
 
 	/**
+	 * ⚠ `composer.json` IS SHIPPED ON PURPOSE, AND ITS PRESENCE IS GATED (13C Part J).
+	 *
+	 * The Plugin Review Team's *"Using composer but no composer.json file"* note asks
+	 * for the manifest to be included "even if it is only used for development
+	 * purposes", so others can review, study and fork the build. Shipping the manifest
+	 * is NOT shipping dev dependencies: `composer.lock` stays out and `--no-dev` keeps
+	 * every `require-dev` package out of `vendor/`, both still asserted above.
+	 *
+	 * This test exists because narrowing an exclusion must not quietly turn it into an
+	 * unchecked one — the file that stopped being forbidden is now required.
+	 *
+	 * @return void
+	 */
+	public function test_the_composer_manifest_is_shipped() {
+		$this->assertContains(
+			self::SLUG . '/composer.json',
+			self::$entries,
+			'composer.json is shipped deliberately (13C Part J) and is missing from the archive.'
+		);
+
+		$zip = new ZipArchive();
+		$this->assertTrue( true === $zip->open( self::$zip_path ) );
+		$manifest = (string) $zip->getFromName( self::SLUG . '/composer.json' );
+		$zip->close();
+
+		$this->assertJson( $manifest, 'The shipped composer.json is not valid JSON.' );
+
+		$decoded = json_decode( $manifest, true );
+
+		$this->assertSame(
+			'GPL-2.0-or-later',
+			$decoded['license'] ?? null,
+			'The shipped manifest must declare the GPL licence the plugin ships under.'
+		);
+	}
+
+	/**
 	 * Nothing excluded by .distignore reached the archive.
 	 *
 	 * @dataProvider forbidden_pattern_provider
@@ -139,7 +176,8 @@ final class ReleaseArchiveTest extends TestCase {
 			'poc harness'       => array( '#(^|/)poc/#', 'the POC harness' ),
 			'tests'             => array( '#(^|/)tests/#', 'the test suite' ),
 			'own bin scripts'   => array( '#^' . self::SLUG . '/bin/#', 'the bin scripts' ),
-			'composer manifest' => array( '#(^|/)composer\.(json|lock)$#', 'Composer manifests' ),
+			'composer lock'     => array( '#(^|/)composer\.lock$#', 'the Composer lock file' ),
+			'empty vendor bin'  => array( '#(^|/)vendor/bin/#', 'the empty vendor/bin directory' ),
 			'tool config'       => array( '#\.xml\.dist$#', 'tooling config' ),
 			'markdown'          => array( '#\.md$#', 'Markdown documentation' ),
 			'node modules'      => array( '#(^|/)node_modules/#', 'node_modules' ),

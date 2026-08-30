@@ -18,10 +18,30 @@
 	<arg name="extensions" value="php"/>
 	<arg name="parallel" value="4"/>
 
-	<config name="minimum_wp_version" value="6.5"/>
+	<!-- ADR-0006: settled at 6.6 by the Prompt 13 release matrix. Kept in step with
+	     EXTONIFY_WCEP_MIN_WP and the readme.txt "Requires at least" header. -->
+	<config name="minimum_wp_version" value="6.6"/>
 
-	<!-- ADR-0006: PHP floor is 8.0 and the ceiling is deliberately open, so a
-	     newer PHP release is linted for compatibility the day it appears. -->
+	<!--
+		ADR-0006: the PHP floor is 8.0 and the ceiling is open, so every version above
+		the floor is checked.
+
+		⚠ "OPEN CEILING" IS A PROPERTY OF THE RANGE, NOT A PROMISE ABOUT FUTURE PHP
+		RELEASES, AND THE COMMENT THAT USED TO STAND HERE GOT THAT WRONG. It claimed a
+		newer PHP release is "linted for compatibility the day it appears". A sniff can
+		only flag constructs it has data for, so the real ceiling is whatever
+		`phpcompatibility/php-compatibility` knows — nothing appears the day PHP ships
+		it; it appears when this dependency is updated.
+
+		⚠ AND UNTIL PROMPT 13C THAT DEPENDENCY KNEW NOTHING ABOVE 7.4. It was pinned at
+		9.3.5 (May 2019), which predates PHP 8.0 entirely: `readonly`, `enum`, `never`,
+		first-class callables and every 8.x function were invisible at any `testVersion`.
+		The stack is now PHPCompatibility 10.0.0-alpha2 + PHPCompatibilityWP 3.0.0-alpha2,
+		whose data runs through PHP 8.5, and the positive control is recorded in
+		docs/p2-backlog.md. Re-run that control after any change to these dependencies —
+		a version gate that cannot see the versions it is aimed at is indistinguishable
+		from one that can.
+	-->
 	<config name="testVersion" value="8.0-"/>
 
 	<rule ref="WordPress-Extra">
@@ -37,6 +57,22 @@
 	<rule ref="WordPress.Security"/>
 	<rule ref="WordPress.DB.PreparedSQL"/>
 	<rule ref="WordPress.DB.PreparedSQLPlaceholders"/>
+
+	<!--
+		⚠ REGISTERED SO THE SUPPRESSIONS FOR IT ARE ACTUALLY EXERCISED.
+
+		This plugin owns three tables and carries dozens of
+		`phpcs:ignore WordPress.DB.DirectDatabaseQuery.*` annotations explaining why
+		each direct query is direct. `WordPress-Extra` does NOT register this sniff,
+		so none of those annotations did anything — and in Prompt 13 that hid a real
+		defect: two of them were a stacked pair, where the second annotation consumed
+		the first, and the whole `DirectQuery`/`NoCaching` half had never been in
+		effect. Plugin Check found it because Plugin Check runs the sniff.
+
+		A suppression for a sniff your own ruleset does not run is indistinguishable
+		from a working one. Either register the sniff or do not annotate for it.
+	-->
+	<rule ref="WordPress.DB.DirectDatabaseQuery"/>
 
 	<rule ref="PHPCompatibilityWP"/>
 

@@ -350,8 +350,25 @@ final class ManualDeliveryTest extends ManualDeliveryTestCase {
 		 * `ConfirmationToken::consume()` succeeds, and prove the identity's UNIQUE index
 		 * refuses on its own — this is the barrier that survives the token store being
 		 * wiped, and it is permanent.
+		 *
+		 * ⚠ THE RESTORED ROW CARRIES THE SAME CONTEXT FINGERPRINT (Prompt 13A item 4),
+		 * because the point of this step is to remove the TOKEN guard and leave the
+		 * IDENTITY guard standing alone. A row restored with no fingerprint would be
+		 * refused as `confirmation_changed`, which is the token guard working — and
+		 * would leave the identity index untested.
 		 */
-		add_option( ConfirmationToken::PREFIX . $token, (string) ( time() + 600 ), '', 'no' );
+		add_option(
+			ConfirmationToken::PREFIX . $token,
+			(string) ( time() + 600 ) . ConfirmationToken::SEPARATOR . ConfirmationToken::fingerprint(
+				DeliveryActions::ACTION_MANUAL,
+				0,
+				(int) $fixture['order_id'],
+				(int) $fixture['rule'],
+				DeliveryActions::preview_recipients( wc_get_order( (int) $fixture['order_id'] ), (array) $this->rules->find( (int) $fixture['rule'] ) )
+			),
+			'',
+			'no'
+		);
 
 		$bypassed = $this->resubmit( DeliveryActions::ACTION_MANUAL, $post );
 
@@ -418,29 +435,103 @@ final class ManualDeliveryTest extends ManualDeliveryTestCase {
 	 * @return void
 	 */
 	public function test_a_token_can_only_be_consumed_once() {
-		$token = ConfirmationToken::issue();
+		$print = ConfirmationToken::fingerprint(
+			DeliveryActions::ACTION_MANUAL,
+			0,
+			41,
+			7,
+			array( 'to' => array( 'someone@example.test' ) )
+		);
+
+		$token = ConfirmationToken::issue( $print );
 
 		$this->assertNotSame( '', $token, 'no token was issued.' );
 		$this->assertTrue( ConfirmationToken::is_well_formed( $token ) );
 
-		$this->assertTrue( ConfirmationToken::consume( $token ), 'the first consumer did not win the token.' );
-		$this->assertFalse( ConfirmationToken::consume( $token ), '⚠ TIER 1: the same token was consumed twice.' );
+		$this->assertSame( ConfirmationToken::OK, ConfirmationToken::consume( $token, $print ), 'the first consumer did not win the token.' );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( $token, $print ), '⚠ TIER 1: the same token was consumed twice.' );
 
 		// A token that was never issued, and a malformed one, both lose.
-		$this->assertFalse( ConfirmationToken::consume( str_repeat( 'a', 32 ) ) );
-		$this->assertFalse( ConfirmationToken::consume( 'not-a-token' ) );
-		$this->assertFalse( ConfirmationToken::consume( '' ) );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( str_repeat( 'a', 32 ), $print ) );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( 'not-a-token', $print ) );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( '', $print ) );
 
 		// An EXPIRED token is consumed and refused, never left for a later replay.
-		$expired = ConfirmationToken::issue();
-		update_option( ConfirmationToken::PREFIX . $expired, (string) ( time() - 10 ) );
+		$expired = ConfirmationToken::issue( $print );
+		update_option( ConfirmationToken::PREFIX . $expired, (string) ( time() - 10 ) . ConfirmationToken::SEPARATOR . $print );
 
-		$this->assertFalse( ConfirmationToken::consume( $expired ), 'an expired token was accepted.' );
-		$this->assertFalse( ConfirmationToken::consume( $expired ), 'an expired token survived its own rejection.' );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( $expired, $print ), 'an expired token was accepted.' );
+		$this->assertSame( ConfirmationToken::REPLAYED, ConfirmationToken::consume( $expired, $print ), 'an expired token survived its own rejection.' );
 
 		$this->gate[] = 'gate 37 (token): issue/consume is single-use; a second consume, an unissued token, a '
 			. 'malformed token, an empty token and an expired token all lose — and the expired one is deleted as it '
 			. 'is refused';
+	}
+
+	/**
+	 * PROMPT 13A ITEM 4. A TOKEN BINDS ITS CONTEXT, so it authorises ONE action on ONE
+	 *                    subject for ONE set of people.
+	 *
+	 * ⚠ WITHOUT THE BINDING, `issue()` TOOK NO ARGUMENTS AND `consume()` CHECKED ONLY
+	 * EXISTENCE AND EXPIRY — the token said "the merchant confirmed something", never
+	 * "the merchant confirmed THIS". Each case below is one axis of that.
+	 *
+	 * @return void
+	 */
+	public function test_a_token_is_refused_for_a_different_context() {
+		$people = array( 'to' => array( 'buyer@example.test' ) );
+
+		$issued = ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, $people );
+
+		foreach ( array(
+			'a different action'    => ConfirmationToken::fingerprint( DeliveryActions::ACTION_RESEND, 0, 41, 7, $people ),
+			'a different order'     => ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 42, 7, $people ),
+			'a different rule'      => ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 8, $people ),
+			'a different delivery'  => ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 9, 41, 7, $people ),
+			'a different recipient' => ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, array( 'to' => array( 'someone-else@example.test' ) ) ),
+			'an added cc'           => ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, $people + array( 'cc' => array( 'boss@example.test' ) ) ),
+			'no fingerprint at all' => '',
+		) as $label => $presented ) {
+			$token = ConfirmationToken::issue( $issued );
+
+			$this->assertSame(
+				ConfirmationToken::CONTEXT_CHANGED,
+				ConfirmationToken::consume( $token, $presented ),
+				'⚠ a confirmation token was accepted for ' . $label . '.'
+			);
+		}
+
+		/*
+		 * ⚠ THE POSITIVE CONTROLS. Without these, a `fingerprint()` that returned a
+		 * constant — or one that hashed the microsecond — would satisfy every
+		 * assertion above.
+		 */
+		$token = ConfirmationToken::issue( $issued );
+
+		$this->assertSame(
+			ConfirmationToken::OK,
+			ConfirmationToken::consume( $token, ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, $people ) ),
+			'the SAME context was refused, so the binding refuses everything.'
+		);
+
+		// CASE AND ORDER ARE NOT CONTEXT: the same audience written differently is the
+		// same audience, and refusing it would train merchants to click through.
+		$token = ConfirmationToken::issue(
+			ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, array( 'to' => array( 'a@example.test', 'B@Example.test' ) ) )
+		);
+
+		$this->assertSame(
+			ConfirmationToken::OK,
+			ConfirmationToken::consume(
+				$token,
+				ConfirmationToken::fingerprint( DeliveryActions::ACTION_MANUAL, 0, 41, 7, array( 'to' => array( 'b@example.test', 'a@example.test' ) ) ) )
+			,
+			'the same two addresses in a different order and case were treated as a different audience.'
+		);
+
+		$this->gate[] = 'item 4 (binding): a token issued for one action/order/rule/delivery/recipient set is REFUSED '
+			. 'for each of the other five and for a missing fingerprint, ACCEPTED for its own, and case- and '
+			. 'order-insensitive across the recipient list';
 	}
 
 	// -----------------------------------------------------------------------
@@ -723,7 +814,11 @@ final class ManualDeliveryTest extends ManualDeliveryTestCase {
 		$deliveries_table = \Extonify\WCEP\Install\Migrator::table( 'deliveries' );
 
 		$break = static function ( $query ) use ( $deliveries_table ) {
-			if ( 1 === preg_match( '/^\s*UPDATE\s+' . preg_quote( $deliveries_table, '/' ) . '\b/i', (string) $query ) ) {
+			// ⚠ THE BACKTICKS ARE OPTIONAL. The table is bound with `%i` now (Prompt 13A
+			// item 6), so `prepare()` renders it backticked; a pattern that insisted on
+			// a bare name would never match and this test would pass by never breaking
+			// anything.
+			if ( 1 === preg_match( '/^\s*UPDATE\s+`?' . preg_quote( $deliveries_table, '/' ) . '`?\s/i', (string) $query ) ) {
 				// A statement that parses, touches nothing, and fails the guarded write.
 				return 'UPDATE ' . $deliveries_table . ' SET final_status = final_status WHERE 1 = 0';
 			}

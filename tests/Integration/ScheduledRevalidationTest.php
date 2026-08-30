@@ -266,13 +266,55 @@ final class ScheduledRevalidationTest extends ScheduledDeliveryTestCase {
 	/**
 	 * §4 check 6 — EVERY matched item was fully refunded (item 8, first half).
 	 *
+	 * ⚠ THE FIXTURE CARRIES A SHIPPING LINE, AND THAT IS WHAT MAKES THIS TEST TEST
+	 * CHECK 6 (Prompt 13A item 5c).
+	 *
+	 * ADR-0015 §4 runs check 5 (the ORDER's status) before check 6 (every matched
+	 * ITEM refunded). Refunding every line item on an order that has nothing BUT line
+	 * items refunds the order in full, so WooCommerce flips its status to `refunded`,
+	 * check 5 wins, and the recorded reason is `order_state` — this test then passed
+	 * or failed according to whether the store happened to add anything to the order
+	 * total.
+	 *
+	 * ⚠ THAT WAS RECORDED IN PROMPT 13 AS A WOOCOMMERCE 9.6-versus-11 DIFFERENCE. IT
+	 * IS NOT. Measured on three stores:
+	 *
+	 * | store                            | taxes | order total | refunded | status after | reason           |
+	 * |----------------------------------|-------|-------------|----------|--------------|------------------|
+	 * | clean WC 9.6.0                   | off   | 40.00       | 40.00    | `refunded`   | `order_state`    |
+	 * | clean WC 11.0.1                  | off   | 40.00       | 40.00    | `refunded`   | `order_state`    |
+	 * | development store, WC 11.0.1     | ON    | 43.30       | 40.00    | `processing` | `items_refunded` |
+	 *
+	 * The variable is the STORE'S TAX CONFIGURATION, not the WooCommerce version: on
+	 * a taxed store the line-item refund leaves the tax unrefunded, the order is not
+	 * fully refunded, and check 6 is reached. A version-aware tolerance would have
+	 * encoded a cause that does not exist and left the test still measuring the
+	 * store's settings.
+	 *
+	 * A shipping line makes the order total exceed the sum of its item totals on ANY
+	 * store, taxed or not — so check 6 is the check under test everywhere, and the
+	 * expected reason is exactly one value again. The `refunded` ORDER STATUS is
+	 * already covered on its own by `cancelling_status_provider()`.
+	 *
 	 * @return void
 	 */
 	public function test_check_6_all_matched_items_refunded() {
 		$fixture = $this->schedule_one( array(), 2 );
 
 		$order = wc_get_order( $fixture['order_id'] );
+
+		$this->add_shipping_line( $order, 5.00 );
+
 		$this->refund_items( $order, array_keys( $order->get_items() ) );
+
+		// ⚠ THE PREMISE, ASSERTED. If a future WooCommerce flips the order to
+		// `refunded` anyway, this test must say so rather than quietly start
+		// measuring check 5 while claiming to measure check 6.
+		$this->assertNotSame(
+			'refunded',
+			(string) wc_get_order( $fixture['order_id'] )->get_status(),
+			'⚠ the fixture fully refunded the ORDER, so check 5 decides and check 6 is untested.'
+		);
 
 		$this->run_job( $fixture['delivery_id'], $fixture['order_id'] );
 
@@ -314,7 +356,44 @@ final class ScheduledRevalidationTest extends ScheduledDeliveryTestCase {
 	}
 
 	/**
-	 * Fully refund the named line items.
+	 * Give an order a shipping line, so its total exceeds its line-item totals.
+	 *
+	 * ⚠ IT EXISTS TO KEEP CHECK 6 REACHABLE. See
+	 * self::test_check_6_all_matched_items_refunded() for why an order made only of
+	 * line items cannot exercise it.
+	 *
+	 * `calculate_totals( false )` recalculates the order total WITHOUT recalculating
+	 * tax, so the fixture behaves identically on a taxed and an untaxed store — which
+	 * is the whole point of adding it.
+	 *
+	 * @param \WC_Order $order  Order.
+	 * @param float     $amount Shipping cost.
+	 * @return void
+	 */
+	private function add_shipping_line( \WC_Order $order, float $amount ): void {
+		$shipping = new \WC_Order_Item_Shipping();
+		$shipping->set_method_title( 'WCEP fixture shipping' );
+		$shipping->set_total( (string) $amount );
+
+		$order->add_item( $shipping );
+		$order->calculate_totals( false );
+		$order->save();
+
+		$items = 0.0;
+
+		foreach ( $order->get_items() as $item ) {
+			$items += (float) $item->get_total();
+		}
+
+		$this->assertGreaterThan(
+			$items,
+			(float) $order->get_total(),
+			'the shipping line did not raise the order total above its line items, so check 6 is unreachable.'
+		);
+	}
+
+	/**
+	 * Refund the full line total of each named item.
 	 *
 	 * @param \WC_Order $order    Order.
 	 * @param int[]     $item_ids Line-item ids.

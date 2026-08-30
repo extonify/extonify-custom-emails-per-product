@@ -64,7 +64,7 @@ final class RuleEditor {
 
 			if ( $rule_id > 0 && null === $rule ) {
 				echo '<div class="wrap extonify-wcep">';
-				echo '<h1>' . esc_html__( 'Custom Product Emails', 'extonify-custom-emails-per-product' ) . '</h1>';
+				echo '<h1>' . esc_html__( 'Email Rules', 'extonify-custom-emails-per-product' ) . '</h1>';
 				Notices::render( 'error', __( 'That rule no longer exists.', 'extonify-custom-emails-per-product' ) );
 				echo '<p><a href="' . esc_url( Menu::url() ) . '">' . esc_html__( 'Back to all rules', 'extonify-custom-emails-per-product' ) . '</a></p>';
 				echo '</div>';
@@ -77,8 +77,8 @@ final class RuleEditor {
 		echo '<div class="wrap extonify-wcep extonify-wcep-editor">';
 
 		echo '<h1 class="wp-heading-inline">' . ( $rule_id > 0
-			? esc_html__( 'Edit rule', 'extonify-custom-emails-per-product' )
-			: esc_html__( 'Add rule', 'extonify-custom-emails-per-product' ) ) . '</h1>';
+			? esc_html__( 'Edit Email Rule', 'extonify-custom-emails-per-product' )
+			: esc_html__( 'Add Email Rule', 'extonify-custom-emails-per-product' ) ) . '</h1>';
 
 		echo '<a href="' . esc_url( Menu::url() ) . '" class="page-title-action">'
 			. esc_html__( 'Back to all rules', 'extonify-custom-emails-per-product' ) . '</a>';
@@ -354,13 +354,53 @@ final class RuleEditor {
 	/**
 	 * Recipients.
 	 *
+	 * ⚠ AN INSERT RULE HAS NO ENVELOPE, AND THIS SECTION USED TO IMPLY IT HAD ONE.
+	 * That was a TIER 1 defect of the interface, not of the delivery code: an insert
+	 * rule contributes BODY CONTENT ONLY — WooCommerce owns the recipient, the
+	 * subject, the heading and the send time (ADR-0013 §2), and
+	 * `RuleRepository::find_active_for_native_email()` never selects on recipients.
+	 * The section nonetheless rendered "Who receives it" as a live choice with no
+	 * mode guard, and told the merchant *"A rule with no 'To' recipient sends
+	 * nothing"* — advice that is meaningless for a rule which sends nothing either
+	 * way. A merchant who set **To: admin** on an insert rule could reasonably
+	 * conclude the extra content went to the administrator alone, when it is in fact
+	 * injected into WooCommerce's email to the CUSTOMER. Nothing on the screen
+	 * corrected that belief, which makes it the worse form of this project's own
+	 * Tier 1 shape: a false belief about who reads what the merchant wrote.
+	 *
+	 * ⚠ READ-ONLY, NOT DISABLED, AND THAT IS THE WHOLE PRESERVATION MECHANISM.
+	 * `delay_row()` and `consolidation_row()` disable their controls and submit a
+	 * hidden mirror, because insert mode FORCES those two columns to `0` and `none` —
+	 * a mirror can carry a constant. Recipients are different in kind: insert mode
+	 * neither reads nor rewrites them, so the stored document must arrive back
+	 * BYTE-FOR-BYTE. A hidden mirror could only carry the value the page was rendered
+	 * with, so a merchant who edited the recipients and THEN switched to insert would
+	 * have had their edit silently replaced by the stale copy — the very defect this
+	 * section is being fixed for, reintroduced by the fix. A read-only `<textarea>`
+	 * submits its own live value in every path, with the script on or off, and needs
+	 * no second copy of the merchant's data to keep in step.
+	 *
 	 * @param RuleFormInput $form The form.
 	 * @return void
 	 */
 	private static function section_recipients( RuleFormInput $form ): void {
-		self::open_section( 'recipients', __( 'Who receives it', 'extonify-custom-emails-per-product' ) );
+		$is_insert = 'insert' === (string) $form->get( 'delivery_mode' );
 
-		echo '<p class="extonify-wcep-note">'
+		// Two paragraphs, both named as the section's description (gate 33): the mode
+		// scope is the one a merchant must read, and the syntax is the one they come
+		// back to. A single `aria-describedby` IDREF LIST associates both with the
+		// group, so neither is loose text and neither is read out three times.
+		self::open_section(
+			'recipients',
+			__( 'Who receives it', 'extonify-custom-emails-per-product' ),
+			'extonify-wcep-recipients-note extonify-wcep-recipients-syntax'
+		);
+
+		echo '<p class="extonify-wcep-note" id="extonify-wcep-recipients-note">'
+			. esc_html__( 'These recipients apply to a rule sent as a separate email. A rule that adds its content to a WooCommerce email has no recipients of its own: the content goes into the email WooCommerce is already sending, to whoever that email is addressed to: the customer for a customer email, the store\'s administrators for an admin one. For such a rule these boxes are read-only, and whatever they hold is kept in case it is switched back.', 'extonify-custom-emails-per-product' )
+			. '</p>';
+
+		echo '<p class="extonify-wcep-note" id="extonify-wcep-recipients-syntax">'
 			. esc_html__( 'One recipient per line. Write "customer" for the billing address on the order, "admin" for the site administrator, or any email address. The placeholders {customer_email} and {store_email} also work here — no others do, because a recipient becomes part of the email header.', 'extonify-custom-emails-per-product' )
 			. '</p>';
 
@@ -372,9 +412,10 @@ final class RuleEditor {
 				(string) ( $labels[ $channel ] ?? $channel ),
 				implode( "\n", $form->recipients( $channel ) ),
 				'to' === $channel
-					? __( 'A rule with no "To" recipient sends nothing, and says so in its delivery record.', 'extonify-custom-emails-per-product' )
+					? __( 'A rule sent as a separate email with no "To" recipient sends nothing, and says so in its delivery record.', 'extonify-custom-emails-per-product' )
 					: '',
-				'extonify-wcep-recipients-' . $channel
+				'extonify-wcep-recipients-' . $channel,
+				$is_insert
 			);
 		}
 
@@ -390,12 +431,40 @@ final class RuleEditor {
 	private static function section_content( RuleFormInput $form ): void {
 		self::open_section( 'content', __( 'What it says', 'extonify-custom-emails-per-product' ) );
 
+		/*
+		 * ⚠ THE REFERENCE IS PLACED **AFTER** THE FIELDS AND STAYS THERE (gate 33).
+		 * `assets/admin.css` puts it in the right-hand column of a two-column grid on
+		 * a wide screen, which is a LAYOUT change and not a DOM one: the document
+		 * order is still subject → heading → body → placeholders, so tab order runs
+		 * fields → reference, which is the order a merchant works in. Moving the
+		 * markup to get the visual order would have swapped the tab order with it.
+		 *
+		 * The wrapper carries no id, no label and no ARIA attribute, so no gate-33
+		 * association passes through it.
+		 */
+		echo '<div class="extonify-wcep-content-layout">';
+		echo '<div class="extonify-wcep-content-fields">';
+
+		/*
+		 * ⚠ THE SUBJECT AND THE HEADING ARE A MATCHED PAIR AND MUST READ AS ONE. The
+		 * heading's description has carried its mode scope since it was written; the
+		 * subject's said *"The subject line the customer sees"* — flatly false for an
+		 * insert rule, whose customer sees WOOCOMMERCE'S subject. One of a pair being
+		 * accurate is how the other survived every earlier read of this file.
+		 *
+		 * Both stay EDITABLE in insert mode, unlike the recipients above, and the line
+		 * between them is deliberate: the recipients section presents an ENVELOPE the
+		 * rule does not have, which is the false belief worth removing, while these two
+		 * are content fields whose scope is now stated on them. A merchant switching
+		 * back to a separate email finds what they wrote still there.
+		 */
 		self::text_row(
 			'subject',
 			Notices::field_label( 'subject' ),
 			(string) $form->get( 'subject' ),
-			__( 'The subject line the customer sees.', 'extonify-custom-emails-per-product' ),
-			false
+			__( 'Used as the subject of a separate email. Ignored when the content is added to a WooCommerce email — WooCommerce\'s own subject is used.', 'extonify-custom-emails-per-product' ),
+			false,
+			true
 		);
 
 		self::text_row(
@@ -403,7 +472,8 @@ final class RuleEditor {
 			Notices::field_label( 'heading' ),
 			(string) $form->get( 'heading' ),
 			__( 'Shown at the top of a separate email. Ignored when the content is added to a WooCommerce email.', 'extonify-custom-emails-per-product' ),
-			false
+			false,
+			true
 		);
 
 		echo '<div class="extonify-wcep-row extonify-wcep-row--editor">';
@@ -421,23 +491,44 @@ final class RuleEditor {
 		 * below, which keeps it inside the textarea's RCDATA. Every OTHER surface that
 		 * shows this value escapes it for its own context.
 		 *
-		 * ⚠ THE DESCRIPTION IS ASSOCIATED THROUGH `the_editor` BECAUSE THERE IS NO
-		 * OTHER WAY IN (gate 33). `wp_editor()` builds its own `<textarea>` and takes
-		 * no attribute arguments, so the description below would be loose text a
-		 * screen-reader user meets at a moment unrelated to the field it explains.
+		 * ⚠ TWO ATTRIBUTES ARE ADDED THROUGH `the_editor` BECAUSE THERE IS NO OTHER
+		 * WAY IN. `wp_editor()` builds its own `<textarea>` and takes no attribute
+		 * arguments — only `editor_class`, which cannot express either of these.
 		 * `the_editor` is the documented filter over exactly that markup; the
 		 * injection is anchored to THIS editor's id, so another `wp_editor()` on the
 		 * same screen is untouched, and the filter is removed immediately after.
+		 *
+		 *   `aria-describedby` (gate 33) — without it the description below is loose
+		 *   text a screen-reader user meets at a moment unrelated to the field it
+		 *   explains.
+		 *
+		 *   `data-extonify-wcep-insertable` — the ONE marker `assets/admin.js` reads
+		 *   to decide where a clicked placeholder lands. ⚠ THE BODY CARRIED NO MARKER
+		 *   UNTIL PART G, AND THAT WAS A TIER 1 DEFECT: focusing the body never
+		 *   updated the script's "last focused field", so a placeholder clicked while
+		 *   the merchant was writing the body was silently inserted into the HEADING.
+		 *   Every field a placeholder may be inserted into carries this attribute,
+		 *   every field that must not accept one does not, and the script branches on
+		 *   nothing else.
+		 *   `AdminOutputTest::test_every_placeholder_target_is_marked_and_nothing_else_is()`
+		 *   pins that as a complete map, on both editor paths, so a new field cannot
+		 *   appear without a deliberate answer either way.
+		 *
+		 * ⚠ BOTH GO **BEFORE** THE `id`, WHICH MUST STAY LAST. `_WP_Editors` emits the
+		 * id as the final attribute and `AdminOutputTest::editor_content()` locates the
+		 * body by `id="…">`; appending after it would make that helper silently return
+		 * the empty string and take the RCDATA escaping assertions down with it.
 		 */
-		$describe = static function ( $markup ) {
+		$augment = static function ( $markup ) {
 			return str_replace(
 				' id="' . self::EDITOR_ID . '"',
-				' aria-describedby="extonify-wcep-content-description" id="' . self::EDITOR_ID . '"',
+				' aria-describedby="extonify-wcep-content-description"'
+					. ' data-extonify-wcep-insertable="1" id="' . self::EDITOR_ID . '"',
 				(string) $markup
 			);
 		};
 
-		add_filter( 'the_editor', $describe );
+		add_filter( 'the_editor', $augment );
 
 		/*
 		 * ⚠ THE BODY IS ESCAPED FOR THE TEXTAREA BY THIS PLUGIN, NOT BY LUCK.
@@ -475,15 +566,19 @@ final class RuleEditor {
 		);
 
 		remove_filter( 'the_editor_content', 'format_for_editor', 10 );
-		remove_filter( 'the_editor', $describe );
+		remove_filter( 'the_editor', $augment );
 
 		echo '<p class="description" id="extonify-wcep-content-description">'
-			. esc_html__( 'The message body. Use the placeholders below to include order and product details.', 'extonify-custom-emails-per-product' )
+			. esc_html__( 'The message body. Use the Placeholders panel to include order and product details.', 'extonify-custom-emails-per-product' )
 			. '</p>';
 
 		echo '</div></div>';
 
+		echo '</div>'; // .extonify-wcep-content-fields — the left column.
+
 		self::placeholder_reference();
+
+		echo '</div>'; // .extonify-wcep-content-layout.
 
 		self::close_section();
 	}
@@ -771,7 +866,7 @@ final class RuleEditor {
 		echo '<div class="extonify-wcep-placeholders" data-extonify-wcep-placeholders="1">';
 		echo '<h3>' . esc_html__( 'Placeholders', 'extonify-custom-emails-per-product' ) . '</h3>';
 		echo '<p class="description">'
-			. esc_html__( 'Select a field above, then choose a placeholder to insert it. Placeholders work in the subject, the heading and the body.', 'extonify-custom-emails-per-product' )
+			. esc_html__( 'Put the cursor in a field, then choose a placeholder to insert it there. Placeholders work in the subject, the heading and the body.', 'extonify-custom-emails-per-product' )
 			. '</p>';
 
 		foreach ( PlaceholderReference::categories() as $category ) {
@@ -852,14 +947,23 @@ final class RuleEditor {
 	/**
 	 * One text input row.
 	 *
+	 * ⚠ `$insertable` IS A DECISION, NOT A DEFAULT. It emits the one attribute
+	 * `assets/admin.js` reads to choose where a clicked placeholder lands, so it
+	 * must be set per FIELD and never per helper. Until Part G this helper emitted
+	 * it unconditionally, which made the rule NAME — a private label nothing ever
+	 * renders, whose own description says "Only you see this" — an insertion target
+	 * a merchant could not see while the placeholder reference was on screen. The
+	 * reference's copy names three fields; exactly those three carry the attribute.
+	 *
 	 * @param string $key         Field key.
 	 * @param string $label       Label text.
 	 * @param string $value       Current value.
 	 * @param string $description Description, or ''.
 	 * @param bool   $invalid     Whether this field was refused.
+	 * @param bool   $insertable  Whether a placeholder may be inserted into it.
 	 * @return void
 	 */
-	private static function text_row( string $key, string $label, string $value, string $description, bool $invalid ): void {
+	private static function text_row( string $key, string $label, string $value, string $description, bool $invalid, bool $insertable = false ): void {
 		$dom  = 'extonify-wcep-' . $key;
 		$desc = $dom . '-description';
 
@@ -869,7 +973,7 @@ final class RuleEditor {
 		echo '<input type="text" class="regular-text" id="' . esc_attr( $dom ) . '"'
 			. ' name="' . esc_attr( RuleFormInput::FIELD ) . '[' . esc_attr( $key ) . ']"'
 			. ' value="' . esc_attr( $value ) . '"'
-			. ' data-extonify-wcep-insertable="1"'
+			. ( $insertable ? ' data-extonify-wcep-insertable="1"' : '' )
 			. ( '' !== $description ? ' aria-describedby="' . esc_attr( $desc ) . '"' : '' )
 			. ( $invalid ? ' aria-invalid="true"' : '' ) . ' />';
 
@@ -883,14 +987,27 @@ final class RuleEditor {
 	/**
 	 * One textarea row.
 	 *
+	 * ⚠ `$inert` EMITS `readonly`, NEVER `disabled`, AND THE DIFFERENCE IS THE STORED
+	 * VALUE. A disabled control submits nothing, so disabling these would empty the
+	 * recipients document of every rule a merchant switched to insert mode — the
+	 * mirror pattern `delay_row()` uses exists for exactly that reason, and cannot be
+	 * reused here because a mirror carries a constant and this field carries the
+	 * merchant's own text. `readonly` keeps the field in the submission, which is what
+	 * makes "switch to insert, save, switch back" lossless.
+	 *
+	 * The marker is emitted on every row this helper draws — all of which are
+	 * recipient channels — so `assets/admin.js` can flip the state on a mode change
+	 * without a per-channel list to fall out of step with `RecipientsDocument`.
+	 *
 	 * @param string $name        The complete input name, brackets included.
 	 * @param string $label       Label text.
 	 * @param string $value       Current value.
 	 * @param string $description Description, or ''.
 	 * @param string $dom         DOM id.
+	 * @param bool   $inert       Whether the current mode makes this field read-only.
 	 * @return void
 	 */
-	private static function textarea_row( string $name, string $label, string $value, string $description, string $dom ): void {
+	private static function textarea_row( string $name, string $label, string $value, string $description, string $dom, bool $inert = false ): void {
 		$desc = $dom . '-description';
 
 		echo '<div class="extonify-wcep-row">';
@@ -898,6 +1015,7 @@ final class RuleEditor {
 		echo '<div class="extonify-wcep-field">';
 		echo '<textarea id="' . esc_attr( $dom ) . '" rows="3" class="large-text code"'
 			. ' name="' . esc_attr( $name ) . '"'
+			. ' data-extonify-wcep-insert-readonly="1"' . ( $inert ? ' readonly="readonly"' : '' )
 			. ( '' !== $description ? ' aria-describedby="' . esc_attr( $desc ) . '"' : '' ) . '>'
 			. esc_textarea( $value ) . '</textarea>';
 

@@ -175,6 +175,51 @@ final class PlaceholderTest extends InsertModeTestCase {
 	}
 
 	/**
+	 * Assert one URL placeholder resolved to the right URL — AND was escaped for the
+	 * format it was rendered into (Prompt 13A item 5d).
+	 *
+	 * ⚠ THE COMPARISON IS ON THE DECODED VALUE, AND THE OLD ONE WAS SIMPLY WRONG.
+	 * With PLAIN permalinks a WooCommerce order URL carries two query arguments —
+	 * `?page_id=8&view-order=95` — and an HTML email body correctly renders the
+	 * separator as `&amp;`. Comparing the raw substring against the raw URL therefore
+	 * failed on every store that has not switched permalinks on, and the message it
+	 * printed said the placeholder was wrong when the plugin was right. The suite had
+	 * simply never been run with plain permalinks.
+	 *
+	 * ⚠ AND DECODING DOES NOT THROW THE TRIPWIRE AWAY. Decoding alone would also pass
+	 * for a body that never escaped anything, so the HTML format additionally asserts
+	 * that no BARE `&` survived — which is the property the escaping is there for, and
+	 * a stronger check than the string equality it replaces.
+	 *
+	 * @param string $expected The URL WooCommerce itself produces.
+	 * @param string $value    The value pulled out of the rendered body.
+	 * @param string $format   `html` or `plain`.
+	 * @param string $name     Placeholder name, for failure messages.
+	 * @return void
+	 */
+	private function assertUrlPlaceholder( string $expected, string $value, string $format, string $name ): void {
+		$this->assertSame(
+			$expected,
+			html_entity_decode( $value, ENT_QUOTES | ENT_HTML5, 'UTF-8' ),
+			'{' . $name . '} in the ' . $format . ' body'
+		);
+
+		if ( 'html' !== $format ) {
+			// A text/plain body carries the URL verbatim; entities there would be the
+			// defect, not the escaping.
+			$this->assertSame( $expected, $value, '{' . $name . '} was HTML-escaped in a text/plain body' );
+
+			return;
+		}
+
+		$this->assertSame(
+			0,
+			preg_match( '/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);)/i', $value ),
+			'{' . $name . '} reached the HTML body with a BARE ampersand: ' . $value
+		);
+	}
+
+	/**
 	 * Assert the whole set against one rendered body.
 	 *
 	 * @param array<string,string> $got    Markers pulled from the body.
@@ -223,18 +268,18 @@ final class PlaceholderTest extends InsertModeTestCase {
 		// rather than the plugin concatenating fields itself.
 		$this->assertStringContainsStringIgnoringCase( 'paris', $got['shipping_address'], $format );
 
-		$this->assertSame( (string) $order->get_view_order_url(), $got['view_order_url'], $format );
+		$this->assertUrlPlaceholder( (string) $order->get_view_order_url(), $got['view_order_url'], $format, 'view_order_url' );
 
 		$this->assertSame( wp_specialchars_decode( (string) get_bloginfo( 'name' ), ENT_QUOTES ), $got['store_name'], $format );
 		$this->assertSame( PlaceholderValues::store_email(), $got['store_email'], $format );
-		$this->assertSame( (string) home_url(), $got['store_url'], $format );
-		$this->assertSame( (string) wc_get_page_permalink( 'myaccount' ), $got['my_account_url'], $format );
+		$this->assertUrlPlaceholder( (string) home_url(), $got['store_url'], $format, 'store_url' );
+		$this->assertUrlPlaceholder( (string) wc_get_page_permalink( 'myaccount' ), $got['my_account_url'], $format, 'my_account_url' );
 
 		$this->assertSame( 'WCEP Placeholder Widget', $got['product_name'], $format );
 		$this->assertSame( 'WCEP Placeholder Widget', $got['product_names'], $format );
 		$this->assertSame( 'WCEP-SKU-1', $got['product_sku'], $format );
 		$this->assertSame( '2', $got['product_quantity'], $format );
-		$this->assertSame( (string) $product->get_permalink(), $got['product_url'], $format );
+		$this->assertUrlPlaceholder( (string) $product->get_permalink(), $got['product_url'], $format, 'product_url' );
 
 		// A simple product has no variation, so both variation placeholders are
 		// empty rather than falling back to anything (ADR-0014 §5).

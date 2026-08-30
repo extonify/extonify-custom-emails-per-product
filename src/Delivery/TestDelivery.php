@@ -136,21 +136,33 @@ final class TestDelivery {
 
 		$delivery_id = (int) $claim['delivery_id'];
 
-		$orchestrator->send_test(
-			$order,
-			(array) $rule,
-			$items,
-			$delivery_id,
-			$identity,
-			self::recipients_for( $recipient ),
-			self::subject_marker()
+		/*
+		 * ⚠ THE RUN'S OUTCOME IS CONSUMED, NOT DISCARDED (Prompt 13A item 3, gate 18).
+		 * This call used to be a statement and the return below said `ok` regardless —
+		 * so a test whose mailer failed, whose delivery a filter declined, or whose
+		 * fan-out half went out still told the merchant *"The test email was sent."*
+		 * A test send exists to show a merchant what happens; reporting a success it
+		 * did not have defeats the whole feature.
+		 */
+		$report = ManualDelivery::report_of(
+			$orchestrator->send_test(
+				$order,
+				(array) $rule,
+				$items,
+				$delivery_id,
+				$identity,
+				self::recipients_for( $recipient ),
+				self::subject_marker()
+			)
 		);
 
 		return array(
 			'outcome'     => self::OK,
-			'code'        => self::ATTEMPT_TYPE,
+			'code'        => $report['code'],
 			'delivery_id' => $delivery_id,
 			'address'     => $recipient,
+			'sent'        => $report['sent'],
+			'total'       => $report['total'],
 		);
 	}
 

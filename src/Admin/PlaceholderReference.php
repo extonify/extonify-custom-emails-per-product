@@ -195,7 +195,7 @@ final class PlaceholderReference {
 			'customer_full_name'   => __( 'Billing full name.', 'extonify-custom-emails-per-product' ),
 			'customer_email'       => __( 'Billing email address.', 'extonify-custom-emails-per-product' ),
 			'customer_phone'       => __( 'Billing phone number.', 'extonify-custom-emails-per-product' ),
-			'order_number'         => __( 'The order number the customer sees.', 'extonify-custom-emails-per-product' ),
+			'order_number'         => __( 'The order\'s display number, not its internal ID.', 'extonify-custom-emails-per-product' ),
 			'order_date'           => __( 'Order date, in this store\'s date format.', 'extonify-custom-emails-per-product' ),
 			'order_status'         => __( 'Order status, by its readable name.', 'extonify-custom-emails-per-product' ),
 			'order_total'          => __( 'Order total, in this store\'s currency format.', 'extonify-custom-emails-per-product' ),

@@ -209,7 +209,7 @@ final class DeliveryConfirm {
 			foreach ( $recipients as $channel => $addresses ) {
 				$lines[] = esc_html(
 					sprintf(
-						/* translators: 1: recipient kind, e.g. "To", 2: a comma-separated list of email addresses. */
+						/* translators: 1: recipient kind, e.g. "To", 2: one or more email addresses, comma-separated. */
 						__( '%1$s: %2$s', 'extonify-custom-emails-per-product' ),
 						$labels[ $channel ] ?? $channel,
 						implode( ', ', (array) $addresses )
@@ -239,14 +239,41 @@ final class DeliveryConfirm {
 			// the reason the alternative design was rejected: letting a manual send
 			// consume the automatic identity would silently disable the rule for this
 			// order, with nothing on any screen to say so.
-			$warnings[] = __( 'This is a one-off send. It does not replace or switch off the rule\'s automatic delivery, so if the rule\'s trigger fires later the customer will receive this email again.', 'extonify-custom-emails-per-product' );
+			$warnings[] = __( 'This is a one-off send. It does not replace or switch off the rule\'s automatic delivery, so if the rule\'s trigger fires later this email is sent again, to the rule\'s own recipients.', 'extonify-custom-emails-per-product' );
 		}
 
 		if ( DeliveryActions::ACTION_TEST === $action ) {
-			// ⚠ THE TWO FACTS A MERCHANT CANNOT INFER (ADR-0020 §4). It is a REAL email,
-			// so it costs a real send and a real record; and it is NOT the customer's,
-			// however the rule's recipients are configured.
-			$warnings[] = __( 'This is a real email. It is sent to the address above and to nobody else — not to the customer, and not to anyone this rule lists as a recipient.', 'extonify-custom-emails-per-product' );
+			/*
+			 * ⚠ THE TWO FACTS A MERCHANT CANNOT INFER (ADR-0020 §4). It is a REAL email,
+			 * so it costs a real send and a real record; and the rule's OWN recipients
+			 * play no part in it, however they are configured.
+			 *
+			 * ⚠ IT NO LONGER SAYS "THE CUSTOMER IS NOT USED", AND THAT WAS A TIER 2
+			 * INACCURACY (Prompt 13C Part L). The customer is not excluded by CATEGORY —
+			 * a merchant may type the customer's own address into the field and the test
+			 * goes there, exactly as asked. What IS structurally true is stronger and is
+			 * what the sentence claims now: `TestDelivery::recipients_for()` builds the
+			 * recipient set from the supplied address alone and never calls
+			 * `RecipientResolver`, so the rule's To, Cc, Bcc and its `customer` token are
+			 * unreachable on this path. Gate 42 asserts it.
+			 *
+			 * ⚠ IT SAYS WHAT THE PLUGIN ENFORCES, NOT "AND TO NOBODY ELSE" (Prompt 13C
+			 * item 3, Tier 2). The old wording promised more than ADR-0020 §4b records:
+			 * that clause states `phpmailer_init` as an ACCEPTED BOUNDARY this plugin
+			 * deliberately does not enforce, so a store-wide "archive every outgoing
+			 * message" integration hooked past `wp_mail()` can still copy this message.
+			 * A guarantee on a confirmation screen that the code does not make is worse
+			 * than a narrower one, because the merchant acts on it.
+			 *
+			 * ⚠ RE-CHECKED IN PART A3, WHICH DECLARED A SECOND BOUNDARY: a replacement
+			 * `woocommerce_mail_callback` that ALTERS the message before forwarding it
+			 * cannot be followed either (ADR-0020 §4b). These two sentences still hold
+			 * unchanged, because what they claim is what this plugin does with THE RULE'S
+			 * OWN recipient configuration — the customer, the Cc and the Bcc a merchant
+			 * entered — and not that no other plugin can add an address afterwards. The
+			 * check was made rather than assumed; the wording needed no narrowing.
+			 */
+			$warnings[] = __( 'This is a real email, and it goes to the address above. The rule\'s own recipients are not used at all — not its To, Cc or Bcc, and not the "customer" entry if it has one.', 'extonify-custom-emails-per-product' );
 			$warnings[] = __( 'Its subject is marked as a test. It does not use up the rule\'s automatic delivery, so the rule still sends normally when its trigger fires.', 'extonify-custom-emails-per-product' );
 		}
 
@@ -300,11 +327,11 @@ final class DeliveryConfirm {
 	 */
 	private static function summary( string $action ): string {
 		$summaries = array(
-			DeliveryActions::ACTION_RESEND   => __( 'This sends the rule\'s email to the customer again. Check who it is going to before you confirm.', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_RESEND   => __( 'This sends the rule\'s email for this order again. Check who it is going to before you confirm.', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_SEND_NOW => __( 'This sends the scheduled email straight away instead of waiting for its delay.', 'extonify-custom-emails-per-product' ),
-			DeliveryActions::ACTION_CANCEL   => __( 'This stops the scheduled email from being sent. Nothing is emailed to the customer.', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_CANCEL   => __( 'This stops the scheduled email from being sent. Nothing is emailed to anyone.', 'extonify-custom-emails-per-product' ),
 			DeliveryActions::ACTION_MANUAL   => __( 'This sends the rule\'s email for this order even though the rule has not fired for it.', 'extonify-custom-emails-per-product' ),
-			DeliveryActions::ACTION_TEST     => __( 'This sends the rule\'s email to you, rendered from this order, so you can see how it arrives. Check the address before you confirm.', 'extonify-custom-emails-per-product' ),
+			DeliveryActions::ACTION_TEST     => __( 'This sends the rule\'s email to the address you chose, rendered from this order, so you can see how it arrives. Check the address before you confirm.', 'extonify-custom-emails-per-product' ),
 		);
 
 		return $summaries[ $action ] ?? '';
